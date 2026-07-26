@@ -89,6 +89,15 @@ class ArtifactCategory(Enum):
     REPORT = "report"
     EXPERIMENT_MANIFEST = "experiment_manifest"
     LOGS = "logs"
+    FOLD_RESULT = "fold_result"
+    """Milestone 4B: one immutable, content-addressed `FoldResult` record
+    per completed fold."""
+    EXECUTION_SUMMARY = "execution_summary"
+    """Milestone 4B: the final `AggregatedExecutionResult` for one
+    execution run."""
+    TIMELINE = "timeline"
+    """Milestone 4B: the per-fold time-bound `Timeline` for one execution
+    run."""
 
 
 class ExperimentStatus(Enum):

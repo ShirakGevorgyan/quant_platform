@@ -99,6 +99,16 @@ class EventType(Enum):
     RUN_COMPLETED = "run_completed"
     RUN_FAILED = "run_failed"
     EXPERIMENT_CANCELLED = "experiment_cancelled"
+    FOLD_STARTED = "fold_started"
+    """Milestone 4B: one fold's execution began."""
+    FOLD_COMPLETED = "fold_completed"
+    """Milestone 4B: one fold's execution completed successfully."""
+    FOLD_FAILED = "fold_failed"
+    """Milestone 4B: one fold's execution failed (recoverable or fatal --
+    see `execution.state_machine.ExecutionStage`)."""
+    EXECUTION_RESUMED = "execution_resumed"
+    """Milestone 4B: a resume attempt was made against a prior,
+    non-terminal execution manifest."""
 
 
 @dataclass(frozen=True, slots=True)

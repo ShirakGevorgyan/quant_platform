@@ -11,13 +11,22 @@ from quant_platform.feature_cli import main as feature_main
 from quant_platform.ml_cli import build_parser, main
 
 
-def _build_research_dataset(tmp_path: Path) -> tuple[str, str, Path, Path]:
+def _build_research_dataset(
+    tmp_path: Path, *, preprocessing: dict[str, object] | None = None,
+) -> tuple[str, str, Path, Path]:
+    """`preprocessing` defaults to omitted (no fitted transforms) -- the
+    ONLY dataset shape Milestone 4B's execution engine can safely
+    re-split (see `execution.runner.
+    assert_preprocessing_is_safe_for_execution`). Pass an explicit
+    `preprocessing` dict only from a test that specifically means to
+    build an UNSAFE (globally fitted) dataset to prove that check
+    rejects it -- see `TestPreprocessingSafety`."""
     historical_root = tmp_path / "data"
     research_root = tmp_path / "research"
     df = make_synthetic_ohlcv(2000, seed=1)
     seed_canonical_dataset(historical_root, df)
 
-    feature_config = {
+    feature_config: dict[str, object] = {
         "symbol": "XAUUSD", "base_timeframe": "M1",
         "start": "2024-01-01T00:00:00Z",
         "end": (pd.Timestamp("2024-01-01T00:00:00Z") + pd.Timedelta(minutes=2000)).isoformat(),
@@ -26,8 +35,9 @@ def _build_research_dataset(tmp_path: Path) -> tuple[str, str, Path, Path]:
         "temporal": {"enabled": True},
         "label": {"name": "fut", "kind": "future_return", "horizon_bars": 5},
         "split": {"strategy": "chronological", "train_fraction": 0.7, "validation_fraction": 0.15, "purge_bars": 5, "embargo_bars": 5},
-        "preprocessing": {"transforms": {"return_simple_1": "standard_scale"}},
     }
+    if preprocessing is not None:
+        feature_config["preprocessing"] = preprocessing
     feature_config_path = tmp_path / "feature_config.json"
     feature_config_path.write_text(json.dumps(feature_config))
 
@@ -66,13 +76,28 @@ def ml_config(tmp_path: Path) -> Path:
     return _write_ml_config(tmp_path, dataset_id=dataset_id, version=version, research_root=research_root, ml_root=tmp_path / "ml_artifacts")
 
 
+@pytest.fixture
+def ml_config_walk_forward(tmp_path: Path) -> Path:
+    """A walk-forward-strategy variant of `ml_config`, used by the
+    Milestone 4B execution commands (`execute`/`resume`/etc.) -- the
+    default `ml_config` fixture's `chronological` strategy has no
+    concept of folds at all, since `execution.splitters` never dispatches
+    on it (see `build_folds_from_split_binding`)."""
+    dataset_id, version, research_root, _ = _build_research_dataset(tmp_path)
+    return _write_ml_config(
+        tmp_path, dataset_id=dataset_id, version=version, research_root=research_root, ml_root=tmp_path / "ml_artifacts",
+        split={"strategy": "expanding_walk_forward", "params": {"n_splits": 3, "test_size": 100, "purge_bars": 5, "embargo_bars": 2}},
+    )
+
+
 class TestBuildParser:
-    def test_all_eight_commands_registered(self) -> None:
+    def test_all_fourteen_commands_registered(self) -> None:
         parser = build_parser()
         subparsers_action = next(a for a in parser._actions if a.dest == "command")
         assert set(subparsers_action.choices) == {
             "list-model-definitions", "describe-model-definition", "prepare-experiment", "validate-experiment",
             "inspect-experiment", "inspect-experiment-manifest", "verify-artifact", "list-experiment-events",
+            "execute", "resume", "inspect-execution", "inspect-fold", "list-folds", "verify-execution",
         }
 
 
@@ -179,5 +204,103 @@ class TestInspectionCommands:
 
     def test_verify_artifact_unknown_hash_fails_actionably(self, ml_config: Path, capsys: pytest.CaptureFixture[str]) -> None:
         rc = main(["verify-artifact", "--config", str(ml_config), "--content-hash", "0" * 64])
+        assert rc == 1
+        assert "ERROR" in capsys.readouterr().err
+
+
+class TestExecutionCommands:
+    def _prepare(self, ml_config: Path, capsys: pytest.CaptureFixture[str]) -> str:
+        rc = main(["prepare-experiment", "--config", str(ml_config)])
+        assert rc == 0
+        out = capsys.readouterr().out
+        return out.split("experiment_id: ")[1].split("\n")[0].strip()
+
+    def test_execute_runs_all_folds_to_completion(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        rc = main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "overall_status: completed" in out
+        assert "completed_folds: [0, 1, 2]" in out
+
+    def test_execute_is_idempotent(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        rc1 = main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc2 = main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        out2 = capsys.readouterr().out
+        assert rc1 == rc2 == 0
+        assert "idempotent_no_op: True" in out2
+
+    def test_resume_without_prior_execution_fails_actionably(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        rc = main(["resume", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        assert rc == 1
+        assert "ERROR" in capsys.readouterr().err
+
+    def test_inspect_execution_markdown(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc = main(["inspect-execution", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "# Execution Report" in out
+
+    def test_inspect_execution_json(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc = main(["inspect-execution", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id, "--format", "json"])
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["experiment_id"] == experiment_id
+        assert parsed["stage"] == "completed"
+
+    def test_list_folds(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc = main(["list-folds", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "fold 0: completed" in out
+        assert "fold 1: completed" in out
+        assert "fold 2: completed" in out
+
+    def test_inspect_fold(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc = main(["inspect-fold", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id, "--fold-index", "0"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "status: completed" in out
+        assert "fold_index: 0" in out
+
+    def test_inspect_fold_unknown_index_fails_actionably(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc = main(["inspect-fold", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id, "--fold-index", "99"])
+        assert rc == 1
+        assert "No fold result" in capsys.readouterr().err
+
+    def test_verify_execution(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc = main(["verify-execution", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "is_ready: True" in out
+        assert "all_fold_results_verified" in out
+        assert "aggregate_verified" in out
+        assert "timeline_verified" in out
+        assert "experiment_status_compatible" in out
+
+    def test_verify_execution_before_any_run_fails_actionably(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_walk_forward, capsys)
+        rc = main(["verify-execution", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
         assert rc == 1
         assert "ERROR" in capsys.readouterr().err

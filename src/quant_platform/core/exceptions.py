@@ -313,12 +313,50 @@ class ExperimentStateError(MLError):
 
 
 class ExperimentLockError(MLError):
-    """Raised when an experiment-preparation lock is already held by
-    another non-stale process -- see `historical.locking.DatasetLock`,
-    reused directly for this purpose."""
+    """Raised when an experiment-preparation OR experiment-execution lock
+    is already held by another non-stale process -- see
+    `historical.locking.DatasetLock`, reused (via `ml.concurrency.
+    experiment_lock`) directly for both purposes, under distinct lock
+    files per experiment_id."""
 
 
 class SchemaVersionError(MLError):
     """Raised when a durable ML JSON structure (spec, manifest, event,
     artifact metadata) declares a schema version this code does not know
     how to read."""
+
+
+# --------------------------------------------------------------------------
+# Time-safe validation and experiment execution engine (Milestone 4B)
+# --------------------------------------------------------------------------
+class ExecutionError(MLError):
+    """Base class for every failure in the experiment execution engine
+    (`quant_platform.execution`) -- fold splitting, walk-forward
+    execution, resume, and execution-lifecycle bookkeeping. Distinct from
+    `MLError`'s other subclasses, which govern Milestone 4A's identity/
+    artifact/manifest/preparation concerns rather than actually running
+    an experiment's folds."""
+
+
+class ExecutionStateError(ExecutionError):
+    """Raised for illegal `ExecutionStage` transitions (e.g. `completed`
+    -> `running_fold`), or an attempt to silently overwrite an already
+    `completed`/terminal execution manifest with inconsistent content --
+    the execution-stage analogue of `ExperimentStateError`."""
+
+
+class FoldValidationError(ExecutionError):
+    """Raised when a generated or reconstructed fold plan fails a
+    structural time-safety check that must never be silently accepted:
+    non-chronological or duplicate timestamps, overlapping folds, an
+    empty train/test split, or a purge/embargo gap that does not actually
+    separate train from test. Reported as a `ValidationIssue` wherever a
+    report is expected instead; raised only where there is no reasonable
+    way to continue (e.g. reconstructing a dataset's timeline)."""
+
+
+class ExecutionResumeError(ExecutionError):
+    """Raised when a resume attempt cannot proceed safely: a completed
+    fold's recorded artifact is missing or corrupted, the requested
+    execution has no prior manifest to resume, or an already-terminal
+    execution is asked to resume without an explicit force restart."""

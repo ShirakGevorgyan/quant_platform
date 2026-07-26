@@ -1,5 +1,5 @@
 """Command-line interface for the ML core infrastructure and artifact
-foundation (Milestone 4A).
+foundation (Milestone 4A) and the time-safe execution engine (Milestone 4B).
 
     python -m quant_platform.ml_cli list-model-definitions
     python -m quant_platform.ml_cli describe-model-definition --name constant_test_model --version 1
@@ -9,21 +9,31 @@ foundation (Milestone 4A).
     python -m quant_platform.ml_cli inspect-experiment-manifest --config config.json --experiment-id ID
     python -m quant_platform.ml_cli verify-artifact --config config.json --content-hash HASH
     python -m quant_platform.ml_cli list-experiment-events --config config.json --experiment-id ID
+    python -m quant_platform.ml_cli execute --config config.json --experiment-id ID
+    python -m quant_platform.ml_cli resume --config config.json --experiment-id ID
+    python -m quant_platform.ml_cli inspect-execution --config config.json --experiment-id ID
+    python -m quant_platform.ml_cli inspect-fold --config config.json --experiment-id ID --fold-index N
+    python -m quant_platform.ml_cli list-folds --config config.json --experiment-id ID
+    python -m quant_platform.ml_cli verify-execution --config config.json --experiment-id ID
 
 Same operability conventions as `data_cli`/`feature_cli`: every command
 returns 0 on success, non-zero on failure, and prints an actionable
 stderr message -- never a raw traceback. `prepare-experiment` and
 `validate-experiment` return 2 (not 1) when the experiment/spec itself
 is not ready -- distinct from 1, which means the COMMAND itself failed
-(bad config, missing dataset, etc).
+(bad config, missing dataset, etc). `execute`/`resume` follow the same
+convention: 2 when the execution ends with one or more failed folds,
+never a traceback.
 
-NO TRAIN/PREDICT COMMANDS
+NO TRAIN/PREDICT COMMANDS ON A REAL MODEL
 --------------------------------------------------------------------------
-There is deliberately no `ml train` or `ml predict` here -- this
-milestone prepares and validates experiments; it does not fit models.
-The only model ever registered by `build_model_registry()` below is
-`ml.testing.ConstantTestModelFactory`, explicitly labeled as a test-only
-model, never a real predictive algorithm.
+There is deliberately no command here that could fit a REAL predictive
+algorithm -- `execute`/`resume` run the walk-forward engine's full fit/
+predict pipeline (see `execution.executor`'s module docstring for why
+that is in scope), but the only model EVER registered by
+`build_model_registry()` below is `ml.testing.ConstantTestModelFactory`,
+explicitly labeled as a test-only model, never a real predictive
+algorithm.
 """
 
 from __future__ import annotations
@@ -36,7 +46,19 @@ from pydantic import ValidationError
 
 from quant_platform.config.ml_schemas import MLExperimentConfig
 from quant_platform.core.exceptions import QuantPlatformError
-from quant_platform.features.manifests import ResearchDatasetManifest, ResearchManifestStore
+from quant_platform.execution.executor import DeterministicFoldExecutor
+from quant_platform.execution.manifests import ExecutionManifestStore
+from quant_platform.execution.reporting import build_execution_report_json, render_execution_report_markdown
+from quant_platform.execution.results import AggregatedExecutionResult, FoldResult
+from quant_platform.execution.runner import ExecutionRunner
+from quant_platform.execution.state_machine import ExecutionStage
+from quant_platform.execution.timeline import Timeline
+from quant_platform.execution.verification import verify_execution
+from quant_platform.features.manifests import (
+    ResearchDatasetManifest,
+    ResearchDatasetStore,
+    ResearchManifestStore,
+)
 from quant_platform.ml.artifacts import MLArtifactStore
 from quant_platform.ml.environment import capture_code_revision_binding
 from quant_platform.ml.experiment_manager import ExperimentPreparer
@@ -145,6 +167,15 @@ def cmd_describe_model_definition(args: argparse.Namespace) -> int:
     return 0
 
 
+def _build_execution_runner(config: MLExperimentConfig) -> ExecutionRunner:
+    return ExecutionRunner(
+        ml_artifacts_root=config.ml_artifacts_root, model_registry=build_model_registry(),
+        research_manifest_store=ResearchManifestStore(config.dataset.research_storage_root),
+        research_dataset_store=ResearchDatasetStore(config.dataset.research_storage_root),
+        fold_executor=DeterministicFoldExecutor(),
+    )
+
+
 def _build_preparer(config: MLExperimentConfig) -> ExperimentPreparer:
     return ExperimentPreparer(
         ml_artifacts_root=config.ml_artifacts_root, model_registry=build_model_registry(),
@@ -230,6 +261,116 @@ def cmd_list_experiment_events(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_or_resume(args: argparse.Namespace, *, is_resume: bool) -> int:
+    config = _load_config(Path(args.config))
+    runner = _build_execution_runner(config)
+    force_rerun_folds = frozenset(getattr(args, "force_rerun_fold", None) or [])
+    outcome = (
+        runner.resume(args.experiment_id, force_rerun_folds=force_rerun_folds) if is_resume
+        else runner.run(args.experiment_id, force_rerun_folds=force_rerun_folds)
+    )
+    print(f"experiment_id: {args.experiment_id}")
+    print(f"overall_status: {outcome.aggregate.overall_status.value}")
+    print(f"completed_folds: {list(outcome.aggregate.completed_fold_indices)}")
+    print(f"failed_folds: {list(outcome.aggregate.failed_fold_indices)}")
+    print(f"idempotent_no_op: {outcome.was_idempotent_no_op}")
+    return 0 if outcome.aggregate.overall_status is ExecutionStage.COMPLETED else 2
+
+
+def cmd_execute_experiment(args: argparse.Namespace) -> int:
+    return _run_or_resume(args, is_resume=False)
+
+
+def cmd_resume_execution(args: argparse.Namespace) -> int:
+    return _run_or_resume(args, is_resume=True)
+
+
+def _execution_manifest_store(config: MLExperimentConfig) -> ExecutionManifestStore:
+    return ExecutionManifestStore(config.ml_artifacts_root)
+
+
+def cmd_inspect_execution(args: argparse.Namespace) -> int:
+    config = _load_config(Path(args.config))
+    store = _execution_manifest_store(config)
+    manifest = store.load(args.experiment_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+
+    aggregate: AggregatedExecutionResult | None = None
+    timeline: Timeline | None = None
+    for ref in manifest.artifact_references:
+        raw = artifact_store.read_artifact(ref.content_hash)
+        if ref.category.value == "execution_summary":
+            aggregate = AggregatedExecutionResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+        elif ref.category.value == "timeline":
+            timeline = Timeline.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+
+    if args.format == "json":
+        import json
+
+        print(json.dumps(build_execution_report_json(manifest, aggregate=aggregate, timeline=timeline), indent=2, sort_keys=True))
+    else:
+        print(render_execution_report_markdown(manifest, aggregate=aggregate, timeline=timeline))
+    return 0
+
+
+def cmd_inspect_fold(args: argparse.Namespace) -> int:
+    config = _load_config(Path(args.config))
+    store = _execution_manifest_store(config)
+    manifest = store.load(args.experiment_id)
+    ref = manifest.fold_result_references.get(args.fold_index)
+    if ref is None:
+        print(
+            f"No fold result recorded for experiment_id={args.experiment_id!r} fold_index={args.fold_index} "
+            f"(known folds: {sorted(manifest.fold_result_references)})",
+            file=sys.stderr,
+        )
+        return 1
+    raw = MLArtifactStore(config.ml_artifacts_root).read_artifact(ref.content_hash)
+    fold_result = FoldResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    for key, value in fold_result.to_json_dict().items():
+        print(f"{key}: {value}")
+    return 0
+
+
+def cmd_list_folds(args: argparse.Namespace) -> int:
+    config = _load_config(Path(args.config))
+    store = _execution_manifest_store(config)
+    manifest = store.load(args.experiment_id)
+    completed = set(manifest.completed_fold_indices)
+    failed = set(manifest.failed_fold_indices)
+    known = sorted(manifest.fold_result_references)
+    if not known:
+        print(f"No folds recorded yet for experiment_id={args.experiment_id!r} (stage={manifest.stage.value})")
+        return 0
+    for fold_index in known:
+        status = "completed" if fold_index in completed else "failed" if fold_index in failed else "unknown"
+        print(f"fold {fold_index}: {status}")
+    return 0
+
+
+def cmd_verify_execution(args: argparse.Namespace) -> int:
+    """Re-audits everything the named experiment's execution has ever
+    recorded across its four separate stores (`ExecutionManifest`,
+    `ExperimentManifest`, the artifact store, the event log) -- see
+    `execution.verification`'s module docstring for exactly what is
+    checked and why. Returns 2 (not 1) when the report contains any
+    CRITICAL/ERROR issue -- consistent with `validate-experiment`'s own
+    "0 unless not ready" convention; a WARNING-only report (e.g. the
+    documented manifest-before-event crash window) still returns 0."""
+    config = _load_config(Path(args.config))
+    report = verify_execution(
+        args.experiment_id,
+        execution_manifest_store=_execution_manifest_store(config),
+        experiment_manifest_store=ExperimentManifestStore(config.ml_artifacts_root),
+        artifact_store=MLArtifactStore(config.ml_artifacts_root),
+        event_store=ExperimentEventStore(config.ml_artifacts_root),
+    )
+    for issue in report.issues:
+        print(f"[{issue.severity.value}] {issue.code}: {issue.message}")
+    print(f"is_ready: {report.is_ready}")
+    return 0 if report.is_ready else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m quant_platform.ml_cli",
@@ -274,6 +415,51 @@ def build_parser() -> argparse.ArgumentParser:
     events_parser.add_argument("--config", required=True)
     events_parser.add_argument("--experiment-id", required=True)
     events_parser.set_defaults(handler=cmd_list_experiment_events)
+
+    execute_parser = subparsers.add_parser(
+        "execute", help="Run (or transparently resume) a READY experiment's walk-forward fold plan."
+    )
+    execute_parser.add_argument("--config", required=True)
+    execute_parser.add_argument("--experiment-id", required=True)
+    execute_parser.add_argument(
+        "--force-rerun-fold", type=int, action="append", default=None,
+        help="Re-run this fold index even if already verified complete (repeatable).",
+    )
+    execute_parser.set_defaults(handler=cmd_execute_experiment)
+
+    resume_parser = subparsers.add_parser(
+        "resume", help="Resume a prior, non-terminal execution -- fails if there is nothing to resume."
+    )
+    resume_parser.add_argument("--config", required=True)
+    resume_parser.add_argument("--experiment-id", required=True)
+    resume_parser.add_argument("--force-rerun-fold", type=int, action="append", default=None)
+    resume_parser.set_defaults(handler=cmd_resume_execution)
+
+    inspect_execution_parser = subparsers.add_parser(
+        "inspect-execution", help="Print a human-readable (or JSON) execution report."
+    )
+    inspect_execution_parser.add_argument("--config", required=True)
+    inspect_execution_parser.add_argument("--experiment-id", required=True)
+    inspect_execution_parser.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    inspect_execution_parser.set_defaults(handler=cmd_inspect_execution)
+
+    inspect_fold_parser = subparsers.add_parser("inspect-fold", help="Print one fold's persisted FoldResult.")
+    inspect_fold_parser.add_argument("--config", required=True)
+    inspect_fold_parser.add_argument("--experiment-id", required=True)
+    inspect_fold_parser.add_argument("--fold-index", type=int, required=True)
+    inspect_fold_parser.set_defaults(handler=cmd_inspect_fold)
+
+    list_folds_parser = subparsers.add_parser("list-folds", help="List every fold this execution has recorded, with status.")
+    list_folds_parser.add_argument("--config", required=True)
+    list_folds_parser.add_argument("--experiment-id", required=True)
+    list_folds_parser.set_defaults(handler=cmd_list_folds)
+
+    verify_execution_parser = subparsers.add_parser(
+        "verify-execution", help="Re-verify every artifact (folds, timeline, aggregate) an execution has recorded."
+    )
+    verify_execution_parser.add_argument("--config", required=True)
+    verify_execution_parser.add_argument("--experiment-id", required=True)
+    verify_execution_parser.set_defaults(handler=cmd_verify_execution)
 
     return parser
 
