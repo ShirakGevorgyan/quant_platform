@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -183,6 +185,52 @@ class TestStructuralChecks:
         )
         report = validate_research_dataset(features, timestamps=timestamps, split_plan=plan)
         assert not any(i.issue_type.value == "TRAIN_TEST_OVERLAP" for i in report.issues)
+
+
+class TestNoSpuriousRuntimeWarnings:
+    """A zero-variance or infinite-value input is an EXPECTED diagnostic
+    case (constant/infinite features happen in real data), not an error --
+    `validate_research_dataset` must report it correctly without emitting
+    a `RuntimeWarning` as a side effect of computing a statistic that is
+    mathematically undefined for that input (dividing by a zero/NaN
+    stddev, or subtracting infinities). `warnings.simplefilter("error")`
+    turns any such warning into a test failure."""
+
+    def test_infinite_value_column_produces_no_warning(self) -> None:
+        timestamps = _timestamps(10)
+        features = pd.DataFrame({"x": [1.0] * 9 + [np.inf]})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            report = validate_research_dataset(features, timestamps=timestamps)
+        assert any(i.issue_type.value == "INFINITE_VALUE" for i in report.critical_issues)
+
+    def test_constant_feature_vs_varying_label_produces_no_warning(self) -> None:
+        timestamps = _timestamps(50)
+        features = pd.DataFrame({"const": [1.0] * 50})
+        labels = pd.Series(np.arange(50.0))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            report = validate_research_dataset(features, timestamps=timestamps, labels=labels)
+        assert not any(i.issue_type.value == "TARGET_LEAKAGE_SUSPECTED" for i in report.issues)
+
+    def test_constant_label_vs_varying_feature_produces_no_warning(self) -> None:
+        timestamps = _timestamps(50)
+        features = pd.DataFrame({"x": np.arange(50.0)})
+        labels = pd.Series([1.0] * 50)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            report = validate_research_dataset(features, timestamps=timestamps, labels=labels)
+        assert not any(i.issue_type.value == "TARGET_LEAKAGE_SUSPECTED" for i in report.issues)
+
+    def test_constant_feature_and_constant_label_together_produce_no_warning(self) -> None:
+        timestamps = _timestamps(50)
+        features = pd.DataFrame({"const": [1.0] * 50})
+        labels = pd.Series([2.0] * 50)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            report = validate_research_dataset(features, timestamps=timestamps, labels=labels)
+        assert any(i.issue_type.value == "CONSTANT_FEATURE" for i in report.issues)
+        assert not any(i.issue_type.value == "TARGET_LEAKAGE_SUSPECTED" for i in report.issues)
 
 
 class TestReportSummary:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -75,3 +77,21 @@ class TestCompareSplits:
         report = compare_splits(reference, comparison)
         assert "const" in report.constant_features
         assert "near_const" in report.near_constant_features
+
+    def test_constant_column_among_others_produces_no_warning_and_still_detects_correlation(self) -> None:
+        """A zero-variance column mixed in with normally-varying ones is
+        an expected diagnostic case, not an error -- the correlation
+        matrix computation must not emit a `RuntimeWarning` as a side
+        effect (dividing by that column's zero stddev), and excluding it
+        from the matrix must not prevent detecting a real highly
+        correlated pair among the REMAINING columns."""
+        rng = np.random.default_rng(3)
+        base = rng.normal(size=200)
+        reference = pd.DataFrame({"const": [7.0] * 200, "a": base, "b": base * 2 + 1})
+        comparison = reference.copy()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            report = compare_splits(reference, comparison, correlation_threshold=0.95)
+        assert "const" in report.constant_features
+        pairs = {(p[0], p[1]) for p in report.highly_correlated_pairs}
+        assert ("a", "b") in pairs

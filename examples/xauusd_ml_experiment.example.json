@@ -1,0 +1,33 @@
+{
+  "ml_artifacts_root": "./ml_artifacts",
+  "dataset": {
+    "dataset_id": "REPLACE_WITH_DATASET_ID_PRINTED_BY_build-research-dataset",
+    "manifest_version": "REPLACE_WITH_VERSION_PRINTED_BY_build-research-dataset",
+    "research_storage_root": "./research_data",
+    "feature_names": null
+  },
+  "label": {
+    "name": "future_return_15",
+    "kind": "future_return",
+    "horizon_bars": 15,
+    "label_type": "continuous",
+    "params": {}
+  },
+  "split": {
+    "strategy": "chronological",
+    "params": {}
+  },
+  "model": {
+    "name": "constant_test_model",
+    "version": "1",
+    "objective": "regression",
+    "hyperparameters": {}
+  },
+  "seeds": {
+    "master_seed": 42
+  },
+  "primary_metric": "rmse",
+  "environment_requirements": {},
+  "tags": ["xauusd", "milestone_4a_example"],
+  "notes": "Milestone 4A worked example: prepares (validates + creates a manifest for) an experiment against the XAUUSD research dataset built from examples/xauusd_research_dataset.example.json. Uses ONLY the deterministic test-only model (quant_platform.ml.testing.ConstantTestModelFactory) -- no real model is trained, and no profitability or predictive-validity claim is made or implied."
+}

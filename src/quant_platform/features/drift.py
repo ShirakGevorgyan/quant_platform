@@ -122,15 +122,28 @@ def compare_splits(
     )
 
     numeric_columns = [c for c in reference_df.columns if pd.api.types.is_numeric_dtype(reference_df[c])]
-    correlation_values = reference_df[numeric_columns].corr().to_numpy(dtype="float64")
+    stds = {c: reference_df[c].std(skipna=True) for c in numeric_columns}
+
+    # A zero-variance (or all-NaN-std) column makes its correlation with
+    # anything mathematically undefined (NaN) -- exactly what `not
+    # np.isnan(value)` below already filters out of `highly_correlated`
+    # -- but including it in `.corr()`'s input divides by its zero/NaN
+    # stddev and raises `RuntimeWarning: invalid value encountered in
+    # divide` for the WHOLE matrix. Excluding such columns up front
+    # changes no reported pair (a constant column could never have
+    # contributed one) while eliminating the warning.
+    correlatable_columns = [c for c in numeric_columns if pd.notna(stds[c]) and stds[c] != 0]
+    correlation_values = (
+        reference_df[correlatable_columns].corr().to_numpy(dtype="float64")
+        if len(correlatable_columns) >= 2 else np.empty((0, 0))
+    )
     highly_correlated: list[tuple[str, str, float]] = []
-    for i, col_a in enumerate(numeric_columns):
-        for j, col_b in enumerate(numeric_columns[i + 1 :], start=i + 1):
+    for i, col_a in enumerate(correlatable_columns):
+        for j, col_b in enumerate(correlatable_columns[i + 1 :], start=i + 1):
             value = float(correlation_values[i, j])
             if not np.isnan(value) and abs(value) >= correlation_threshold:
                 highly_correlated.append((col_a, col_b, value))
 
-    stds = {c: reference_df[c].std(skipna=True) for c in numeric_columns}
     constant_features = tuple(c for c, std in stds.items() if pd.isna(std) or std == 0)
     near_constant_features = tuple(
         c for c, std in stds.items() if pd.notna(std) and 0 < std < near_constant_std_threshold

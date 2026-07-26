@@ -228,3 +228,97 @@ class ResearchDatasetError(FeatureError):
     """Raised for research dataset manifest/storage failures: a manifest
     referencing content that no longer exists, a corrupted artifact, or an
     attempt to reconstruct a dataset from an incompatible manifest."""
+
+
+# --------------------------------------------------------------------------
+# ML core infrastructure (Milestone 4A)
+# --------------------------------------------------------------------------
+class MLError(QuantPlatformError):
+    """Base class for every failure in the ML core infrastructure and
+    artifact foundation (`quant_platform.ml`). This milestone trains no
+    real model -- these exceptions govern experiment identity, artifact
+    storage, and manifest lifecycle, not model quality."""
+
+
+class DuplicateModelDefinitionError(MLError):
+    """Raised when `ModelRegistry.register` is called with a
+    (name, version) pair that is already registered."""
+
+
+class UnknownModelDefinitionError(MLError):
+    """Raised when a requested model name/version is not present in a
+    `ModelRegistry`."""
+
+
+class ModelNotFittedError(MLError):
+    """Raised when `predict`/`predict_proba` is called on a `TrainableModel`
+    that has not been fit yet -- 'predict before fit' must fail loudly, not
+    silently return an arbitrary result."""
+
+
+class UnsupportedObjectiveError(MLError):
+    """Raised when an operation is incompatible with a model's declared
+    `ModelCapabilities` or `ObjectiveType` -- e.g. `predict_proba` on a
+    regression-only model, or a label type that does not match the
+    declared objective."""
+
+
+class FeatureSchemaMismatchError(MLError):
+    """Raised when input feature columns do not match a fitted model's
+    recorded feature schema -- missing columns, extra columns (unless an
+    explicit policy allows them), or a different column order when order is
+    semantically relevant."""
+
+
+class InvalidSeedError(MLError):
+    """Raised when a seed value or `SeedConfiguration` is out of the
+    supported range, non-deterministic, or otherwise invalid."""
+
+
+class ExperimentIdentityError(MLError):
+    """Raised when a deterministic experiment identity cannot be computed
+    from an `ExperimentSpec` -- e.g. non-canonicalizable fields."""
+
+
+class ExperimentValidationError(MLError):
+    """Raised when an experiment is asked to proceed (e.g. to 'ready') while
+    its `ValidationReport` still contains an ERROR- or CRITICAL-severity
+    issue. Warnings alone never block a transition."""
+
+
+class ArtifactCorruptionError(MLError):
+    """Raised for ML artifact store failures: a checksum mismatch, a missing
+    `_SUCCESS` marker, or malformed sidecar metadata -- mirrors
+    `historical.raw_store`/`features.manifests`'s identical concern for the
+    ML artifact layer."""
+
+
+class ArtifactNotFoundError(MLError):
+    """Raised when a referenced artifact (by content hash) does not exist
+    in the store -- distinguishes 'never existed' from 'exists but
+    corrupted' (`ArtifactCorruptionError`)."""
+
+
+class UntrustedArtifactError(MLError):
+    """Raised when a generic artifact-layer caller attempts to deserialize
+    an artifact using a mechanism capable of executing arbitrary code
+    (e.g. pickle) -- the generic artifact layer never does this itself;
+    this is the last-line guard for a caller that tries anyway."""
+
+
+class ExperimentStateError(MLError):
+    """Raised for illegal `ExperimentStatus` transitions (e.g. `completed`
+    -> `running`), or an attempt to silently overwrite an already
+    `ready`/`completed` experiment manifest with inconsistent content."""
+
+
+class ExperimentLockError(MLError):
+    """Raised when an experiment-preparation lock is already held by
+    another non-stale process -- see `historical.locking.DatasetLock`,
+    reused directly for this purpose."""
+
+
+class SchemaVersionError(MLError):
+    """Raised when a durable ML JSON structure (spec, manifest, event,
+    artifact metadata) declares a schema version this code does not know
+    how to read."""

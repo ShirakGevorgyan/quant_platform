@@ -142,15 +142,6 @@ def validate_research_dataset(
         clean = features[col].dropna()
         if len(clean) == 0:
             continue
-        std = float(clean.std())
-        if std < thresholds.constant_std_epsilon:
-            issues.append(
-                DatasetIssue(
-                    DatasetIssueType.CONSTANT_FEATURE, Severity.WARNING,
-                    f"Column {col!r} is constant (or near-constant) across all non-null rows (std={std:.3g})",
-                    affected_columns=(col,), stats={"std": std},
-                )
-            )
         inf_count = int(np.isinf(clean.to_numpy(dtype="float64")).sum())
         if inf_count > 0:
             issues.append(
@@ -158,6 +149,23 @@ def validate_research_dataset(
                     DatasetIssueType.INFINITE_VALUE, Severity.CRITICAL,
                     f"Column {col!r} contains {inf_count} infinite value(s)",
                     affected_columns=(col,), stats={"infinite_count": float(inf_count)},
+                )
+            )
+        # `.std()` on data containing an infinite value is mathematically
+        # always NaN (inf - inf terms in the variance sum), which every
+        # comparison below already treats as "not constant"/"not an
+        # outlier" (NaN comparisons are always False) -- but computing it
+        # anyway would perform real inf-inf arithmetic for no behavioral
+        # benefit, and pandas/numpy raise `RuntimeWarning: invalid value
+        # encountered in subtract` doing so. Skip straight to the same
+        # NaN outcome instead of computing it.
+        std = float("nan") if inf_count > 0 else float(clean.std())
+        if std < thresholds.constant_std_epsilon:
+            issues.append(
+                DatasetIssue(
+                    DatasetIssueType.CONSTANT_FEATURE, Severity.WARNING,
+                    f"Column {col!r} is constant (or near-constant) across all non-null rows (std={std:.3g})",
+                    affected_columns=(col,), stats={"std": std},
                 )
             )
         if std > 0 and len(clean) > 10:
@@ -199,6 +207,16 @@ def validate_research_dataset(
         for col in numeric_columns:
             combined = pd.concat([features[col], labels], axis=1).dropna()
             if len(combined) <= 10:
+                continue
+            # A zero-variance (or all-NaN-std) side makes `.corr()`
+            # mathematically undefined (NaN) -- exactly what `pd.notna`
+            # below already filters out -- but computing it anyway
+            # divides by a zero/NaN stddev and raises `RuntimeWarning:
+            # invalid value encountered in divide`. Skip straight to the
+            # same "no leakage flagged" outcome instead.
+            feature_std = combined.iloc[:, 0].std()
+            label_std = combined.iloc[:, 1].std()
+            if pd.isna(feature_std) or pd.isna(label_std) or feature_std == 0 or label_std == 0:
                 continue
             correlation = combined.iloc[:, 0].corr(combined.iloc[:, 1])
             if pd.notna(correlation) and abs(correlation) >= thresholds.target_leakage_correlation_threshold:
