@@ -1,0 +1,59 @@
+{
+  "canonical_symbol": "XAUUSD",
+  "source_name": "mt5",
+  "mt5": {
+    "broker": "ExampleBrokerName",
+    "source_symbol": "XAUUSDm",
+    "server_timezone": {
+      "kind": "fixed_offset",
+      "offset_minutes": 120,
+      "label": "EET"
+    },
+    "terminal_path": null
+  },
+  "requested_timeframe": "M1",
+  "extraction_chunk_size_days": 20,
+  "update_overlap_bars": 5,
+  "storage": {
+    "storage_root": "./data",
+    "compression": "zstd"
+  },
+  "session_calendar": {
+    "name": "example_xauusd_schedule",
+    "local_timezone": {
+      "kind": "fixed_offset",
+      "offset_minutes": 120,
+      "label": "EET"
+    },
+    "weekly_sessions": [
+      {
+        "open_weekday": 6,
+        "open_time": "23:00:00",
+        "close_weekday": 4,
+        "close_time": "23:00:00"
+      }
+    ],
+    "maintenance_breaks": [
+      {
+        "start": "23:00:00",
+        "end": "23:01:00"
+      }
+    ],
+    "holidays": []
+  },
+  "validation": {
+    "severity_policy": "STRICT",
+    "allow_sort": false,
+    "allow_exact_duplicate_removal": true,
+    "max_price_jump_fraction": 0.05,
+    "max_spread_points": 500.0,
+    "frozen_sequence_min_length": 5,
+    "extreme_range_multiple": 10.0,
+    "volume_spike_multiple": 10.0
+  },
+  "resampling": {
+    "target_timeframes": ["M15", "H1", "H4", "D1"],
+    "policy": "REJECT_INCOMPLETE"
+  },
+  "revision_policy": "REJECT_CONFLICTS"
+}
