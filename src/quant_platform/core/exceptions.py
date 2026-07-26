@@ -164,3 +164,67 @@ class DatasetLockError(HistoricalDataError):
     """Raised when a dataset lock (`historical.locking.DatasetLock`) is
     already held by another non-stale process, or a lock file is
     corrupted/unreadable in a way that prevents safe reclamation."""
+
+
+# --------------------------------------------------------------------------
+# Feature engineering / research dataset platform (Milestone 3)
+# --------------------------------------------------------------------------
+class FeatureError(QuantPlatformError):
+    """Base class for every failure in the feature engineering and research
+    dataset platform (`quant_platform.features`)."""
+
+
+class PointInTimeViolationError(FeatureError):
+    """Raised when a feature, alignment, or dataset-building operation
+    would use (or did use) information that would not actually have been
+    available at the timestamp it is being attached to: a future base-
+    timeframe candle, an incomplete higher-timeframe bar, a macro value
+    before its release timestamp, or any other future-information leak.
+    This is the feature-engineering platform's analogue of
+    `LookaheadViolationError` -- a defensive, structural guard, not an
+    expected error path in correct usage."""
+
+
+class LabelLeakageError(FeatureError):
+    """Raised when label/target information would enter feature
+    computation -- e.g. a caller passes a DataFrame already containing
+    reserved `label_`/`target_`-prefixed columns into `FeatureEngine.compute`.
+    Features and labels are built by entirely separate code paths
+    (`quant_platform.features.labels` is never imported by any feature
+    module) specifically so this class of bug is structurally difficult to
+    introduce; this exception is the last-line runtime guard."""
+
+
+class DuplicateFeatureError(FeatureError):
+    """Raised when `FeatureRegistry.register` is called with a
+    (name, version) pair that is already registered. Registrations are
+    append-only and never silently overwrite one another."""
+
+
+class UnknownFeatureError(FeatureError):
+    """Raised when a requested feature name/version is not present in a
+    `FeatureRegistry`."""
+
+
+class CyclicFeatureDependencyError(FeatureError):
+    """Raised when `FeatureRegistry.resolve_dependency_order` detects a
+    cycle among registered features' `feature_dependencies`."""
+
+
+class FeatureComputationError(FeatureError):
+    """Raised when a registered feature's `compute` callable fails, or
+    returns output that violates its own declared `FeatureSpec` (wrong
+    length, wrong dtype)."""
+
+
+class PreprocessingLeakageError(FeatureError):
+    """Raised when a fitted preprocessing transform (scaler, imputer) would
+    be (or was) refit on data outside its designated training partition --
+    e.g. calling `.fit()` a second time on an already-fitted
+    `TransformPipeline` without an explicit `allow_refit=True` override."""
+
+
+class ResearchDatasetError(FeatureError):
+    """Raised for research dataset manifest/storage failures: a manifest
+    referencing content that no longer exists, a corrupted artifact, or an
+    attempt to reconstruct a dataset from an incompatible manifest."""

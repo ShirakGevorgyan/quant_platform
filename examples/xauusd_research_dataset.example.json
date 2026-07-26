@@ -1,0 +1,88 @@
+{
+  "symbol": "XAUUSD",
+  "base_timeframe": "M1",
+  "start": "2024-01-01T00:00:00Z",
+  "end": "2024-06-01T00:00:00Z",
+  "dataset_version": null,
+  "historical_storage_root": "./data",
+  "research_storage_root": "./research_data",
+  "technical": {
+    "return_windows": [1, 5, 15],
+    "momentum_windows": [10, 20],
+    "volatility_window": 20,
+    "zscore_window": 20,
+    "ma_distance_windows": [20, 50],
+    "high_low_distance_window": 20,
+    "atr_window": 14,
+    "volume_window": 20,
+    "include_spread": true,
+    "spread_window": 20
+  },
+  "temporal": {
+    "enabled": true,
+    "use_session_calendar": false
+  },
+  "multi_timeframe": {
+    "higher_timeframes": ["H1", "H4"],
+    "return_window": 3,
+    "volatility_window": 10,
+    "trend_window": 10
+  },
+  "cross_assets": [
+    {
+      "symbol": "DXY",
+      "timeframe": "M1",
+      "return_window": 5,
+      "momentum_window": 10,
+      "volatility_window": 20,
+      "correlation_window": 30
+    },
+    {
+      "symbol": "XAGUSD",
+      "timeframe": "M1",
+      "return_window": 5,
+      "momentum_window": 10,
+      "volatility_window": 20,
+      "correlation_window": 30
+    }
+  ],
+  "macro_sources": [
+    {
+      "source_name": "fed_funds_rate",
+      "data_path": "./examples/fed_funds_rate.example.csv",
+      "change_lookback": 1,
+      "tolerance_days": 45
+    }
+  ],
+  "label": {
+    "name": "future_return_15",
+    "kind": "future_return",
+    "horizon_bars": 15,
+    "params": {}
+  },
+  "split": {
+    "strategy": "chronological",
+    "train_fraction": 0.7,
+    "validation_fraction": 0.15,
+    "purge_bars": 15,
+    "embargo_bars": 15,
+    "gap_bars": 0
+  },
+  "preprocessing": {
+    "transforms": {
+      "return_simple_1": "standard_scale",
+      "return_simple_5": "standard_scale",
+      "atr_14": "robust_scale",
+      "rolling_volume_mean_20": "robust_scale"
+    }
+  },
+  "validation": {
+    "max_missing_fraction": 0.5,
+    "constant_std_epsilon": 1e-12,
+    "outlier_zscore_threshold": 8.0,
+    "max_stale_fraction": 0.5,
+    "target_leakage_correlation_threshold": 0.999
+  },
+  "drop_unlabeled_rows": true,
+  "allow_critical_validation_issues": false
+}

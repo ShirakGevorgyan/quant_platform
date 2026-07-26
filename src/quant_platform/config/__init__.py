@@ -1,5 +1,17 @@
 """Validated, factory-capable configuration schemas."""
 
+from quant_platform.config.feature_schemas import (
+    CrossAssetInstrumentConfig,
+    LabelConfig,
+    MacroSourceFeatureConfig,
+    MultiTimeframeFeatureConfig,
+    PreprocessingConfig,
+    ResearchDatasetConfig,
+    SplitConfig,
+    TechnicalFeatureConfig,
+    TemporalFeatureConfig,
+    ValidationConfig,
+)
 from quant_platform.config.historical_schemas import (
     HolidayConfig,
     IngestionConfig,
@@ -18,15 +30,25 @@ from quant_platform.config.schemas import BacktestConfig, CostModelConfig, RiskC
 __all__ = [
     "BacktestConfig",
     "CostModelConfig",
+    "CrossAssetInstrumentConfig",
     "HolidayConfig",
     "IngestionConfig",
+    "LabelConfig",
     "MT5SourceConfig",
+    "MacroSourceFeatureConfig",
     "MaintenanceBreakConfig",
+    "MultiTimeframeFeatureConfig",
+    "PreprocessingConfig",
     "ResamplingOutputConfig",
+    "ResearchDatasetConfig",
     "RiskConfig",
     "SessionCalendarConfig",
+    "SplitConfig",
     "StorageConfig",
+    "TechnicalFeatureConfig",
+    "TemporalFeatureConfig",
     "TimezoneConfig",
+    "ValidationConfig",
     "ValidationPolicyConfig",
     "WeeklySessionConfig",
     "resolve_mt5_credentials_from_env",

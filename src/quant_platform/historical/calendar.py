@@ -138,6 +138,16 @@ class TradingCalendar:
             )
         return True
 
+    def is_open_at(self, moment_utc: pd.Timestamp) -> bool:
+        """True if this single UTC instant falls inside an open weekly
+        session and outside every maintenance break/holiday. The single-
+        instant complement of `is_expected_closure` (which answers the
+        question for an interval); added for
+        `quant_platform.features.temporal` session-flag features, which
+        need a per-bar answer rather than a gap-sized interval one."""
+        tzinfo_obj = self.local_tz.to_tzinfo()
+        return self._is_open_at_local(moment_utc.tz_convert(tzinfo_obj))
+
     def _is_open_at_local(self, moment: pd.Timestamp) -> bool:
         if self._in_any_holiday(moment):
             return False

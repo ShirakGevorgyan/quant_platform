@@ -151,7 +151,7 @@ class MT5HistoricalSource(HistoricalSource):
     def connect(self) -> None:
         if self._client is None:
             try:
-                import MetaTrader5 as mt5_module  # type: ignore[import-not-found]  # noqa: N813
+                import MetaTrader5 as mt5_module  # type: ignore  # noqa: N813
             except ImportError as exc:
                 raise MissingDependencyError(
                     "MT5HistoricalSource requires the optional 'MetaTrader5' package, which "
