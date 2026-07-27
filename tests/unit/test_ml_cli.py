@@ -91,13 +91,14 @@ def ml_config_walk_forward(tmp_path: Path) -> Path:
 
 
 class TestBuildParser:
-    def test_all_fourteen_commands_registered(self) -> None:
+    def test_all_nineteen_commands_registered(self) -> None:
         parser = build_parser()
         subparsers_action = next(a for a in parser._actions if a.dest == "command")
         assert set(subparsers_action.choices) == {
             "list-model-definitions", "describe-model-definition", "prepare-experiment", "validate-experiment",
             "inspect-experiment", "inspect-experiment-manifest", "verify-artifact", "list-experiment-events",
             "execute", "resume", "inspect-execution", "inspect-fold", "list-folds", "verify-execution",
+            "list-models", "inspect-model", "validate-model", "train", "compare",
         }
 
 
@@ -302,5 +303,177 @@ class TestExecutionCommands:
     def test_verify_execution_before_any_run_fails_actionably(self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str]) -> None:
         experiment_id = self._prepare(ml_config_walk_forward, capsys)
         rc = main(["verify-execution", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        assert rc == 1
+        assert "ERROR" in capsys.readouterr().err
+
+
+_WALK_FORWARD_SPLIT: dict[str, object] = {
+    "strategy": "expanding_walk_forward",
+    "params": {"n_splits": 3, "test_size": 100, "purge_bars": 5, "embargo_bars": 2},
+}
+
+
+@pytest.fixture
+def ml_config_lightgbm(tmp_path: Path) -> Path:
+    """Milestone 4C: the SAME walk-forward dataset `ml_config_walk_forward`
+    uses, bound to a REAL model (`lightgbm`) instead of the test-only
+    one. Written into its own subdirectory (not directly under
+    `tmp_path`) so it can coexist with `ml_config_baseline`'s config
+    file, which otherwise collides on the shared `tmp_path /
+    "ml_config.json"` path `_write_ml_config` always uses."""
+    config_dir = tmp_path / "candidate"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    dataset_id, version, research_root, _ = _build_research_dataset(config_dir)
+    return _write_ml_config(
+        config_dir, dataset_id=dataset_id, version=version, research_root=research_root, ml_root=tmp_path / "ml_artifacts",
+        split=_WALK_FORWARD_SPLIT,
+        model={"name": "lightgbm", "version": "1", "objective": "regression", "hyperparameters": {"num_boost_round": 10, "num_leaves": 7}},
+    )
+
+
+@pytest.fixture
+def ml_config_baseline(tmp_path: Path) -> Path:
+    """Milestone 4C: an INDEPENDENT dataset copy (own subdirectory, same
+    synthetic generation seed so its content is identical) but the SAME
+    shared `ml_artifacts_root` as `ml_config_lightgbm` -- `compare`
+    resolves both the candidate and every baseline experiment id from a
+    single `--config`'s `ml_artifacts_root`, so both configs must agree
+    on that root even though their dataset-build directories differ."""
+    config_dir = tmp_path / "baseline"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    dataset_id, version, research_root, _ = _build_research_dataset(config_dir)
+    return _write_ml_config(
+        config_dir, dataset_id=dataset_id, version=version, research_root=research_root, ml_root=tmp_path / "ml_artifacts",
+        split=_WALK_FORWARD_SPLIT,
+        model={"name": "dummy_mean_regressor", "version": "1", "objective": "regression", "hyperparameters": {}},
+    )
+
+
+class TestListAndInspectModels:
+    def test_list_models_shows_every_real_model_and_the_test_model(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = main(["list-models"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        for name in ("lightgbm@1", "xgboost@1", "catboost@1", "logistic_regression@1", "elastic_net@1",
+                     "constant_predictor@1", "random_predictor@1", "majority_predictor@1", "dummy_mean_regressor@1",
+                     "constant_test_model@1"):
+            assert name in out
+
+    def test_inspect_model_prints_every_capability_field(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = main(["inspect-model", "--name", "catboost", "--version", "1"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "supports_categorical_features: True" in out
+        assert "library_name: catboost" in out
+        assert "seed_usage:" in out
+        assert "required_preprocessing:" in out
+
+    def test_inspect_unknown_model_fails_actionably(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = main(["inspect-model", "--name", "no_such_model", "--version", "1"])
+        assert rc == 1
+        assert "ERROR" in capsys.readouterr().err
+
+
+class TestValidateModel:
+    def test_validate_model_ready_for_lightgbm(self, ml_config_lightgbm: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = main(["validate-model", "--config", str(ml_config_lightgbm)])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "is_ready: True" in out
+        assert "all_features_numeric" in out
+
+    def test_validate_model_before_any_prepare_still_works(self, ml_config_lightgbm: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """`validate-model` writes nothing and needs no prior
+        `prepare-experiment` call -- a pure dry-run against the dataset."""
+        rc = main(["validate-model", "--config", str(ml_config_lightgbm)])
+        assert rc == 0
+
+
+class TestTrainCommand:
+    def _prepare(self, ml_config: Path, capsys: pytest.CaptureFixture[str]) -> str:
+        rc = main(["prepare-experiment", "--config", str(ml_config)])
+        assert rc == 0
+        out = capsys.readouterr().out
+        return out.split("experiment_id: ")[1].split("\n")[0].strip()
+
+    def test_train_runs_all_folds_with_real_model_and_completes(self, ml_config_lightgbm: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_lightgbm, capsys)
+        rc = main(["train", "--config", str(ml_config_lightgbm), "--experiment-id", experiment_id])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "overall_status: completed" in out
+
+    def test_train_persists_real_metrics_readable_via_inspect_fold(self, ml_config_lightgbm: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_lightgbm, capsys)
+        main(["train", "--config", str(ml_config_lightgbm), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc = main(["inspect-fold", "--config", str(ml_config_lightgbm), "--experiment-id", experiment_id, "--fold-index", "0"])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "metrics:" in out
+        assert "mae" in out
+
+    def test_train_is_idempotent(self, ml_config_lightgbm: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        experiment_id = self._prepare(ml_config_lightgbm, capsys)
+        main(["train", "--config", str(ml_config_lightgbm), "--experiment-id", experiment_id])
+        capsys.readouterr()
+        rc = main(["train", "--config", str(ml_config_lightgbm), "--experiment-id", experiment_id])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "idempotent_no_op: True" in out
+
+    def test_execute_still_works_for_a_real_model_without_metrics(self, ml_config_lightgbm: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """`execute` (unchanged since Milestone 4B, `DeterministicFoldExecutor`)
+        still successfully runs a REAL model end to end -- just without
+        computing metrics/probabilities/training-metadata."""
+        experiment_id = self._prepare(ml_config_lightgbm, capsys)
+        rc = main(["execute", "--config", str(ml_config_lightgbm), "--experiment-id", experiment_id])
+        out = capsys.readouterr().out
+        assert rc == 0, out
+        assert "overall_status: completed" in out
+        rc = main(["inspect-fold", "--config", str(ml_config_lightgbm), "--experiment-id", experiment_id, "--fold-index", "0"])
+        fold_out = capsys.readouterr().out
+        assert "metrics: {}" in fold_out
+
+
+class TestCompareCommand:
+    def _prepare_and_train(self, ml_config: Path, capsys: pytest.CaptureFixture[str]) -> str:
+        rc = main(["prepare-experiment", "--config", str(ml_config)])
+        assert rc == 0
+        out = capsys.readouterr().out
+        experiment_id = out.split("experiment_id: ")[1].split("\n")[0].strip()
+        rc = main(["train", "--config", str(ml_config), "--experiment-id", experiment_id])
+        assert rc == 0
+        capsys.readouterr()
+        return experiment_id
+
+    def test_compare_reports_a_result_and_a_definite_exit_code(
+        self, ml_config_lightgbm: Path, ml_config_baseline: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        candidate_id = self._prepare_and_train(ml_config_lightgbm, capsys)
+        baseline_id = self._prepare_and_train(ml_config_baseline, capsys)
+        rc = main([
+            "compare", "--config", str(ml_config_lightgbm),
+            "--candidate-experiment-id", candidate_id, "--baseline-experiment-id", baseline_id,
+            "--primary-metric", "mae",
+        ])
+        out = capsys.readouterr().out
+        assert rc in (0, 2)
+        assert "outperforms_all_baselines (mae):" in out
+        assert "mae:" in out
+
+    def test_compare_before_training_fails_actionably(self, ml_config_lightgbm: Path, ml_config_baseline: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = main(["prepare-experiment", "--config", str(ml_config_lightgbm)])
+        out = capsys.readouterr().out
+        candidate_id = out.split("experiment_id: ")[1].split("\n")[0].strip()
+        rc = main(["prepare-experiment", "--config", str(ml_config_baseline)])
+        out = capsys.readouterr().out
+        baseline_id = out.split("experiment_id: ")[1].split("\n")[0].strip()
+
+        rc = main([
+            "compare", "--config", str(ml_config_lightgbm),
+            "--candidate-experiment-id", candidate_id, "--baseline-experiment-id", baseline_id,
+            "--primary-metric", "mae",
+        ])
         assert rc == 1
         assert "ERROR" in capsys.readouterr().err

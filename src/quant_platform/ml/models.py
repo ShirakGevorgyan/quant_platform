@@ -98,6 +98,13 @@ class ArtifactCategory(Enum):
     TIMELINE = "timeline"
     """Milestone 4B: the per-fold time-bound `Timeline` for one execution
     run."""
+    TRAINING_METADATA = "training_metadata"
+    """Milestone 4C: one immutable `ml.training_metadata.TrainingMetadata`
+    record per fitted model -- training duration, seed, library name/
+    version, model version, hyperparameters, feature-schema fingerprint,
+    dataset content id, and experiment id, all in one place distinct from
+    the `MODEL` artifact itself (the fitted model's own serialized bytes
+    carry `ModelMetadata`, not this provenance record)."""
 
 
 class ExperimentStatus(Enum):
@@ -134,10 +141,83 @@ def is_legal_transition(current: ExperimentStatus, target: ExperimentStatus) -> 
 # --------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class ModelCapabilities:
+    """Milestone 4C additive fields (`supports_missing_values` through
+    `required_preprocessing`) declare exactly what the "MODEL REGISTRY"
+    section asks every model to state about itself: which raw feature
+    types it can consume directly, whether its fit/predict is
+    deterministic given a fixed seed, how (if at all) it actually uses
+    that seed, and what preprocessing (if any) callers are expected to
+    apply before handing it features. All five default to the
+    conservative "declare nothing extra" value so every pre-4C
+    `ModelCapabilities` construction (Milestone 4A/4B's `ConstantTestModel`
+    included) remains valid unchanged."""
+
     supported_objectives: tuple[ObjectiveType, ...]
     supports_predict_proba: bool = False
     supports_feature_importance: bool = False
     supports_incremental_fit: bool = False
+    supports_missing_values: bool = False
+    """True iff `fit`/`predict` accept NaN feature values directly (e.g.
+    LightGBM/XGBoost/CatBoost's native missing-value handling) -- never
+    "the platform silently imputes/fills them first" (no such
+    preprocessing framework exists; see Milestone 4B's own preprocessing-
+    safety audit)."""
+    supports_categorical_features: bool = False
+    """True iff `fit`/`predict` accept non-numeric (object/category dtype)
+    feature columns directly (e.g. CatBoost's/LightGBM's native
+    categorical handling). Every model, regardless of this flag, must
+    accept purely numeric feature columns -- that baseline is never
+    separately declared."""
+    is_deterministic: bool = True
+    """True iff `fit`/`predict` are bit-for-bit reproducible given an
+    identical `SeedConfiguration`, identical data, and identical
+    environment (the same limitation `ml.seeds`'s own module docstring
+    already documents: this is a claim about what THIS platform's seeding
+    controls, not a guarantee against every possible non-deterministic
+    native/GPU code path)."""
+    seed_usage: str = "none"
+    """Free-text, human-readable description of exactly what the derived
+    seed controls for this model (e.g. "controls native library RNG for
+    row/column subsampling and tie-breaking splits", "unused -- no
+    stochastic component"). Descriptive only, never machine-parsed."""
+    required_preprocessing: str = "none"
+    """Free-text, human-readable statement of what a caller is expected to
+    have already done to features before calling `fit`/`predict` (e.g.
+    "none -- tree splits are scale-invariant", "numeric features only, no
+    missing values; benefits from but does not require scaling"). This is
+    a DECLARATION for a human/report to read, never an executable
+    preprocessing spec -- this platform still implements no preprocessing
+    framework (Milestone 4B). See `requires_scaled_numeric_features` for
+    the machine-CHECKABLE form of the scaling requirement specifically --
+    this string is never parsed to decide whether to fit a model."""
+    requires_scaled_numeric_features: bool = False
+    """True iff this model's fit is scale-SENSITIVE (e.g. a linear model
+    whose coefficient magnitudes and L1/L2 penalty weighting depend on
+    features sharing a comparable scale) -- the machine-checkable
+    complement to `required_preprocessing`'s free-text description.
+    `ml.model_validation.validate_training_data` enforces this: it REJECTS
+    (fail-closed, before `fit`) unless the caller supplies typed evidence
+    (a `PreprocessingBinding` proving a scaling transform was actually FIT
+    for every feature this model declares) that a safe, train-only scaler
+    was applied -- since no fold-local preprocessing-refitting framework
+    exists yet (Milestone 4B/4C), that evidence can never actually exist
+    today, so a model declaring this `True` cannot currently be trained
+    through the real execution engine at all; it remains usable directly
+    (`ModelFactory.create().fit(...)`) for unit-level testing, which
+    exercises the model's OWN fit/predict logic, not the platform's
+    orchestrated safety gate. Tree-based models and every baseline are
+    scale-invariant by construction and always leave this `False`."""
+    library_name: str = "quant-platform"
+    """The `importlib.metadata` DISTRIBUTION name backing this model's fit/
+    predict (e.g. `"lightgbm"`, `"scikit-learn"`) -- looked up against
+    `ml.environment.capture_environment_snapshot`'s already-captured
+    `EnvironmentSnapshot.package_versions` (informational only, see that
+    module's docstring) to populate `ml.training_metadata.
+    TrainingMetadata.library_version`, rather than a second, parallel
+    version-introspection mechanism. Defaults to `"quant-platform"`
+    (this platform's OWN distribution name, matching `ml.environment.
+    _TRACKED_PACKAGES`'s exact spelling) for models with no external
+    library dependency (every baseline)."""
 
     def __post_init__(self) -> None:
         if not self.supported_objectives:
@@ -146,6 +226,12 @@ class ModelCapabilities:
             raise ValueError("ModelCapabilities.supported_objectives must not contain duplicates")
         if self.supports_predict_proba and ObjectiveType.REGRESSION in self.supported_objectives and len(self.supported_objectives) == 1:
             raise ValueError("A regression-only model cannot declare supports_predict_proba=True")
+        if not self.seed_usage:
+            raise ValueError("ModelCapabilities.seed_usage must not be empty")
+        if not self.required_preprocessing:
+            raise ValueError("ModelCapabilities.required_preprocessing must not be empty")
+        if not self.library_name:
+            raise ValueError("ModelCapabilities.library_name must not be empty")
 
     def supports(self, objective: ObjectiveType) -> bool:
         return objective in self.supported_objectives
@@ -163,6 +249,13 @@ class ModelCapabilities:
             "supports_predict_proba": self.supports_predict_proba,
             "supports_feature_importance": self.supports_feature_importance,
             "supports_incremental_fit": self.supports_incremental_fit,
+            "supports_missing_values": self.supports_missing_values,
+            "supports_categorical_features": self.supports_categorical_features,
+            "is_deterministic": self.is_deterministic,
+            "seed_usage": self.seed_usage,
+            "required_preprocessing": self.required_preprocessing,
+            "requires_scaled_numeric_features": self.requires_scaled_numeric_features,
+            "library_name": self.library_name,
         }
 
     @classmethod
@@ -174,6 +267,13 @@ class ModelCapabilities:
             supports_predict_proba=bool(raw.get("supports_predict_proba", False)),
             supports_feature_importance=bool(raw.get("supports_feature_importance", False)),
             supports_incremental_fit=bool(raw.get("supports_incremental_fit", False)),
+            supports_missing_values=bool(raw.get("supports_missing_values", False)),
+            supports_categorical_features=bool(raw.get("supports_categorical_features", False)),
+            is_deterministic=bool(raw.get("is_deterministic", True)),
+            seed_usage=str(raw.get("seed_usage", "none")),
+            library_name=str(raw.get("library_name", "quant-platform")),
+            required_preprocessing=str(raw.get("required_preprocessing", "none")),
+            requires_scaled_numeric_features=bool(raw.get("requires_scaled_numeric_features", False)),
         )
 
 

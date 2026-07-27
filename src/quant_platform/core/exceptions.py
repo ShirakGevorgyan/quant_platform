@@ -360,3 +360,19 @@ class ExecutionResumeError(ExecutionError):
     fold's recorded artifact is missing or corrupted, the requested
     execution has no prior manifest to resume, or an already-terminal
     execution is asked to resume without an explicit force restart."""
+
+
+# --------------------------------------------------------------------------
+# Baseline predictive model framework (Milestone 4C)
+# --------------------------------------------------------------------------
+class TrainingDataValidationError(ExecutionError):
+    """Raised when `ml.model_validation.validate_training_data`'s
+    `ValidationReport` for one fold's actual train partition contains an
+    ERROR- or CRITICAL-severity issue (missing values a model does not
+    support, constant/degenerate labels, a single training sample, etc.)
+    -- the per-fold, data-level analogue of `ExperimentValidationError`.
+    Raised by `execution.executor`'s production `FoldExecutor`
+    immediately before `TrainableModel.fit` would otherwise be called;
+    caught by `execution.runner` exactly like any other fold-level
+    exception (that fold is marked `FAILED`, the run continues to the
+    remaining folds)."""

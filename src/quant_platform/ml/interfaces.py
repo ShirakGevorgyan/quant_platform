@@ -164,6 +164,20 @@ class ProbabilisticPredictor(Predictor, Protocol):
 
 
 @runtime_checkable
+class DecisionFunctionPredictor(Predictor, Protocol):
+    """Milestone 4C: an additional, OPTIONAL capability -- only a model
+    with a natural raw margin/score BEFORE any probability transform
+    (e.g. `LogisticRegression`'s linear decision boundary distance)
+    implements this. Additive to the Protocol surface: it does not
+    replace or narrow `Predictor`/`ProbabilisticPredictor`, and most
+    models (tree ensembles, every baseline) simply do not implement it --
+    there is no "not applicable" flag to set anywhere; Python's
+    structural typing means a class either has the method or it doesn't."""
+
+    def decision_function(self, features: pd.DataFrame, *, column_policy: FeatureColumnPolicy = FeatureColumnPolicy.STRICT) -> np.ndarray: ...
+
+
+@runtime_checkable
 class FittedModel(Predictor, Protocol):
     """A model that has completed `fit`. Structurally distinct from
     `TrainableModel` -- see module docstring."""
@@ -219,6 +233,7 @@ class ModelDeserializer(Protocol):
 
 
 __all__ = [
+    "DecisionFunctionPredictor",
     "FeatureColumnPolicy",
     "FeatureSchema",
     "FittedModel",

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 
 import pandas as pd
 import pytest
@@ -120,3 +121,119 @@ class TestDatasetLockPathHelper:
 
         with pytest.raises(DataSourceError):
             dataset_lock_path(tmp_path, symbol="../escape", timeframe_value="M1")
+
+
+class TestNoDoubleAcquisitionUnderForcedInterleaving:
+    """Regression tests for a genuine race found during a Milestone 4C
+    release-readiness concurrency audit (not merely "pre-existing and
+    dismissed" -- reproduced deterministically, root-caused, and fixed).
+
+    ROOT CAUSE (previous implementation): the lock file was created via
+    `os.open(path, O_CREAT | O_EXCL | O_WRONLY)` -- exclusive-CREATE
+    atomic -- and its JSON content was written in a SEPARATE, later step.
+    Between those two steps, the lock path existed but was observably
+    EMPTY. A concurrent contender that lost the `open` race, fell into
+    `_handle_existing_lock`, and happened to call `_read_existing_lock`
+    during exactly that window would see unparseable (empty) content and
+    conclude the lock was corrupted -- a reasonable conclusion from what
+    it could observe, but a STALE one. If that contender then acted on
+    its stale conclusion (unlink + recreate) AFTER the true holder had
+    already finished writing and released its file descriptor, BOTH
+    ended up with `_held = True` simultaneously. Confirmed via a forced-
+    interleaving reproduction (deterministic `threading.Event`
+    synchronization, not sleep timing) before this fix; the SAME
+    reproduction technique is what the tests below use to prove it can
+    no longer happen.
+
+    FIX: `DatasetLock._try_publish` now writes the full JSON content to a
+    private, uniquely-named temp file FIRST, then publishes it at the
+    shared lock path via `os.link` -- which fails atomically with
+    `FileExistsError` if that path already exists, on both POSIX and
+    Windows. The shared lock path is therefore NEVER observable in a
+    content-less state: it either does not exist yet, or already has its
+    complete, valid content the instant it exists at all."""
+
+    def test_reader_never_observes_a_content_less_lock_file_even_when_forced_to_read_mid_publish(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        """Forces the EXACT interleaving that used to cause double
+        acquisition: thread A is paused (via a deterministic `threading.
+        Event`, never a sleep) with its lock content already written to
+        its private temp file, but BEFORE `os.link` publishes it. Thread
+        B is released only once thread A reaches that paused point, and
+        immediately checks the shared lock path. The old implementation
+        could show an EMPTY file here; the fix must show NO file at all
+        (never a content-less one) -- `_read_existing_lock` must never
+        be given a chance to misdiagnose a live acquisition as
+        corrupted."""
+        lock_path = tmp_path / ".lock"
+        real_link = os.link
+        writer_paused_before_link = threading.Event()
+        allow_writer_to_link = threading.Event()
+
+        def paused_link(src: str, dst: str) -> None:
+            writer_paused_before_link.set()
+            assert allow_writer_to_link.wait(timeout=5), "test failed to release the writer in time"
+            real_link(src, dst)
+
+        monkeypatch.setattr(os, "link", paused_link)
+
+        writer = DatasetLock(lock_path)
+        writer_thread = threading.Thread(target=writer.acquire)
+        writer_thread.start()
+
+        assert writer_paused_before_link.wait(timeout=5), "writer did not reach its pre-link pause in time"
+        # The critical assertion: at this exact instant (content already
+        # written to the writer's own private temp file, but NOT YET
+        # linked into the shared path), the shared lock path must not
+        # exist at all -- never present-but-empty/corrupted.
+        assert not lock_path.exists(), "lock path must never be observable before its content is fully published"
+
+        allow_writer_to_link.set()
+        writer_thread.join(timeout=5)
+        assert not writer_thread.is_alive()
+
+        assert lock_path.exists()
+        raw = json.loads(lock_path.read_text())  # must not raise -- always fully-formed JSON once present
+        assert raw["pid"] == os.getpid()
+        writer.release()
+
+    def test_exactly_one_winner_when_two_threads_link_at_the_same_instant(self, tmp_path, monkeypatch) -> None:
+        """Two threads' `os.link` publish attempts are released from a
+        `threading.Barrier` at (as close as the platform allows) the
+        SAME instant -- the strongest concurrent-acquisition pressure
+        this lock can be put under. Exactly one must succeed; the other
+        must fail loudly (`DatasetLockError`), never both, never neither,
+        never a silently corrupted lock file."""
+        lock_path = tmp_path / ".lock"
+        real_link = os.link
+        barrier = threading.Barrier(2, timeout=5)
+
+        def synchronized_link(src: str, dst: str) -> None:
+            barrier.wait()
+            real_link(src, dst)
+
+        monkeypatch.setattr(os, "link", synchronized_link)
+
+        results: list[str] = []
+        results_lock = threading.Lock()
+
+        def attempt() -> None:
+            lock = DatasetLock(lock_path)
+            try:
+                lock.acquire()
+                with results_lock:
+                    results.append("acquired")
+            except DatasetLockError:
+                with results_lock:
+                    results.append("rejected")
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert not any(t.is_alive() for t in threads)
+        assert sorted(results) == ["acquired", "rejected"]
+        assert json.loads(lock_path.read_text())  # exactly one, fully-valid lock file remains

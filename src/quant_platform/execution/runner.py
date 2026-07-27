@@ -54,6 +54,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -129,15 +130,26 @@ _SERIALIZER_REGISTRY: dict[str, tuple[ModelSerializer, ModelDeserializer]] = {
 }
 
 
-def resolve_serializer(serializer_id: str) -> ModelSerializer:
+def resolve_serializer(
+    serializer_id: str, *, registry: Mapping[str, tuple[ModelSerializer, ModelDeserializer]] | None = None,
+) -> ModelSerializer:
     """`ModelDefinition.serializer_id` is deliberately "resolved by a
     caller-provided lookup, never instantiated by the registry itself"
     (`ml.registry`'s own docstring) -- this is that lookup, the ML
     execution engine's one place that knows which serializer
-    implementation goes with which id. Only the test-only model's
-    serializer is registered; a future milestone adding a real model
-    registers its serializer here too."""
-    entry = _SERIALIZER_REGISTRY.get(serializer_id)
+    implementation goes with which id.
+
+    `registry` defaults to the built-in `_SERIALIZER_REGISTRY` (only the
+    test-only model) when omitted -- exactly the pre-Milestone-4C
+    behavior, unchanged. A caller wanting real models resolved (e.g.
+    `ExecutionRunner`, constructed with `additional_serializers`) passes
+    its OWN merged mapping instead. Deliberately NOT a hardcoded, ever-
+    growing module-level dict of every real model this platform will
+    ever ship: `execution.runner` must stay unaware that `ml.model_zoo`
+    (or any other real-model package) exists at all -- see
+    `ExecutionRunner.__init__`'s `additional_serializers` parameter."""
+    lookup = _SERIALIZER_REGISTRY if registry is None else registry
+    entry = lookup.get(serializer_id)
     if entry is None:
         raise UnknownModelDefinitionError(
             f"No serializer registered for serializer_id={serializer_id!r}", context={"serializer_id": serializer_id}
@@ -254,12 +266,23 @@ class ExecutionRunner:
         research_manifest_store: ResearchManifestStore,
         research_dataset_store: ResearchDatasetStore,
         fold_executor: FoldExecutor | None = None,
+        additional_serializers: Mapping[str, tuple[ModelSerializer, ModelDeserializer]] | None = None,
     ) -> None:
         self._artifacts_root = Path(ml_artifacts_root).resolve()
         self._model_registry = model_registry
         self._research_manifest_store = research_manifest_store
         self._research_dataset_store = research_dataset_store
         self._fold_executor: FoldExecutor = fold_executor if fold_executor is not None else DeterministicFoldExecutor()
+        # Merged serializer lookup for THIS runner instance -- the built-in
+        # test-only entry, plus whatever `additional_serializers` a caller
+        # supplied (e.g. `ml.model_zoo.default_serializer_registry()` for
+        # the real models). `execution.runner` itself still imports
+        # nothing from `ml.model_zoo` (or any other real-model package) --
+        # it only ever sees an externally-constructed mapping, preserving
+        # "no model-specific execution logic inside ExecutionRunner".
+        self._serializer_registry: dict[str, tuple[ModelSerializer, ModelDeserializer]] = {
+            **_SERIALIZER_REGISTRY, **dict(additional_serializers or {}),
+        }
 
         self._experiment_manifest_store = ExperimentManifestStore(self._artifacts_root)
         self._execution_manifest_store = ExecutionManifestStore(self._artifacts_root)
@@ -470,7 +493,7 @@ class ExecutionRunner:
         }
 
         model_definition = self._model_registry.get(spec.model_name, spec.model_version)
-        serializer = resolve_serializer(model_definition.serializer_id)
+        serializer = resolve_serializer(model_definition.serializer_id, registry=self._serializer_registry)
         feature_schema = FeatureSchema(feature_names=spec.feature_binding.feature_names)
 
         for position, fold in enumerate(resume_plan.remaining_folds):

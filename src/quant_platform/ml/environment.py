@@ -43,7 +43,15 @@ from quant_platform.ml.models import CodeRevisionBinding, EnvironmentSnapshot
 from quant_platform.ml.persistence import format_utc_timestamp, utc_now
 
 _SCHEMA_VERSION = 1
-_TRACKED_PACKAGES = ("numpy", "pandas", "pydantic", "pyarrow", "quant-platform")
+_TRACKED_PACKAGES = (
+    "numpy", "pandas", "pydantic", "pyarrow", "quant-platform",
+    # Milestone 4C: the real predictive-model libraries -- tracked here
+    # (informationally, never identity-relevant -- see module docstring)
+    # so `ml.training_metadata.TrainingMetadata.library_version` can be
+    # looked up from this SAME already-captured snapshot rather than a
+    # second, parallel introspection mechanism.
+    "lightgbm", "xgboost", "catboost", "scikit-learn", "scipy",
+)
 _GIT_TIMEOUT_SECONDS = 5
 
 

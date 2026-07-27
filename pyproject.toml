@@ -25,6 +25,21 @@ dependencies = [
     "pandas>=2.2,<3.1",
     "pydantic>=2.6,<3.0",
     "pyarrow>=15.0",
+    # Milestone 4C baseline predictive model framework: each of these is
+    # imported directly by quant_platform.ml (metrics.py, comparison.py)
+    # and quant_platform.ml.model_zoo (linear.py, lightgbm_model.py,
+    # xgboost_model.py, catboost_model.py) -- never merely a transitive
+    # dependency of another declared package. Floors are the major/minor
+    # line this milestone was actually tested against (see the delivery
+    # report for exact patch versions); ceilings exclude the next major
+    # version, which for every one of these libraries has historically
+    # meant breaking API/behavior changes this platform has not verified
+    # against.
+    "lightgbm>=4.0,<5.0",
+    "xgboost>=3.0,<4.0",
+    "catboost>=1.2,<2.0",
+    "scikit-learn>=1.4,<2.0",
+    "scipy>=1.11,<2.0",
 ]
 
 [project.optional-dependencies]

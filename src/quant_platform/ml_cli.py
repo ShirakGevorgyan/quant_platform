@@ -1,5 +1,6 @@
 """Command-line interface for the ML core infrastructure and artifact
-foundation (Milestone 4A) and the time-safe execution engine (Milestone 4B).
+foundation (Milestone 4A), the time-safe execution engine (Milestone 4B),
+and the baseline predictive model framework (Milestone 4C).
 
     python -m quant_platform.ml_cli list-model-definitions
     python -m quant_platform.ml_cli describe-model-definition --name constant_test_model --version 1
@@ -15,25 +16,46 @@ foundation (Milestone 4A) and the time-safe execution engine (Milestone 4B).
     python -m quant_platform.ml_cli inspect-fold --config config.json --experiment-id ID --fold-index N
     python -m quant_platform.ml_cli list-folds --config config.json --experiment-id ID
     python -m quant_platform.ml_cli verify-execution --config config.json --experiment-id ID
+    python -m quant_platform.ml_cli list-models
+    python -m quant_platform.ml_cli inspect-model --name lightgbm --version 1
+    python -m quant_platform.ml_cli validate-model --config config.json
+    python -m quant_platform.ml_cli train --config config.json --experiment-id ID
+    python -m quant_platform.ml_cli compare --config config.json --candidate-experiment-id ID --baseline-experiment-id ID [--baseline-experiment-id ID ...] --primary-metric roc_auc
 
 Same operability conventions as `data_cli`/`feature_cli`: every command
 returns 0 on success, non-zero on failure, and prints an actionable
 stderr message -- never a raw traceback. `prepare-experiment` and
 `validate-experiment` return 2 (not 1) when the experiment/spec itself
 is not ready -- distinct from 1, which means the COMMAND itself failed
-(bad config, missing dataset, etc). `execute`/`resume` follow the same
-convention: 2 when the execution ends with one or more failed folds,
-never a traceback.
+(bad config, missing dataset, etc). `execute`/`resume`/`train` follow
+the same convention: 2 when the execution ends with one or more failed
+folds, never a traceback. `validate-model` mirrors `validate-experiment`:
+2 when `ml.model_validation.validate_training_data`'s report is not
+ready.
 
-NO TRAIN/PREDICT COMMANDS ON A REAL MODEL
+`build_model_registry()` NOW REGISTERS REAL MODELS TOO (MILESTONE 4C)
 --------------------------------------------------------------------------
-There is deliberately no command here that could fit a REAL predictive
-algorithm -- `execute`/`resume` run the walk-forward engine's full fit/
-predict pipeline (see `execution.executor`'s module docstring for why
-that is in scope), but the only model EVER registered by
-`build_model_registry()` below is `ml.testing.ConstantTestModelFactory`,
-explicitly labeled as a test-only model, never a real predictive
-algorithm.
+Every command that resolves a model definition (`list-model-definitions`,
+`describe-model-definition`, `prepare-experiment`, `validate-experiment`,
+`execute`, `resume`, `list-models`, `inspect-model`, `validate-model`,
+`train`) now sees `ml.testing.ConstantTestModelFactory` (still
+explicitly test-only) AND all nine Milestone 4C production models
+(`ml.model_zoo.register_default_models`) -- purely additive; nothing
+about an experiment referencing the test model changes.
+
+`execute`/`resume` STILL USE `DeterministicFoldExecutor` (UNCHANGED)
+--------------------------------------------------------------------------
+`train` is the NEW, additional command that runs the identical pipeline
+`execute` does (same "already `ready`, resolved via `prepare-experiment`"
+requirement) but with `execution.executor.MetricsFoldExecutor` --
+computing real metrics, capturing `predict_proba`, and persisting a
+`TrainingMetadata` provenance artifact. `execute`/`resume` are left
+exactly as Milestone 4B shipped them (`DeterministicFoldExecutor`, no
+metrics) -- a real model run through `execute` instead of `train` still
+completes successfully (every 4C model satisfies `DeterministicFoldExecutor`'s
+requirements too), just without the 4C-specific artifacts/metrics. This
+is a deliberate, conservative choice: no existing command's default
+behavior changes at all.
 """
 
 from __future__ import annotations
@@ -46,11 +68,12 @@ from pydantic import ValidationError
 
 from quant_platform.config.ml_schemas import MLExperimentConfig
 from quant_platform.core.exceptions import QuantPlatformError
-from quant_platform.execution.executor import DeterministicFoldExecutor
+from quant_platform.execution.executor import DeterministicFoldExecutor, MetricsFoldExecutor
 from quant_platform.execution.manifests import ExecutionManifestStore
 from quant_platform.execution.reporting import build_execution_report_json, render_execution_report_markdown
 from quant_platform.execution.results import AggregatedExecutionResult, FoldResult
 from quant_platform.execution.runner import ExecutionRunner
+from quant_platform.execution.splitters import reconstruct_dataset_timeline
 from quant_platform.execution.state_machine import ExecutionStage
 from quant_platform.execution.timeline import Timeline
 from quant_platform.execution.verification import verify_execution
@@ -59,11 +82,15 @@ from quant_platform.features.manifests import (
     ResearchDatasetStore,
     ResearchManifestStore,
 )
+from quant_platform.ml import model_zoo as mz
 from quant_platform.ml.artifacts import MLArtifactStore
+from quant_platform.ml.comparison import ModelFoldMetrics, compare_to_baselines
 from quant_platform.ml.environment import capture_code_revision_binding
 from quant_platform.ml.experiment_manager import ExperimentPreparer
 from quant_platform.ml.experiment_spec import ExperimentSpec
+from quant_platform.ml.interfaces import FeatureSchema
 from quant_platform.ml.manifests import ExperimentManifest, ExperimentManifestStore
+from quant_platform.ml.model_validation import validate_training_data
 from quant_platform.ml.models import (
     DatasetBinding,
     ExperimentStatus,
@@ -80,12 +107,16 @@ from quant_platform.ml.testing import TEST_MODEL_NAME, TEST_MODEL_VERSION, Const
 from quant_platform.ml.tracking import ExperimentEventStore
 from quant_platform.ml.validation import validate_experiment_spec
 
+_TIMESTAMP_COLUMN = "open_time"
+_LABEL_COLUMN = "label"
+
 
 def build_model_registry() -> ModelRegistry:
-    """The only registry this milestone ships -- one TEST-ONLY model
-    (`ml.testing.ConstantTestModelFactory`), explicitly labeled as such.
-    A future milestone that adds a real model registers it here too;
-    nothing about this function's shape needs to change."""
+    """The test-only model (`ml.testing.ConstantTestModelFactory`,
+    explicitly labeled as such, never a real predictive algorithm) PLUS
+    every Milestone 4C production model (`ml.model_zoo.
+    register_default_models`) -- LightGBM, XGBoost, CatBoost, Logistic
+    Regression, Elastic Net, and the four mandatory baselines."""
     registry = ModelRegistry()
     registry.register(
         ModelDefinition(
@@ -99,6 +130,7 @@ def build_model_registry() -> ModelRegistry:
             factory=ConstantTestModelFactory(), serializer_id="constant_test_model_json_v1",
         )
     )
+    mz.register_default_models(registry)
     return registry
 
 
@@ -167,12 +199,13 @@ def cmd_describe_model_definition(args: argparse.Namespace) -> int:
     return 0
 
 
-def _build_execution_runner(config: MLExperimentConfig) -> ExecutionRunner:
+def _build_execution_runner(config: MLExperimentConfig, *, fold_executor: DeterministicFoldExecutor | MetricsFoldExecutor | None = None) -> ExecutionRunner:
     return ExecutionRunner(
         ml_artifacts_root=config.ml_artifacts_root, model_registry=build_model_registry(),
         research_manifest_store=ResearchManifestStore(config.dataset.research_storage_root),
         research_dataset_store=ResearchDatasetStore(config.dataset.research_storage_root),
-        fold_executor=DeterministicFoldExecutor(),
+        fold_executor=fold_executor if fold_executor is not None else DeterministicFoldExecutor(),
+        additional_serializers=mz.default_serializer_registry(),
     )
 
 
@@ -261,9 +294,11 @@ def cmd_list_experiment_events(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_or_resume(args: argparse.Namespace, *, is_resume: bool) -> int:
+def _run_or_resume(
+    args: argparse.Namespace, *, is_resume: bool, fold_executor: DeterministicFoldExecutor | MetricsFoldExecutor | None = None,
+) -> int:
     config = _load_config(Path(args.config))
-    runner = _build_execution_runner(config)
+    runner = _build_execution_runner(config, fold_executor=fold_executor)
     force_rerun_folds = frozenset(getattr(args, "force_rerun_fold", None) or [])
     outcome = (
         runner.resume(args.experiment_id, force_rerun_folds=force_rerun_folds) if is_resume
@@ -283,6 +318,16 @@ def cmd_execute_experiment(args: argparse.Namespace) -> int:
 
 def cmd_resume_execution(args: argparse.Namespace) -> int:
     return _run_or_resume(args, is_resume=True)
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    """Identical requirement as `execute` (the experiment must already be
+    `ready`, via a prior `prepare-experiment`) and identical transparent-
+    resume behavior -- the only difference is `fold_executor=
+    MetricsFoldExecutor()`: real per-fold metrics, `predict_proba`
+    capture, and a persisted `TrainingMetadata` artifact, on top of
+    everything `execute` already does."""
+    return _run_or_resume(args, is_resume=False, fold_executor=MetricsFoldExecutor())
 
 
 def _execution_manifest_store(config: MLExperimentConfig) -> ExecutionManifestStore:
@@ -371,11 +416,151 @@ def cmd_verify_execution(args: argparse.Namespace) -> int:
     return 0 if report.is_ready else 2
 
 
+def cmd_list_models(args: argparse.Namespace) -> int:  # noqa: ARG001 -- uniform handler signature
+    """Milestone 4C: distinct from `list-model-definitions` (a plain
+    name/description dump reused from Milestone 4A) -- one line per
+    registered model summarizing exactly the capability fields the
+    "MODEL REGISTRY" section requires every model to declare."""
+    registry = build_model_registry()
+    for definition in registry.list_definitions():
+        cap = definition.capabilities
+        objectives = "/".join(o.value for o in cap.supported_objectives)
+        print(
+            f"{definition.qualified_name}: objectives=[{objectives}] predict_proba={cap.supports_predict_proba} "
+            f"feature_importance={cap.supports_feature_importance} missing_values={cap.supports_missing_values} "
+            f"categorical={cap.supports_categorical_features} deterministic={cap.is_deterministic} "
+            f"library={cap.library_name}"
+        )
+    return 0
+
+
+def cmd_inspect_model(args: argparse.Namespace) -> int:
+    """Milestone 4C: distinct from `describe-model-definition` (a raw
+    `to_json_dict()` dump) -- prints every declared capability field on
+    its own line, including the free-text `seed_usage`/
+    `required_preprocessing` declarations `describe-model-definition`'s
+    JSON dump renders less readably."""
+    registry = build_model_registry()
+    definition = registry.get(args.name, args.version)
+    cap = definition.capabilities
+    print(f"model: {definition.qualified_name}")
+    print(f"description: {definition.description}")
+    print(f"serializer_id: {definition.serializer_id}")
+    print(f"fingerprint: {definition.fingerprint()}")
+    print(f"supported_objectives: {[o.value for o in cap.supported_objectives]}")
+    print(f"supports_predict_proba: {cap.supports_predict_proba}")
+    print(f"supports_feature_importance: {cap.supports_feature_importance}")
+    print(f"supports_incremental_fit: {cap.supports_incremental_fit}")
+    print(f"supports_missing_values: {cap.supports_missing_values}")
+    print(f"supports_categorical_features: {cap.supports_categorical_features}")
+    print(f"is_deterministic: {cap.is_deterministic}")
+    print(f"seed_usage: {cap.seed_usage}")
+    print(f"required_preprocessing: {cap.required_preprocessing}")
+    print(f"library_name: {cap.library_name}")
+    return 0
+
+
+def cmd_validate_model(args: argparse.Namespace) -> int:
+    """Milestone 4C "MODEL VALIDATION": a standalone, dry-run (writes
+    nothing) check of `ml.model_validation.validate_training_data`
+    against the FULL reconstructed dataset timeline this config's
+    `dataset_binding` refers to -- a coarser, whole-dataset version of
+    the SAME per-fold gate `execution.executor.MetricsFoldExecutor` runs
+    automatically immediately before every fold's `fit`. Useful for
+    catching a gross model/dataset incompatibility (missing values, a
+    non-numeric column, a fully-constant label) before ever calling
+    `train`."""
+    config = _load_config(Path(args.config))
+    spec, _ = build_experiment_spec(config)
+    definition = build_model_registry().get(spec.model_name, spec.model_version)
+    feature_schema = FeatureSchema(feature_names=spec.feature_binding.feature_names)
+    trainable = definition.factory.create(
+        hyperparameters=spec.hyperparameters, feature_schema=feature_schema, objective=spec.objective,
+    )
+
+    research_dataset_store = ResearchDatasetStore(config.dataset.research_storage_root)
+    timeline = reconstruct_dataset_timeline(
+        research_dataset_store, dataset_id=spec.dataset_binding.dataset_id,
+        content_id=spec.dataset_binding.content_id, timestamp_column=_TIMESTAMP_COLUMN,
+    )
+    features = timeline[list(feature_schema.feature_names)]
+    labels = timeline[_LABEL_COLUMN]
+
+    report = validate_training_data(metadata=trainable.metadata, features=features, labels=labels)
+    for issue in report.issues:
+        print(f"[{issue.severity.value}] {issue.code}: {issue.message}")
+    print(f"is_ready: {report.is_ready}")
+    return 0 if report.is_ready else 2
+
+
+def _load_fold_metrics(config: MLExperimentConfig, experiment_id: str) -> ModelFoldMetrics:
+    experiment_manifest = _load_manifest(config, experiment_id)
+    execution_manifest = _execution_manifest_store(config).load(experiment_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    fold_identities: list[int] = []
+    per_fold_metrics: list[dict[str, float]] = []
+    for fold_index in sorted(execution_manifest.fold_result_references):
+        ref = execution_manifest.fold_result_references[fold_index]
+        raw = artifact_store.read_artifact(ref.content_hash)
+        fold_result = FoldResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+        # `FoldResult.metrics` is declared as `Mapping[str, JsonPrimitive]`
+        # (Milestone 4B's general-purpose placeholder type); every value
+        # `MetricsFoldExecutor` actually stores is a `float` (see `ml.
+        # metrics.MetricComputationReport.values`) -- filtered the same
+        # way `ml.metrics.aggregate_fold_metrics` already does, never
+        # trusting the wider declared type is narrower than it says.
+        fold_identities.append(fold_result.fold_index)
+        per_fold_metrics.append({
+            name: float(value) for name, value in fold_result.metrics.items()
+            if not isinstance(value, bool) and isinstance(value, (int, float))
+        })
+    if not per_fold_metrics:
+        raise ValueError(f"No fold results recorded yet for experiment_id={experiment_id!r} -- run 'train' first")
+    model_label = f"{experiment_manifest.spec.model_name}@{experiment_manifest.spec.model_version}:{experiment_id[:12]}"
+    # `fold_identities` is `FoldResult.fold_index` itself (never just this
+    # loop's own enumeration position) -- `ml.comparison` pairs candidate
+    # and baseline folds by this IDENTITY, never by raw list position.
+    return ModelFoldMetrics(model_name=model_label, per_fold_metrics=tuple(per_fold_metrics), fold_identities=tuple(fold_identities))
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Milestone 4C "MODEL COMPARISON": loads the candidate's and every
+    named baseline's already-persisted per-fold `FoldResult.metrics`
+    (never re-running anything), then reports `ml.comparison.
+    compare_to_baselines`'s full per-metric statistical comparison plus
+    the single `outperforms_all_baselines` gate for `--primary-metric`.
+    Returns 2 (not 1) when that gate is `False` -- "never declare a
+    model successful unless it statistically outperforms every
+    baseline" made an exit-code-checkable fact, not just a printed
+    report a caller must parse."""
+    config = _load_config(Path(args.config))
+    candidate = _load_fold_metrics(config, args.candidate_experiment_id)
+    baselines = [_load_fold_metrics(config, eid) for eid in args.baseline_experiment_id]
+    report = compare_to_baselines(candidate, baselines)
+
+    for baseline_report in report.baseline_reports:
+        print(f"=== {report.candidate_name} vs {baseline_report.baseline_name} ===")
+        for mc in baseline_report.metric_comparisons:
+            candidate_mean = "n/a" if mc.candidate_aggregate is None else f"{mc.candidate_aggregate.mean:.6f}"
+            baseline_mean = "n/a" if mc.baseline_aggregate is None else f"{mc.baseline_aggregate.mean:.6f}"
+            p_value = "n/a" if mc.p_value is None else f"{mc.p_value:.6f}"
+            reason = f" ({mc.reason})" if mc.reason else ""
+            print(
+                f"  {mc.metric_name}: candidate_mean={candidate_mean} baseline_mean={baseline_mean} "
+                f"paired_n={mc.paired_n} p_value={p_value} outcome={mc.outcome.value}{reason}"
+            )
+
+    outperforms = report.outperforms_all_baselines(args.primary_metric)
+    print(f"outperforms_all_baselines ({args.primary_metric}): {outperforms}")
+    return 0 if outperforms else 2
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m quant_platform.ml_cli",
-        description="ML core infrastructure and artifact foundation CLI (Milestone 4A) -- prepares and "
-        "validates experiments; trains nothing.",
+        description="ML core infrastructure and artifact foundation CLI: experiment preparation (Milestone "
+        "4A), the time-safe execution engine (Milestone 4B), and the baseline predictive model framework "
+        "(Milestone 4C).",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -460,6 +645,44 @@ def build_parser() -> argparse.ArgumentParser:
     verify_execution_parser.add_argument("--config", required=True)
     verify_execution_parser.add_argument("--experiment-id", required=True)
     verify_execution_parser.set_defaults(handler=cmd_verify_execution)
+
+    list_models_parser = subparsers.add_parser(
+        "list-models", help="Milestone 4C: list every registered model with a one-line capability summary."
+    )
+    list_models_parser.set_defaults(handler=cmd_list_models)
+
+    inspect_model_parser = subparsers.add_parser(
+        "inspect-model", help="Milestone 4C: print one model's full declared capabilities."
+    )
+    inspect_model_parser.add_argument("--name", required=True)
+    inspect_model_parser.add_argument("--version", required=True)
+    inspect_model_parser.set_defaults(handler=cmd_inspect_model)
+
+    validate_model_parser = subparsers.add_parser(
+        "validate-model", help="Milestone 4C: dry-run pre-fit model/data compatibility check; writes nothing."
+    )
+    validate_model_parser.add_argument("--config", required=True)
+    validate_model_parser.set_defaults(handler=cmd_validate_model)
+
+    train_parser = subparsers.add_parser(
+        "train", help="Milestone 4C: run (or transparently resume) a READY experiment with real metrics/probabilities/training-metadata capture.",
+    )
+    train_parser.add_argument("--config", required=True)
+    train_parser.add_argument("--experiment-id", required=True)
+    train_parser.add_argument(
+        "--force-rerun-fold", type=int, action="append", default=None,
+        help="Re-run this fold index even if already verified complete (repeatable).",
+    )
+    train_parser.set_defaults(handler=cmd_train)
+
+    compare_parser = subparsers.add_parser(
+        "compare", help="Milestone 4C: statistically compare a candidate experiment's per-fold metrics against one or more baseline experiments.",
+    )
+    compare_parser.add_argument("--config", required=True)
+    compare_parser.add_argument("--candidate-experiment-id", required=True)
+    compare_parser.add_argument("--baseline-experiment-id", action="append", required=True, help="Repeatable -- at least one required.")
+    compare_parser.add_argument("--primary-metric", required=True)
+    compare_parser.set_defaults(handler=cmd_compare)
 
     return parser
 

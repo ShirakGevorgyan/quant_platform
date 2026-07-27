@@ -13,16 +13,22 @@ same dataset at once" from a silent race into an explicit, loud failure
 "no corruption, but nondeterministic" fallback.
 
 The lock is a plain file (`<dataset_dir>/.lock`) containing the holder's
-PID, hostname, and UTC acquisition time, created with an exclusive
-(fail-if-exists) open -- atomic on both POSIX and Windows. A lock older
-than `stale_after` is considered abandoned (the holder crashed without
-releasing it) and can be forcibly reclaimed, logging a warning; this is
-the "stale-lock recovery" half of the contract. There is no distributed
-consensus here (this is a local-filesystem advisory lock, appropriate for
-this platform's single-machine, single-writer-at-a-time design target),
-and it does not protect against a process that ignores it -- it protects
-cooperating callers (`apply_incremental_update` always acquires it) from
-each other.
+PID, hostname, and UTC acquisition time. It is published atomically,
+CONTENT INCLUDED: the full JSON payload is written to a private,
+uniquely-named temp file first, then "published" at the shared lock path
+via `os.link` (which fails atomically with `FileExistsError` if that path
+already exists, on both POSIX and Windows) -- see `DatasetLock._try_
+publish`'s own docstring for why a plain exclusive-CREATE-then-separate-
+write is not enough: it lets a concurrent contender observe the lock file
+mid-creation (created, but still empty) and misdiagnose a live lock as
+corrupted. A lock older than `stale_after` is considered abandoned (the
+holder crashed without releasing it) and can be forcibly reclaimed,
+logging a warning; this is the "stale-lock recovery" half of the
+contract. There is no distributed consensus here (this is a local-
+filesystem advisory lock, appropriate for this platform's single-machine,
+single-writer-at-a-time design target), and it does not protect against a
+process that ignores it -- it protects cooperating callers
+(`apply_incremental_update` always acquires it) from each other.
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ import json
 import logging
 import os
 import socket
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -87,16 +94,51 @@ class DatasetLock:
     def acquire(self) -> None:
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
         info = LockInfo(pid=os.getpid(), hostname=socket.gethostname(), acquired_at=pd.Timestamp.now(tz="UTC"))
-        try:
-            fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            self._handle_existing_lock(info)
-            return
-        else:
-            with os.fdopen(fd, "w") as fh:
-                fh.write(json.dumps(info.to_json_dict()))
+        if self._try_publish(info):
             self._held = True
             logger.info("Dataset lock acquired: path=%s pid=%d", self._lock_path, info.pid)
+            return
+        self._handle_existing_lock(info)
+
+    def _try_publish(self, info: LockInfo) -> bool:
+        """Atomically publishes `info` as the lock file's FULL content at
+        `self._lock_path`, or returns `False` if a lock file already
+        exists there (never raises for that expected case).
+
+        WHY NOT `os.open(path, O_CREAT | O_EXCL | O_WRONLY)` FOLLOWED BY
+        A SEPARATE WRITE (the previous implementation)
+        --------------------------------------------------------------
+        That sequence is exclusive-CREATE atomic, but the file is
+        observably EMPTY for the (short but real) window between the
+        `open` succeeding and the subsequent `write` completing. A
+        concurrent contender that lost the `open` race and falls into
+        `_handle_existing_lock` can call `_read_existing_lock` during
+        exactly that window, see an empty/unparseable file, and
+        (correctly, given what it can observe) conclude the lock is
+        corrupted -- reclaiming it by unlinking and recreating even
+        though the original holder is still alive and about to write.
+        If the original holder finishes writing and releases its own
+        file descriptor before the "reclaimer" gets to its own unlink-
+        and-recreate step, BOTH ends up believing they hold the lock
+        (verified via a forced-interleaving reproduction; see this
+        class's regression test for the exact sequence).
+
+        Writing the FULL content to a private, uniquely-named temp file
+        FIRST, then "publishing" it via `os.link` (which fails atomically
+        with `FileExistsError` if the destination already exists, on
+        both POSIX and Windows) means the shared lock path is NEVER
+        observable in a content-less state: it either does not exist yet,
+        or already has its complete, valid content the moment it exists
+        at all."""
+        tmp_path = self._lock_path.with_name(f".{self._lock_path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
+        tmp_path.write_text(json.dumps(info.to_json_dict()))
+        try:
+            os.link(tmp_path, self._lock_path)
+            return True
+        except FileExistsError:
+            return False
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     def _handle_existing_lock(self, new_info: LockInfo) -> None:
         existing = self._read_existing_lock()
@@ -119,18 +161,15 @@ class DatasetLock:
                 "Reclaiming unreadable/corrupted dataset lock file: path=%s", self._lock_path
             )
         # Reclaim: remove the stale/corrupted lock and retry acquisition
-        # once. A second collision here means a genuine concurrent
+        # once, via the SAME atomic write-then-link publish path `acquire`
+        # itself uses. A second collision here means a genuine concurrent
         # acquisition race lost -- surface that rather than looping.
         self._lock_path.unlink(missing_ok=True)
-        try:
-            fd = os.open(self._lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
+        if not self._try_publish(new_info):
             raise DatasetLockError(
                 f"Lost a race reclaiming stale lock {self._lock_path} against another process",
                 context={"lock_path": str(self._lock_path)},
-            ) from exc
-        with os.fdopen(fd, "w") as fh:
-            fh.write(json.dumps(new_info.to_json_dict()))
+            )
         self._held = True
         logger.info("Dataset lock reclaimed and acquired: path=%s pid=%d", self._lock_path, new_info.pid)
 
