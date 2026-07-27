@@ -51,6 +51,7 @@ this module reads it from there rather than re-deciding per call site.
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -351,6 +352,13 @@ class RankedModel:
     primary_metric_mean: float
     outperforms_all_baselines: bool
     comparison_report: ModelComparisonReport
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.primary_metric_mean):
+            raise ValueError(
+                f"RankedModel.primary_metric_mean must be finite, got {self.primary_metric_mean!r} -- a "
+                "non-finite mean must never be allowed to enter the ranking sort"
+            )
 
     def to_json_dict(self) -> dict[str, object]:
         return {

@@ -28,6 +28,7 @@ drew between `FoldResult` (per-fold outcome) and `ExecutionManifest`
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from quant_platform.ml.models import JsonPrimitive, validate_json_primitive_mapping
@@ -65,8 +66,11 @@ class TrainingMetadata:
             raise ValueError("TrainingMetadata.library_version must not be empty")
         if self.seed < 0:
             raise ValueError(f"TrainingMetadata.seed must be >= 0, got {self.seed}")
-        if self.training_duration_seconds < 0:
-            raise ValueError(f"TrainingMetadata.training_duration_seconds must be >= 0, got {self.training_duration_seconds}")
+        if not math.isfinite(self.training_duration_seconds) or self.training_duration_seconds < 0:
+            raise ValueError(
+                f"TrainingMetadata.training_duration_seconds must be a finite number >= 0, "
+                f"got {self.training_duration_seconds}"
+            )
         if not self.feature_schema_fingerprint:
             raise ValueError("TrainingMetadata.feature_schema_fingerprint must not be empty")
         if not self.dataset_content_id:

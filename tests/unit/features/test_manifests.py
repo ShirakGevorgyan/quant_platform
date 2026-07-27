@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
@@ -102,6 +104,74 @@ class TestResearchDatasetStore:
         assert store.current_content_id("crash_ds") == content_id
 
 
+class TestCorruptedResearchArtifactsFailClosed:
+    """Milestone 4D.1 completion: `features.manifests` now reads through
+    `quant_platform.core.json.parse_json_strict` (previously plain
+    `json.loads`) for both `metadata.json` and `preprocessing.json`."""
+
+    def _written(self, tmp_path) -> tuple[ResearchDatasetStore, str]:
+        store = ResearchDatasetStore(tmp_path)
+        content_id, _ = store.write_artifacts("ds1", splits=_splits(), preprocessing_json={"global": {"a": 1}})
+        return store, content_id
+
+    def test_malformed_metadata_json_rejected(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        (store.content_dir("ds1", content_id) / "metadata.json").write_text("{not valid json")
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.read_artifacts("ds1", content_id)
+
+    def test_metadata_json_with_nan_metric_field_rejected(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        path = store.content_dir("ds1", content_id) / "metadata.json"
+        raw = path.read_text()
+        path.write_text(raw[:-1] + ',"bogus_metric":NaN}' if raw.endswith("}") else raw)
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.read_artifacts("ds1", content_id)
+
+    def test_metadata_json_non_object_root_rejected(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        (store.content_dir("ds1", content_id) / "metadata.json").write_text("[1, 2, 3]")
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.read_artifacts("ds1", content_id)
+
+    def test_metadata_json_duplicate_key_rejected(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        (store.content_dir("ds1", content_id) / "metadata.json").write_text('{"split_names": [], "split_names": []}')
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.read_artifacts("ds1", content_id)
+
+    def test_preprocessing_json_malformed_rejected(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        (store.content_dir("ds1", content_id) / "preprocessing.json").write_text("{not valid json")
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.read_preprocessing("ds1", content_id)
+
+    def test_preprocessing_json_infinity_rejected(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        (store.content_dir("ds1", content_id) / "preprocessing.json").write_text('{"scale": Infinity}')
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.read_preprocessing("ds1", content_id)
+
+    def test_preprocessing_json_non_object_root_rejected(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        (store.content_dir("ds1", content_id) / "preprocessing.json").write_text("[1, 2, 3]")
+        with pytest.raises(ResearchDatasetError, match="must decode to a JSON object"):
+            store.read_preprocessing("ds1", content_id)
+
+    def test_preprocessing_json_invalid_utf8_rejected(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        (store.content_dir("ds1", content_id) / "preprocessing.json").write_bytes(b"\xff\xfe\x00bad \x80\x81")
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.read_preprocessing("ds1", content_id)
+
+    def test_valid_artifacts_remain_readable_after_migration(self, tmp_path) -> None:
+        store, content_id = self._written(tmp_path)
+        loaded = store.read_artifacts("ds1", content_id)
+        assert loaded is not None
+        preprocessing = store.read_preprocessing("ds1", content_id)
+        assert preprocessing == {"global": {"a": 1}}
+
+
 class TestResearchManifestStore:
     def _manifest(self, **overrides) -> ResearchDatasetManifest:
         base = {
@@ -166,6 +236,48 @@ class TestResearchManifestStore:
         assert restored.dataset_id == manifest.dataset_id
         assert restored.feature_names == manifest.feature_names
         assert restored.row_counts == manifest.row_counts
+
+    def _saved_path(self, tmp_path) -> tuple[ResearchManifestStore, Path]:
+        store = ResearchManifestStore(tmp_path)
+        version = store.save(self._manifest())
+        path = tmp_path / "research_datasets" / "dataset_id=ds1" / "manifests" / f"{version}.json"
+        return store, path
+
+    def test_malformed_manifest_json_rejected(self, tmp_path) -> None:
+        store, path = self._saved_path(tmp_path)
+        path.write_text("{not valid json")
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.load("ds1")
+
+    def test_manifest_json_with_nan_field_rejected(self, tmp_path) -> None:
+        store, path = self._saved_path(tmp_path)
+        raw = path.read_text()
+        path.write_text(raw.replace('"row_counts":{"train":10}', '"row_counts":{"train":NaN}'))
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.load("ds1")
+
+    def test_manifest_json_non_object_root_rejected(self, tmp_path) -> None:
+        store, path = self._saved_path(tmp_path)
+        path.write_text("[1, 2, 3]")
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.load("ds1")
+
+    def test_manifest_json_invalid_utf8_rejected(self, tmp_path) -> None:
+        store, path = self._saved_path(tmp_path)
+        path.write_bytes(b"\xff\xfe\x00invalid utf8 \x80\x81")
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.load("ds1")
+
+    def test_manifest_json_duplicate_key_rejected(self, tmp_path) -> None:
+        store, path = self._saved_path(tmp_path)
+        path.write_text('{"dataset_id": "a", "dataset_id": "b"}')
+        with pytest.raises(ResearchDatasetError, match="corrupted"):
+            store.load("ds1")
+
+    def test_valid_manifest_remains_readable_after_migration(self, tmp_path) -> None:
+        store, _ = self._saved_path(tmp_path)
+        loaded = store.load("ds1")
+        assert loaded.dataset_id == "ds1"
 
 
 class TestComputeDatasetId:

@@ -50,8 +50,6 @@ never escalated to a false claim of corruption:
 
 from __future__ import annotations
 
-import json
-
 from quant_platform.core.exceptions import ArtifactCorruptionError, ArtifactNotFoundError, SchemaVersionError
 from quant_platform.execution.manifests import ExecutionManifest, ExecutionManifestStore
 from quant_platform.execution.results import AggregatedExecutionResult, FoldResult, FoldStatus
@@ -67,7 +65,7 @@ from quant_platform.ml.models import (
     ValidationReport,
     ValidationSeverity,
 )
-from quant_platform.ml.persistence import format_utc_timestamp, utc_now
+from quant_platform.ml.persistence import format_utc_timestamp, parse_json_strict, utc_now
 from quant_platform.ml.tracking import EventRecord, EventType, ExperimentEventStore
 
 _SCHEMA_VERSION = 1
@@ -173,7 +171,7 @@ def _verify_fold_results(execution_manifest: ExecutionManifest, *, artifact_stor
             continue
         try:
             raw = artifact_store.read_artifact(reference.content_hash)
-            decoded = FoldResult.from_json_dict(json.loads(raw.decode("utf-8")))
+            decoded = FoldResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
         except _UNVERIFIABLE_ARTIFACT_ERRORS as exc:
             issues.append(_issue(
                 ValidationSeverity.CRITICAL, "fold_result_unverifiable",
@@ -227,7 +225,7 @@ def _verify_aggregate(
 
     try:
         raw = artifact_store.read_artifact(summary_ref.content_hash)
-        aggregate = AggregatedExecutionResult.from_json_dict(json.loads(raw.decode("utf-8")))
+        aggregate = AggregatedExecutionResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
     except _UNVERIFIABLE_ARTIFACT_ERRORS as exc:
         issues.append(_issue(
             ValidationSeverity.CRITICAL, "aggregate_unverifiable",
@@ -235,6 +233,13 @@ def _verify_aggregate(
         ))
         return None, issues
 
+    if aggregate.experiment_id != execution_manifest.experiment_id:
+        issues.append(_issue(
+            ValidationSeverity.CRITICAL, "aggregate_experiment_id_mismatch",
+            f"Aggregate.experiment_id={aggregate.experiment_id!r} does not match "
+            f"ExecutionManifest.experiment_id={execution_manifest.experiment_id!r} -- a valid content hash "
+            "proves the bytes are intact, not that this is genuinely THIS execution's own summary",
+        ))
     if aggregate.completed_fold_indices != execution_manifest.completed_fold_indices:
         issues.append(_issue(
             ValidationSeverity.CRITICAL, "aggregate_completed_indices_mismatch",
@@ -272,7 +277,7 @@ def _verify_timeline(execution_manifest: ExecutionManifest, *, artifact_store: M
         return issues
     try:
         raw = artifact_store.read_artifact(timeline_ref.content_hash)
-        Timeline.from_json_dict(json.loads(raw.decode("utf-8")))
+        Timeline.from_json_dict(parse_json_strict(raw.decode("utf-8")))
     except _UNVERIFIABLE_ARTIFACT_ERRORS as exc:
         issues.append(_issue(
             ValidationSeverity.CRITICAL, "timeline_unverifiable",

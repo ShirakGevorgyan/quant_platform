@@ -67,7 +67,6 @@ reference" step because the old one was never carried forward -- see
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
 from quant_platform.core.exceptions import (
@@ -82,6 +81,7 @@ from quant_platform.execution.splitters import Fold, FoldPlan
 from quant_platform.execution.state_machine import is_terminal_stage
 from quant_platform.ml.artifacts import MLArtifactStore
 from quant_platform.ml.models import ArtifactCategory
+from quant_platform.ml.persistence import parse_json_strict
 
 _UNSAFE_DECODE_ERRORS: tuple[type[Exception], ...] = (
     ArtifactNotFoundError, ArtifactCorruptionError, SchemaVersionError, KeyError, ValueError, TypeError,
@@ -89,10 +89,11 @@ _UNSAFE_DECODE_ERRORS: tuple[type[Exception], ...] = (
 """Every failure mode a claimed-complete fold's artifact can legitimately
 hit: missing/corrupted content (`ArtifactNotFoundError`/
 `ArtifactCorruptionError`), an unreadable schema (`SchemaVersionError`),
-malformed JSON (`json.JSONDecodeError`, a `ValueError` subclass), or a
-`FoldResult.from_json_dict`/`__post_init__` field problem (`KeyError` for
-a missing key, `ValueError`/`TypeError` for a malformed one). All treated
-identically: fail closed, demote to `needs_rerun`, never propagate raw."""
+malformed or non-finite (NaN/Infinity) JSON (`parse_json_strict` raises
+`ValueError` for both), or a `FoldResult.from_json_dict`/`__post_init__`
+field problem (`KeyError` for a missing key, `ValueError`/`TypeError` for
+a malformed one). All treated identically: fail closed, demote to
+`needs_rerun`, never propagate raw."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +134,7 @@ def verify_completed_folds(
             continue
         try:
             raw = artifact_store.read_artifact(reference.content_hash)
-            decoded = FoldResult.from_json_dict(json.loads(raw.decode("utf-8")))
+            decoded = FoldResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
         except _UNSAFE_DECODE_ERRORS:
             needs_rerun.add(fold_index)
             continue

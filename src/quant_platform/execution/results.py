@@ -19,6 +19,7 @@ score from predictions and truth.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -64,8 +65,8 @@ class FoldResult:
             raise ValueError(f"FoldResult.fold_index must be >= 0, got {self.fold_index}")
         if self.train_size < 0 or self.validation_size < 0 or self.test_size < 0:
             raise ValueError("FoldResult train/validation/test sizes must be >= 0")
-        if self.duration_seconds < 0:
-            raise ValueError(f"FoldResult.duration_seconds must be >= 0, got {self.duration_seconds}")
+        if not math.isfinite(self.duration_seconds) or self.duration_seconds < 0:
+            raise ValueError(f"FoldResult.duration_seconds must be a finite number >= 0, got {self.duration_seconds}")
         parse_utc_timestamp(self.train_start)
         parse_utc_timestamp(self.train_end)
         parse_utc_timestamp(self.test_start)
@@ -155,8 +156,11 @@ class AggregatedExecutionResult:
         overlap = set(self.completed_fold_indices) & set(self.failed_fold_indices)
         if overlap:
             raise ValueError(f"A fold index cannot be both completed and failed: {sorted(overlap)}")
-        if self.execution_duration_seconds < 0:
-            raise ValueError("AggregatedExecutionResult.execution_duration_seconds must be >= 0")
+        if not math.isfinite(self.execution_duration_seconds) or self.execution_duration_seconds < 0:
+            raise ValueError(
+                f"AggregatedExecutionResult.execution_duration_seconds must be a finite number >= 0, "
+                f"got {self.execution_duration_seconds}"
+            )
         if self.resume_count < 0:
             raise ValueError("AggregatedExecutionResult.resume_count must be >= 0")
         parse_utc_timestamp(self.started_at)

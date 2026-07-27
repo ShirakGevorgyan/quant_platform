@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
 from quant_platform.ml.metrics import (
     CLASSIFICATION_METRIC_NAMES,
     REGRESSION_METRIC_NAMES,
+    MetricAggregate,
     aggregate_fold_metrics,
     aggregate_metric_values,
     compute_classification_metrics,
@@ -308,11 +311,44 @@ class TestAggregateMetricValues:
             aggregate_metric_values([])
 
     def test_round_trip(self) -> None:
-        from quant_platform.ml.metrics import MetricAggregate
-
         agg = aggregate_metric_values([1.0, 2.0, 3.0])
         restored = MetricAggregate.from_json_dict(agg.to_json_dict())
         assert restored == agg
+
+
+class TestMetricAggregateFiniteNumberInvariants:
+    """Regression tests for Milestone 4D.1: `MetricAggregate` previously
+    had no `__post_init__` validation at all beyond `n >= 1` -- a
+    non-finite mean/std/min/max/median (reachable via `from_json_dict`'s
+    `float(str(raw[...]))` string-coercion path even though the bare JSON
+    tokens are already rejected by `parse_json_strict`) could silently
+    corrupt a downstream comparison. `std` is a standard deviation and
+    must also never be negative."""
+
+    @pytest.mark.parametrize("field_name", ["mean", "std", "min", "max", "median"])
+    @pytest.mark.parametrize("bad_value", [math.nan, math.inf, -math.inf])
+    def test_rejects_non_finite_field(self, field_name: str, bad_value: float) -> None:
+        kwargs = {"mean": 1.0, "std": 0.5, "min": 0.0, "max": 2.0, "median": 1.0, "n": 3}
+        kwargs[field_name] = bad_value
+        with pytest.raises(ValueError, match="finite"):
+            MetricAggregate(**kwargs)
+
+    def test_rejects_negative_std(self) -> None:
+        with pytest.raises(ValueError, match="std"):
+            MetricAggregate(mean=1.0, std=-0.1, min=0.0, max=2.0, median=1.0, n=3)
+
+    def test_rejects_min_greater_than_max(self) -> None:
+        with pytest.raises(ValueError, match="min"):
+            MetricAggregate(mean=1.0, std=0.0, min=5.0, max=1.0, median=1.0, n=1)
+
+    def test_string_coerced_nan_rejected_on_from_json_dict(self) -> None:
+        raw = {"mean": "nan", "std": "0.0", "min": "1.0", "max": "1.0", "median": "1.0", "n": "1"}
+        with pytest.raises(ValueError, match="finite"):
+            MetricAggregate.from_json_dict(raw)
+
+    def test_legitimate_aggregate_still_constructs(self) -> None:
+        agg = MetricAggregate(mean=1.5, std=0.25, min=1.0, max=2.0, median=1.5, n=4)
+        assert agg.mean == 1.5
 
 
 class TestAggregateFoldMetrics:

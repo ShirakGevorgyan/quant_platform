@@ -51,6 +51,7 @@ inner-fold-derived, and never influenced by outer-test in any way.
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -130,8 +131,11 @@ class OuterFoldResult:
             raise ValueError("OuterFoldResult.final_selected_features must not contain duplicates")
         if self.seed < 0:
             raise ValueError(f"OuterFoldResult.seed must be >= 0, got {self.seed}")
-        if self.training_duration_seconds < 0:
-            raise ValueError(f"OuterFoldResult.training_duration_seconds must be >= 0, got {self.training_duration_seconds}")
+        if not math.isfinite(self.training_duration_seconds) or self.training_duration_seconds < 0:
+            raise ValueError(
+                f"OuterFoldResult.training_duration_seconds must be a finite number >= 0, "
+                f"got {self.training_duration_seconds}"
+            )
         if self.outer_train_row_count < 1 or self.outer_test_row_count < 1:
             raise ValueError("OuterFoldResult.outer_train_row_count/outer_test_row_count must be >= 1")
         validate_json_primitive_mapping(self.final_hyperparameters, field_name="OuterFoldResult.final_hyperparameters")

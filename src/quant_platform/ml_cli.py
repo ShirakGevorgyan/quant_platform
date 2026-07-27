@@ -293,7 +293,7 @@ def cmd_inspect_experiment(args: argparse.Namespace) -> int:
     if args.format == "json":
         import json
 
-        print(json.dumps(build_report_json(manifest, validation_report=validation_report), indent=2, sort_keys=True))
+        print(json.dumps(build_report_json(manifest, validation_report=validation_report), indent=2, sort_keys=True, allow_nan=False))
     else:
         print(render_report_markdown(manifest, validation_report=validation_report))
     return 0
@@ -388,7 +388,7 @@ def cmd_inspect_execution(args: argparse.Namespace) -> int:
     if args.format == "json":
         import json
 
-        print(json.dumps(build_execution_report_json(manifest, aggregate=aggregate, timeline=timeline), indent=2, sort_keys=True))
+        print(json.dumps(build_execution_report_json(manifest, aggregate=aggregate, timeline=timeline), indent=2, sort_keys=True, allow_nan=False))
     else:
         print(render_execution_report_markdown(manifest, aggregate=aggregate, timeline=timeline))
     return 0
@@ -718,7 +718,7 @@ def cmd_inspect_optimization(args: argparse.Namespace) -> int:
             manifest, spec=spec, outer_fold_results=list(outer_fold_results.values()), ranking_tables=ranking_tables,
             feature_stability=feature_stability, hyperparameter_stability=hyperparameter_stability,
         )
-        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
     else:
         print(render_optimization_report_markdown(
             manifest, spec=spec, outer_fold_results=list(outer_fold_results.values()), ranking_tables=ranking_tables,
@@ -1055,7 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args))
-    except (QuantPlatformError, ValidationError, OSError, ValueError, KeyError) as exc:
+    except (QuantPlatformError, ValidationError, OSError, ValueError, KeyError, TypeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

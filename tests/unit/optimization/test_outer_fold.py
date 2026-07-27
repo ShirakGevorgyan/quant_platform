@@ -127,6 +127,13 @@ class TestOuterFoldResultValidation:
         with pytest.raises(ValueError, match="training_duration_seconds"):
             OuterFoldResult(**self._base_kwargs(training_duration_seconds=-1.0))  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_training_duration_rejected(self, bad_value: float) -> None:
+        """Milestone 4D.1 regression: `training_duration_seconds < 0`
+        alone does not reject NaN (`nan < 0` is `False`)."""
+        with pytest.raises(ValueError, match="training_duration_seconds"):
+            OuterFoldResult(**self._base_kwargs(training_duration_seconds=bad_value))  # type: ignore[arg-type]
+
     def test_zero_outer_train_row_count_rejected(self) -> None:
         with pytest.raises(ValueError, match="outer_train_row_count"):
             OuterFoldResult(**self._base_kwargs(outer_train_row_count=0))  # type: ignore[arg-type]

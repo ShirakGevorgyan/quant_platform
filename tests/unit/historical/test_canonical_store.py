@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from datetime import timezone as dt_timezone
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -98,6 +99,53 @@ class TestCorruptionDetection:
         with (content_dir / "data.parquet").open("ab") as fh:
             fh.write(b"corruption")
         with pytest.raises(SnapshotError, match="checksum mismatch"):
+            store.read_partition(symbol="XAUUSD", timeframe=Timeframe.M1, year=2024)
+
+    def _metadata_path(self, store: CanonicalStore, tmp_path) -> Path:
+        df = _frame(datetime(2024, 1, 3, tzinfo=dt_timezone.utc), 20)
+        metadata = store.write_partition(df, symbol="XAUUSD", timeframe=Timeframe.M1, year=2024)
+        content_dir = store.content_dir(
+            symbol="XAUUSD", timeframe=Timeframe.M1, year=2024, content_id=metadata.content_id
+        )
+        return content_dir / "metadata.json"
+
+    def test_malformed_metadata_json_is_rejected(self, tmp_path) -> None:
+        store = CanonicalStore(tmp_path)
+        path = self._metadata_path(store, tmp_path)
+        path.write_text("{not valid json")
+        with pytest.raises(SnapshotError, match="corrupted"):
+            store.read_partition(symbol="XAUUSD", timeframe=Timeframe.M1, year=2024)
+
+    def test_metadata_with_non_object_root_is_rejected(self, tmp_path) -> None:
+        """Milestone 4D.1: `PartitionMetadata.from_json_dict` now raises
+        an explicit `ValueError` for a non-dict root (e.g. a bare JSON
+        array), instead of a raw `TypeError` from indexing a list."""
+        store = CanonicalStore(tmp_path)
+        path = self._metadata_path(store, tmp_path)
+        path.write_text("[1, 2, 3]")
+        with pytest.raises(SnapshotError, match="corrupted"):
+            store.read_partition(symbol="XAUUSD", timeframe=Timeframe.M1, year=2024)
+
+    def test_metadata_with_nan_field_is_rejected(self, tmp_path) -> None:
+        store = CanonicalStore(tmp_path)
+        path = self._metadata_path(store, tmp_path)
+        raw = path.read_text()
+        path.write_text(raw.replace('"row_count":20', '"row_count":NaN'))
+        with pytest.raises(SnapshotError, match="corrupted"):
+            store.read_partition(symbol="XAUUSD", timeframe=Timeframe.M1, year=2024)
+
+    def test_metadata_with_invalid_utf8_is_rejected(self, tmp_path) -> None:
+        store = CanonicalStore(tmp_path)
+        path = self._metadata_path(store, tmp_path)
+        path.write_bytes(b"\xff\xfe\x00invalid utf8 \x80\x81")
+        with pytest.raises(SnapshotError, match="corrupted"):
+            store.read_partition(symbol="XAUUSD", timeframe=Timeframe.M1, year=2024)
+
+    def test_metadata_with_duplicate_key_is_rejected(self, tmp_path) -> None:
+        store = CanonicalStore(tmp_path)
+        path = self._metadata_path(store, tmp_path)
+        path.write_text('{"symbol": "a", "symbol": "b"}')
+        with pytest.raises(SnapshotError, match="corrupted"):
             store.read_partition(symbol="XAUUSD", timeframe=Timeframe.M1, year=2024)
 
 

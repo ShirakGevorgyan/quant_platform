@@ -24,7 +24,6 @@ requires.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -32,6 +31,7 @@ from pathlib import Path
 import pandas as pd
 
 from quant_platform.core.exceptions import ManifestError
+from quant_platform.core.json import canonical_json_bytes, parse_json_strict
 from quant_platform.core.types import Timeframe
 from quant_platform.data.interfaces import DataSource
 
@@ -223,7 +223,7 @@ class ManifestStore:
                 context={"path": str(path)},
             )
         tmp_path = dataset_dir / f".{version}.json.tmp"
-        tmp_path.write_text(json.dumps(manifest.to_json_dict(), indent=2))
+        tmp_path.write_bytes(canonical_json_bytes(manifest.to_json_dict()))
         tmp_path.replace(path)
 
     def _write_latest_pointer(self, dataset_dir: Path, version: str) -> None:
@@ -237,10 +237,11 @@ class ManifestStore:
         if not path.is_file():
             raise ManifestError(f"Manifest version {version!r} not found", context={"path": str(path)})
         try:
-            raw = json.loads(path.read_text())
-        except json.JSONDecodeError as exc:
+            raw = parse_json_strict(path.read_text(encoding="utf-8"))
+            manifest = DatasetManifest.from_json_dict(_as_dict(raw))
+        except (UnicodeDecodeError, KeyError, ValueError, TypeError, ManifestError) as exc:
             raise ManifestError(f"Manifest {version!r} is corrupted: {exc}", context={"path": str(path)}) from exc
-        return DatasetManifest.from_json_dict(raw)
+        return manifest
 
     def load(self, *, symbol: str, timeframe: Timeframe, version: str | None = None) -> DatasetManifest:
         """Load a specific `version`, or the latest if `version` is None."""

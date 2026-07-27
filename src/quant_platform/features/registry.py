@@ -113,14 +113,24 @@ class FeatureRegistry:
         `FeatureSpec`s selected by `names` (or every registered feature, if
         `None`) -- independent of registration order or Python object
         identity. Two registries (even in different processes) with the
-        same selected feature specs always produce the same fingerprint."""
+        same selected feature specs always produce the same fingerprint.
+
+        NOT migrated to `canonical_json_bytes`: this IS
+        `feature_registry_fingerprint`, embedded in `FeatureBinding` and
+        therefore in every `ExperimentSpec`/`ExperimentIdentity` that
+        binds to it -- the single most widely-propagated fingerprint in
+        this platform (see `features.manifests.write_artifacts`'s
+        identical note on why byte-representation changes here are
+        unacceptable). `allow_nan=False` added; `default=str`/key
+        ordering/separators intentionally untouched so bytes for any
+        already-finite selection of specs are completely unchanged."""
         if names is None:
             keys = sorted(self._definitions.keys())
         else:
             resolved_names = self.resolve_dependency_order(names)
             keys = sorted((self.get(n).name, self.get(n).version) for n in resolved_names)
         payload = [self._definitions[key].spec.to_json_dict() for key in keys]
-        blob = json.dumps(payload, sort_keys=True, default=str)
+        blob = json.dumps(payload, sort_keys=True, default=str, allow_nan=False)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
     def __len__(self) -> int:

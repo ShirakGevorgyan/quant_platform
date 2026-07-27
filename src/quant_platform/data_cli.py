@@ -392,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args))
-    except (QuantPlatformError, ValidationError, OSError, ValueError) as exc:
+    except (QuantPlatformError, ValidationError, OSError, ValueError, KeyError, TypeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 

@@ -51,7 +51,6 @@ before aggregating, rather than special-casing the empty-loop path.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Mapping
@@ -61,10 +60,13 @@ from pathlib import Path
 import pandas as pd
 
 from quant_platform.core.exceptions import (
+    ArtifactCorruptionError,
+    ArtifactNotFoundError,
     ExecutionResumeError,
     ExperimentLockError,
     FeatureError,
     FoldValidationError,
+    SchemaVersionError,
     UnknownModelDefinitionError,
 )
 from quant_platform.execution.context import FoldExecutionContext
@@ -99,7 +101,12 @@ from quant_platform.ml.experiment_spec import ExperimentSpec
 from quant_platform.ml.interfaces import FeatureSchema, ModelDeserializer, ModelFactory, ModelSerializer
 from quant_platform.ml.manifests import ExperimentManifestStore
 from quant_platform.ml.models import ArtifactCategory, ArtifactReference, ExperimentStatus
-from quant_platform.ml.persistence import canonical_json_bytes, format_utc_timestamp, utc_now
+from quant_platform.ml.persistence import (
+    canonical_json_bytes,
+    format_utc_timestamp,
+    parse_json_strict,
+    utc_now,
+)
 from quant_platform.ml.registry import ModelRegistry
 from quant_platform.ml.seeds import SeedDomain
 from quant_platform.ml.testing import ConstantTestModelDeserializer, ConstantTestModelSerializer
@@ -117,6 +124,19 @@ guards its own brief, per-transition read-modify-write and is acquired
 and released many times per run, by the SAME process, WHILE this outer
 lock is held. Sharing one file between the two would self-deadlock,
 since `historical.locking.DatasetLock` is not reentrant."""
+
+_UNVERIFIABLE_ARTIFACT_ERRORS: tuple[type[Exception], ...] = (
+    ArtifactNotFoundError, ArtifactCorruptionError, SchemaVersionError, KeyError, ValueError, TypeError,
+)
+"""Every failure mode reading+decoding a previously-written durable
+artifact can legitimately hit (missing/corrupted content, an unreadable
+schema, malformed or non-finite JSON via `parse_json_strict` -- a
+`ValueError` subclass --, or a `from_json_dict`/`__post_init__` field
+problem). Mirrors `execution.verification`'s and `execution.resume`'s
+identically-named constants: a completed execution's own previously-
+verified-or-just-written artifacts must never let a raw decode exception
+escape a public `ExecutionRunner` method -- see `_load_existing_aggregate`
+and `_load_all_fold_results`."""
 
 _SERIALIZER_REGISTRY: dict[str, tuple[ModelSerializer, ModelDeserializer]] = {
     # `ConstantTestModelSerializer.serialize`'s parameter is typed as the
@@ -400,8 +420,23 @@ class ExecutionRunner:
                 f"Execution manifest for {execution_manifest.experiment_id!r} is COMPLETED but has no recorded "
                 "EXECUTION_SUMMARY artifact reference"
             )
-        raw = self._artifact_store.read_artifact(summary_ref.content_hash)
-        return AggregatedExecutionResult.from_json_dict(json.loads(raw.decode("utf-8")))
+        try:
+            raw = self._artifact_store.read_artifact(summary_ref.content_hash)
+            aggregate = AggregatedExecutionResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+        except _UNVERIFIABLE_ARTIFACT_ERRORS as exc:
+            raise ExecutionResumeError(
+                f"Execution {execution_manifest.experiment_id!r} is recorded as COMPLETED, but its "
+                f"EXECUTION_SUMMARY artifact could not be read and decoded: {exc}",
+                context={"experiment_id": execution_manifest.experiment_id},
+            ) from exc
+        if aggregate.experiment_id != execution_manifest.experiment_id:
+            raise ExecutionResumeError(
+                f"Execution {execution_manifest.experiment_id!r}'s recorded EXECUTION_SUMMARY artifact decodes "
+                f"to experiment_id={aggregate.experiment_id!r} -- a valid content hash proves the bytes are "
+                "intact, not that this is genuinely this execution's own summary",
+                context={"experiment_id": execution_manifest.experiment_id, "decoded_experiment_id": aggregate.experiment_id},
+            )
+        return aggregate
 
     def _execute_pipeline(
         self, *, experiment_id: str, execution_manifest: ExecutionManifest, force_rerun_folds: frozenset[int],
@@ -673,9 +708,31 @@ class ExecutionRunner:
 
     def _load_all_fold_results(self, fold_result_refs: dict[int, ArtifactReference]) -> list[FoldResult]:
         results = []
-        for ref in fold_result_refs.values():
-            raw = self._artifact_store.read_artifact(ref.content_hash)
-            results.append(FoldResult.from_json_dict(json.loads(raw.decode("utf-8"))))
+        for fold_index, ref in fold_result_refs.items():
+            if ref.category is not ArtifactCategory.FOLD_RESULT:
+                raise ExecutionResumeError(
+                    f"Fold {fold_index}'s recorded artifact reference has category={ref.category.value!r}, "
+                    f"expected {ArtifactCategory.FOLD_RESULT.value!r} -- refusing to finalize this execution "
+                    "from a reference that was never recorded as a fold result",
+                    context={"fold_index": fold_index, "category": ref.category.value},
+                )
+            try:
+                raw = self._artifact_store.read_artifact(ref.content_hash)
+                decoded = FoldResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+            except _UNVERIFIABLE_ARTIFACT_ERRORS as exc:
+                raise ExecutionResumeError(
+                    f"Fold {fold_index}'s recorded FOLD_RESULT artifact could not be read and decoded while "
+                    f"finalizing this execution: {exc}",
+                    context={"fold_index": fold_index},
+                ) from exc
+            if decoded.fold_index != fold_index:
+                raise ExecutionResumeError(
+                    f"Fold {fold_index}'s recorded FOLD_RESULT artifact decodes to fold_index="
+                    f"{decoded.fold_index} -- a valid content hash proves the bytes are intact, not that "
+                    "they were filed under the correct key",
+                    context={"fold_index": fold_index, "decoded_fold_index": decoded.fold_index},
+                )
+            results.append(decoded)
         return results
 
 

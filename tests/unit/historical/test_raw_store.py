@@ -153,6 +153,46 @@ class TestCorruptionDetection:
         with pytest.raises(SnapshotError, match="invalid JSON"):
             store.read_snapshot(snap_dir)
 
+    def test_nan_in_metadata_json_is_rejected_on_read(self, tmp_path) -> None:
+        store = RawSnapshotStore(tmp_path)
+        _write(store, _frame())
+        snap_dir = store.list_snapshots(
+            source_name="mt5", broker="TestBroker", symbol="XAUUSD", timeframe=Timeframe.M1
+        )[0]
+        (snap_dir / "metadata.json").write_text('{"row_count": NaN}')
+        with pytest.raises(SnapshotError, match="corrupted"):
+            store.read_snapshot(snap_dir)
+
+    def test_non_object_root_metadata_json_is_rejected_on_read(self, tmp_path) -> None:
+        store = RawSnapshotStore(tmp_path)
+        _write(store, _frame())
+        snap_dir = store.list_snapshots(
+            source_name="mt5", broker="TestBroker", symbol="XAUUSD", timeframe=Timeframe.M1
+        )[0]
+        (snap_dir / "metadata.json").write_text("[1, 2, 3]")
+        with pytest.raises(SnapshotError, match="corrupted"):
+            store.read_snapshot(snap_dir)
+
+    def test_invalid_utf8_metadata_json_is_rejected_on_read(self, tmp_path) -> None:
+        store = RawSnapshotStore(tmp_path)
+        _write(store, _frame())
+        snap_dir = store.list_snapshots(
+            source_name="mt5", broker="TestBroker", symbol="XAUUSD", timeframe=Timeframe.M1
+        )[0]
+        (snap_dir / "metadata.json").write_bytes(b"\xff\xfe\x00invalid utf8 \x80\x81")
+        with pytest.raises(SnapshotError, match="corrupted"):
+            store.read_snapshot(snap_dir)
+
+    def test_duplicate_key_metadata_json_is_rejected_on_read(self, tmp_path) -> None:
+        store = RawSnapshotStore(tmp_path)
+        _write(store, _frame())
+        snap_dir = store.list_snapshots(
+            source_name="mt5", broker="TestBroker", symbol="XAUUSD", timeframe=Timeframe.M1
+        )[0]
+        (snap_dir / "metadata.json").write_text('{"symbol": "a", "symbol": "b"}')
+        with pytest.raises(SnapshotError, match="corrupted"):
+            store.read_snapshot(snap_dir)
+
     def test_missing_data_file_is_rejected_on_read(self, tmp_path) -> None:
         store = RawSnapshotStore(tmp_path)
         _write(store, _frame())

@@ -97,7 +97,13 @@ def _fold_groups(split_plan: SplitPlan) -> dict[str, list[DatasetSplit]]:
 
 
 def _combined_fold_fingerprint(fold_pipeline_fingerprints: dict[str, str | None]) -> str:
-    payload = json.dumps(fold_pipeline_fingerprints, sort_keys=True)
+    """NOT migrated to `canonical_json_bytes`: this directly computes a
+    fingerprint that propagates into `fitted_preprocessing_fingerprint`
+    and ultimately `compute_dataset_id` -- see `features.manifests.
+    write_artifacts`' identical note. `allow_nan=False` costs nothing
+    here (every value is a fingerprint string or `None`, never a float)
+    but keeps this fingerprint chain uniformly NaN-safe."""
+    payload = json.dumps(fold_pipeline_fingerprints, sort_keys=True, allow_nan=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

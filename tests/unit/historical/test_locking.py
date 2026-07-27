@@ -109,6 +109,76 @@ class TestStaleLockRecovery:
         assert json.loads(lock_path.read_text())["pid"] == os.getpid()
         lock.release()
 
+    def test_lock_file_with_nan_field_is_treated_as_reclaimable(self, tmp_path) -> None:
+        """Milestone 4D.1: `_read_existing_lock` now reads through
+        `core.json.parse_json_strict`, which rejects a bare `NaN` token at
+        parse time (the old plain `json.loads` would have accepted it,
+        then failed later at `int(str(raw["pid"]))` -- same ultimate
+        outcome, reclaimable, just a different rejection point). Explicit
+        regression test for the documented "NaN/Infinity fields ->
+        reclaimable" decision in `_read_existing_lock`'s docstring."""
+        lock_path = tmp_path / ".lock"
+        lock_path.write_text('{"pid": NaN, "hostname": "h", "acquired_at": "2024-01-01T00:00:00+00:00"}')
+        lock = DatasetLock(lock_path)
+        lock.acquire()
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+        lock.release()
+
+    def test_lock_file_with_non_object_root_is_treated_as_reclaimable(self, tmp_path) -> None:
+        """Regression test: previously the except tuple in
+        `_read_existing_lock` had no `TypeError`, so a non-object root
+        (e.g. a JSON array) would raise UNCAUGHT out of
+        `_read_existing_lock` instead of being treated as reclaimable --
+        a real, now-fixed gap."""
+        lock_path = tmp_path / ".lock"
+        lock_path.write_text("[1, 2, 3]")
+        lock = DatasetLock(lock_path)
+        lock.acquire()  # must not raise
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+        lock.release()
+
+    def test_lock_file_with_duplicate_key_is_treated_as_reclaimable(self, tmp_path) -> None:
+        lock_path = tmp_path / ".lock"
+        lock_path.write_text('{"pid": 1, "pid": 2, "hostname": "h", "acquired_at": "2024-01-01T00:00:00+00:00"}')
+        lock = DatasetLock(lock_path)
+        lock.acquire()  # must not raise
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+        lock.release()
+
+    def test_lock_file_with_invalid_utf8_is_treated_as_reclaimable(self, tmp_path) -> None:
+        lock_path = tmp_path / ".lock"
+        lock_path.write_bytes(b"\xff\xfe\x00invalid utf8 \x80\x81")
+        lock = DatasetLock(lock_path)
+        lock.acquire()  # must not raise
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+        lock.release()
+
+    def test_lock_file_missing_owner_field_is_treated_as_reclaimable(self, tmp_path) -> None:
+        lock_path = tmp_path / ".lock"
+        lock_path.write_text('{"hostname": "h", "acquired_at": "2024-01-01T00:00:00+00:00"}')  # no "pid"
+        lock = DatasetLock(lock_path)
+        lock.acquire()  # must not raise
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+        lock.release()
+
+    def test_lock_file_with_invalid_timestamp_is_treated_as_reclaimable(self, tmp_path) -> None:
+        lock_path = tmp_path / ".lock"
+        lock_path.write_text('{"pid": 1, "hostname": "h", "acquired_at": "not-a-timestamp"}')
+        lock = DatasetLock(lock_path)
+        lock.acquire()  # must not raise
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+        lock.release()
+
+    def test_truncated_lock_file_is_treated_as_reclaimable(self, tmp_path) -> None:
+        lock_path = tmp_path / ".lock"
+        valid = LockInfo(pid=999_999, hostname="h", acquired_at=pd.Timestamp.now(tz="UTC"))
+        full_text = json.dumps(valid.to_json_dict())
+        lock_path.write_text(full_text[: len(full_text) // 2])  # truncated mid-object
+        lock = DatasetLock(lock_path)
+        lock.acquire()  # must not raise
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()
+        lock.release()
+
 
 class TestDatasetLockPathHelper:
     def test_lock_path_is_a_sibling_of_the_dataset_directory(self, tmp_path) -> None:
@@ -237,3 +307,67 @@ class TestNoDoubleAcquisitionUnderForcedInterleaving:
         assert not any(t.is_alive() for t in threads)
         assert sorted(results) == ["acquired", "rejected"]
         assert json.loads(lock_path.read_text())  # exactly one, fully-valid lock file remains
+
+    def test_exactly_one_winner_when_two_threads_race_to_reclaim_a_corrupted_lock(self, tmp_path, monkeypatch) -> None:
+        """Milestone 4D.1 regression: the same barrier-synchronized race
+        as above, but starting from a lock file corrupted in a way ONLY
+        the new `parse_json_strict`-based reader distinguishes from the
+        old plain `json.loads` (a bare `NaN` token) -- proves the parser
+        migration did not weaken the underlying `os.link` atomicity that
+        actually adjudicates the race. Both threads independently decide
+        "reclaimable" from `_read_existing_lock`, but only one may
+        actually win the `os.link` publish.
+
+        Unlike the simpler race above (starting with NO pre-existing
+        lock file, so each thread calls `os.link` exactly once), starting
+        from an ALREADY-corrupted file means each thread's FIRST `os.link`
+        (in `acquire`'s initial `_try_publish`) always loses to the
+        pre-existing file, then reclaims and retries a SECOND `os.link`
+        (in `_handle_existing_lock`) -- a variable number of calls per
+        thread depending on scheduling. A single shared `threading.
+        Barrier` synchronizing EVERY call (not just the first) can pair a
+        slow thread's first call with a fast thread's second, leaving the
+        slow thread's second call without a partner until it times out.
+        Scoped via `threading.local()` to only the FIRST `os.link` call
+        per thread -- exactly the pattern already established for the
+        optimization engine's own multi-call concurrency tests -- so only
+        the genuinely simultaneous, meaningful race (both threads
+        discovering and first contending with the corrupted lock) is
+        forced; each thread's own retry then races via `os.link`'s own
+        real atomicity, unsynchronized, which is the property under test."""
+        lock_path = tmp_path / ".lock"
+        lock_path.write_text('{"pid": NaN, "hostname": "h", "acquired_at": "2024-01-01T00:00:00+00:00"}')
+        real_link = os.link
+        barrier = threading.Barrier(2, timeout=5)
+        already_synced = threading.local()
+
+        def synchronized_link(src: str, dst: str) -> None:
+            if not getattr(already_synced, "done", False):
+                already_synced.done = True
+                barrier.wait()
+            real_link(src, dst)
+
+        monkeypatch.setattr(os, "link", synchronized_link)
+
+        results: list[str] = []
+        results_lock = threading.Lock()
+
+        def attempt() -> None:
+            lock = DatasetLock(lock_path)
+            try:
+                lock.acquire()
+                with results_lock:
+                    results.append("acquired")
+            except DatasetLockError:
+                with results_lock:
+                    results.append("rejected")
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert not any(t.is_alive() for t in threads)
+        assert sorted(results) == ["acquired", "rejected"]
+        assert json.loads(lock_path.read_text())["pid"] == os.getpid()

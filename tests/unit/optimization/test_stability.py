@@ -4,12 +4,20 @@ coefficient-of-variation) calculations."""
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from quant_platform.optimization.candidates import RankingEntry, RankingTable
 from quant_platform.optimization.feature_selection import FeatureSelectionResult, FeatureSelectionStrategy
 from quant_platform.optimization.search_space import FloatParameter, IntegerParameter, build_search_space
 from quant_platform.optimization.stability import (
+    CategoricalParameterStability,
+    FeatureStabilityEntry,
+    FeatureStabilityReport,
+    HyperparameterStabilityReport,
+    JaccardSummary,
+    NumericParameterStability,
     flag_near_tied_top_candidates,
     pairwise_jaccard_similarity,
     summarize_feature_stability,
@@ -146,3 +154,135 @@ class TestFlagNearTiedTopCandidates:
     def test_fewer_than_two_valid_entries_returns_no_warning(self) -> None:
         table = self._table([0.9, None], [True, False])
         assert flag_near_tied_top_candidates(table) == ()
+
+
+class TestStabilityDataclassesFiniteNumberInvariants:
+    """Regression tests for Milestone 4D.1: none of these six durable,
+    round-trippable stability dataclasses had ANY `__post_init__`
+    validation before this milestone -- a corrupted or string-coerced
+    non-finite value (mean/std/frequency/etc.) would previously
+    reconstruct silently via `from_json_dict`. Frequencies/Jaccard scores
+    must lie in [0, 1]; standard deviations must be >= 0."""
+
+    def test_jaccard_summary_rejects_non_finite_mean(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            JaccardSummary(mean=math.nan, std=0.0, min=0.0, max=1.0, n_pairs=1)
+
+    def test_jaccard_summary_rejects_mean_outside_unit_interval(self) -> None:
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            JaccardSummary(mean=1.5, std=0.0, min=0.0, max=1.0, n_pairs=1)
+
+    def test_jaccard_summary_rejects_negative_std(self) -> None:
+        with pytest.raises(ValueError, match="std"):
+            JaccardSummary(mean=0.5, std=-0.1, min=0.0, max=1.0, n_pairs=1)
+
+    def test_jaccard_summary_accepts_valid_values(self) -> None:
+        summary = JaccardSummary(mean=0.5, std=0.1, min=0.2, max=0.8, n_pairs=3)
+        assert summary.mean == 0.5
+
+    def test_feature_stability_entry_rejects_frequency_outside_unit_interval(self) -> None:
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            FeatureStabilityEntry(
+                feature_name="f", times_selected=1, eligible_evaluations=1,
+                selection_frequency=1.2, selected_in_winning_candidate_frequency=0.0,
+            )
+
+    def test_feature_stability_entry_rejects_times_selected_exceeding_eligible(self) -> None:
+        with pytest.raises(ValueError, match="cannot exceed"):
+            FeatureStabilityEntry(
+                feature_name="f", times_selected=5, eligible_evaluations=2,
+                selection_frequency=1.0, selected_in_winning_candidate_frequency=0.0,
+            )
+
+    def test_feature_stability_entry_rejects_non_finite_optional_score(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            FeatureStabilityEntry(
+                feature_name="f", times_selected=1, eligible_evaluations=2,
+                selection_frequency=0.5, selected_in_winning_candidate_frequency=0.0, mean_score=math.inf,
+            )
+
+    def test_feature_stability_entry_rejects_negative_score_std(self) -> None:
+        with pytest.raises(ValueError, match="score_std"):
+            FeatureStabilityEntry(
+                feature_name="f", times_selected=1, eligible_evaluations=2,
+                selection_frequency=0.5, selected_in_winning_candidate_frequency=0.0,
+                mean_score=1.0, score_std=-0.5,
+            )
+
+    def test_feature_stability_entry_none_optionals_are_valid(self) -> None:
+        entry = FeatureStabilityEntry(
+            feature_name="f", times_selected=1, eligible_evaluations=2,
+            selection_frequency=0.5, selected_in_winning_candidate_frequency=0.0,
+        )
+        assert entry.mean_score is None
+
+    def test_numeric_parameter_stability_rejects_non_finite_mean(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            NumericParameterStability(
+                parameter_name="p", values=(1.0, 2.0), mean=math.nan, std=0.0, min=1.0, max=2.0,
+                low_bound=0.0, high_bound=3.0, boundary_hit_frequency=0.0,
+            )
+
+    def test_numeric_parameter_stability_rejects_low_bound_greater_than_high_bound(self) -> None:
+        with pytest.raises(ValueError, match="low_bound"):
+            NumericParameterStability(
+                parameter_name="p", values=(1.0,), mean=1.0, std=0.0, min=1.0, max=1.0,
+                low_bound=5.0, high_bound=0.0, boundary_hit_frequency=0.0,
+            )
+
+    def test_numeric_parameter_stability_rejects_non_finite_value_in_values_tuple(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            NumericParameterStability(
+                parameter_name="p", values=(1.0, math.inf), mean=1.0, std=0.0, min=1.0, max=1.0,
+                low_bound=0.0, high_bound=3.0, boundary_hit_frequency=0.0,
+            )
+
+    def test_numeric_parameter_stability_rejects_boundary_frequency_outside_unit_interval(self) -> None:
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            NumericParameterStability(
+                parameter_name="p", values=(1.0,), mean=1.0, std=0.0, min=1.0, max=1.0,
+                low_bound=0.0, high_bound=3.0, boundary_hit_frequency=1.5,
+            )
+
+    def test_categorical_parameter_stability_rejects_frequency_outside_unit_interval(self) -> None:
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            CategoricalParameterStability(parameter_name="p", choice_frequencies={"a": 1.2})
+
+    def test_categorical_parameter_stability_accepts_valid_frequencies(self) -> None:
+        stability = CategoricalParameterStability(parameter_name="p", choice_frequencies={"a": 0.5, "b": 0.5})
+        assert stability.choice_frequencies == {"a": 0.5, "b": 0.5}
+
+    def test_hyperparameter_stability_report_rejects_negative_outer_fold_count(self) -> None:
+        with pytest.raises(ValueError, match="outer_fold_count"):
+            HyperparameterStabilityReport(schema_version=1, optimization_id="o", outer_fold_count=-1)
+
+    def test_hyperparameter_stability_report_rejects_non_finite_best_iteration_entry(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            HyperparameterStabilityReport(
+                schema_version=1, optimization_id="o", outer_fold_count=1,
+                best_iteration_distribution={"mean": math.nan, "std": 0.0, "min": 1.0, "max": 1.0},
+            )
+
+    def test_hyperparameter_stability_report_rejects_negative_best_iteration_std(self) -> None:
+        with pytest.raises(ValueError, match="std"):
+            HyperparameterStabilityReport(
+                schema_version=1, optimization_id="o", outer_fold_count=1,
+                best_iteration_distribution={"mean": 1.0, "std": -1.0, "min": 1.0, "max": 1.0},
+            )
+
+    def test_hyperparameter_stability_report_rejects_negative_trial_score_dispersion(self) -> None:
+        with pytest.raises(ValueError, match="trial_score_dispersion"):
+            HyperparameterStabilityReport(
+                schema_version=1, optimization_id="o", outer_fold_count=1, trial_score_dispersion=-0.1,
+            )
+
+    def test_feature_stability_report_rejects_negative_total_evaluations(self) -> None:
+        with pytest.raises(ValueError, match="total_evaluations"):
+            FeatureStabilityReport(
+                schema_version=1, optimization_id="o", total_evaluations=-1, entries=(), feature_count_distribution={},
+            )
+
+    def test_string_coerced_nan_jaccard_mean_rejected_on_from_json_dict(self) -> None:
+        raw = {"mean": "nan", "std": "0.0", "min": "0.0", "max": "1.0", "n_pairs": "1"}
+        with pytest.raises(ValueError, match="finite"):
+            JaccardSummary.from_json_dict(raw)

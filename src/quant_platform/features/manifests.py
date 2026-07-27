@@ -51,6 +51,7 @@ from pathlib import Path
 import pandas as pd
 
 from quant_platform.core.exceptions import PathSecurityError, ResearchDatasetError
+from quant_platform.core.json import canonical_json_bytes, parse_json_strict
 from quant_platform.core.types import Timeframe
 from quant_platform.data.interfaces import DataSource
 from quant_platform.historical.models import sha256_file
@@ -245,8 +246,19 @@ class ResearchDatasetStore:
                 splits[split_name].to_parquet(split_path, index=False, compression="zstd")
                 per_split_checksums[split_name] = sha256_file(split_path)
 
+            # NOT migrated to `canonical_json_bytes`: `preprocessing_checksum`
+            # below hashes this file's own serialized TEXT (not a re-
+            # derivation of the logical payload), and directly feeds
+            # `_combined_checksum` -> `content_id` -- this dataset's
+            # permanent, content-addressed identity. Changing the byte
+            # representation here (compact vs. indented separators) would
+            # change `content_id` for every future write of otherwise-
+            # identical content, breaking "content IDs remain unchanged"
+            # for no security benefit (`allow_nan=False` alone closes the
+            # actual NaN/Infinity gap without touching a single byte of
+            # any payload that was already finite).
             preprocessing_path = tmp_dir / _PREPROCESSING_FILE
-            preprocessing_path.write_text(json.dumps(preprocessing_json, indent=2, sort_keys=True))
+            preprocessing_path.write_text(json.dumps(preprocessing_json, indent=2, sort_keys=True, allow_nan=False))
             preprocessing_checksum = _sha256_text(preprocessing_path.read_text())
 
             metadata = {
@@ -256,7 +268,10 @@ class ResearchDatasetStore:
                 "row_counts": {name: len(df) for name, df in splits.items()},
                 **(extra_metadata or {}),
             }
-            (tmp_dir / _METADATA_FILE).write_text(json.dumps(metadata, indent=2, sort_keys=True, default=str))
+            # SAFE to migrate: unlike preprocessing.json above, nothing
+            # hashes metadata.json's own bytes -- content_id is already
+            # fixed by the time this is written.
+            (tmp_dir / _METADATA_FILE).write_bytes(canonical_json_bytes(metadata))
 
             content_id = _combined_checksum(per_split_checksums, preprocessing_checksum)
             (tmp_dir / _SUCCESS_MARKER).write_text("")
@@ -306,12 +321,25 @@ class ResearchDatasetStore:
                 "Research dataset content is incomplete or corrupted: missing _SUCCESS marker",
                 context={"path": str(content_dir)},
             )
-        metadata = json.loads((content_dir / _METADATA_FILE).read_text())
+        try:
+            metadata = parse_json_strict((content_dir / _METADATA_FILE).read_text(encoding="utf-8"))
+            split_names = metadata["split_names"]
+            per_split_checksums = metadata["per_split_checksums"]
+        except (UnicodeDecodeError, KeyError, ValueError, TypeError) as exc:
+            raise ResearchDatasetError(
+                f"Research dataset metadata.json is corrupted: {exc}", context={"path": str(content_dir)}
+            ) from exc
         splits: dict[str, pd.DataFrame] = {}
-        for split_name in metadata["split_names"]:
+        for split_name in split_names:
             split_path = content_dir / f"{split_name}.parquet"
             actual_checksum = sha256_file(split_path)
-            expected_checksum = metadata["per_split_checksums"][split_name]
+            try:
+                expected_checksum = per_split_checksums[split_name]
+            except (KeyError, TypeError) as exc:
+                raise ResearchDatasetError(
+                    f"Research dataset metadata.json has no per_split_checksums entry for split {split_name!r}",
+                    context={"path": str(content_dir)},
+                ) from exc
             if actual_checksum != expected_checksum:
                 raise ResearchDatasetError(
                     f"Research dataset split {split_name!r} checksum mismatch: data is corrupted",
@@ -327,8 +355,18 @@ class ResearchDatasetStore:
             raise ResearchDatasetError(
                 "Research dataset preprocessing.json is missing", context={"path": str(content_dir)}
             )
-        result: dict[str, object] = json.loads(preprocessing_path.read_text())
-        return result
+        try:
+            decoded = parse_json_strict(preprocessing_path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ResearchDatasetError(
+                f"Research dataset preprocessing.json is corrupted: {exc}", context={"path": str(content_dir)}
+            ) from exc
+        if not isinstance(decoded, dict):
+            raise ResearchDatasetError(
+                f"Research dataset preprocessing.json must decode to a JSON object, got {type(decoded).__name__}",
+                context={"path": str(content_dir)},
+            )
+        return decoded
 
 
 def _sha256_text(text: str) -> str:
@@ -336,8 +374,14 @@ def _sha256_text(text: str) -> str:
 
 
 def _combined_checksum(per_split_checksums: dict[str, str], preprocessing_checksum: str) -> str:
+    """NOT migrated to `canonical_json_bytes`: this directly computes
+    `content_id`, this dataset's permanent, content-addressed identity --
+    see `write_artifacts`' identical note on `preprocessing.json`.
+    `allow_nan=False` costs nothing here (every value passed in is
+    already a hex checksum string, never a float) but keeps the write
+    path uniformly NaN-safe regardless of future callers."""
     payload = json.dumps(
-        {"splits": per_split_checksums, "preprocessing": preprocessing_checksum}, sort_keys=True
+        {"splits": per_split_checksums, "preprocessing": preprocessing_checksum}, sort_keys=True, allow_nan=False
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -398,7 +442,7 @@ class ResearchManifestStore:
                 "immutable once saved", context={"path": str(path)},
             )
         tmp_path = manifest_dir / f".{version}.json.tmp"
-        tmp_path.write_text(json.dumps(manifest.to_json_dict(), indent=2))
+        tmp_path.write_bytes(canonical_json_bytes(manifest.to_json_dict()))
         tmp_path.replace(path)
 
     def _write_latest_pointer(self, manifest_dir: Path, version: str) -> None:
@@ -412,10 +456,11 @@ class ResearchManifestStore:
         if not path.is_file():
             raise ResearchDatasetError(f"Research dataset manifest version {version!r} not found", context={"path": str(path)})
         try:
-            raw = json.loads(path.read_text())
-        except json.JSONDecodeError as exc:
+            raw = parse_json_strict(path.read_text(encoding="utf-8"))
+            manifest = ResearchDatasetManifest.from_json_dict(raw)
+        except (UnicodeDecodeError, KeyError, ValueError, TypeError) as exc:
             raise ResearchDatasetError(f"Research dataset manifest {version!r} is corrupted: {exc}") from exc
-        return ResearchDatasetManifest.from_json_dict(raw)
+        return manifest
 
     def load(self, dataset_id: str, version: str | None = None) -> ResearchDatasetManifest:
         manifest_dir = self._manifest_dir(dataset_id)
@@ -442,7 +487,15 @@ def compute_dataset_id(
     preprocessing definition. Changing ANY of these changes the dataset
     ID outright (a different dataset, not a new version of the old one);
     only a revision of the underlying historical data, with configuration
-    held fixed, produces a new VERSION of the same dataset ID."""
+    held fixed, produces a new VERSION of the same dataset ID.
+
+    NOT migrated to `canonical_json_bytes`: this directly computes
+    `dataset_id`, a permanent identity used as a storage path component
+    everywhere in this package -- see `write_artifacts`' identical note
+    on `preprocessing.json`. `allow_nan=False` added below (closes the
+    actual NaN/Infinity gap) without touching `default=str`/key ordering/
+    separators, so bytes for any already-finite payload -- every
+    legitimate caller today -- are completely unchanged."""
     payload = json.dumps(
         {
             "symbol": symbol, "base_timeframe": base_timeframe.value,
@@ -450,7 +503,7 @@ def compute_dataset_id(
             "label_definition": label_definition, "split_definition": split_definition,
             "preprocessing_definition": preprocessing_definition,
         },
-        sort_keys=True, default=str,
+        sort_keys=True, default=str, allow_nan=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 

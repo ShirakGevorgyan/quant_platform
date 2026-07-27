@@ -153,8 +153,8 @@ class InnerFoldTrialMetrics:
             raise ValueError(f"InnerFoldTrialMetrics.inner_fold_index must be >= 0, got {self.inner_fold_index}")
         if self.selected_feature_count < 1:
             raise ValueError(f"InnerFoldTrialMetrics.selected_feature_count must be >= 1, got {self.selected_feature_count}")
-        if self.duration_seconds < 0:
-            raise ValueError(f"InnerFoldTrialMetrics.duration_seconds must be >= 0, got {self.duration_seconds}")
+        if not math.isfinite(self.duration_seconds) or self.duration_seconds < 0:
+            raise ValueError(f"InnerFoldTrialMetrics.duration_seconds must be a finite number >= 0, got {self.duration_seconds}")
         validate_json_primitive_mapping(self.secondary_metrics, field_name="InnerFoldTrialMetrics.secondary_metrics")
         if self.best_iteration is not None and self.best_iteration < 0:
             raise ValueError(f"InnerFoldTrialMetrics.best_iteration must be >= 0 if set, got {self.best_iteration}")
@@ -222,8 +222,8 @@ class TrialResult:
                 f"TrialResult.successful_inner_folds ({self.successful_inner_folds}) cannot exceed "
                 f"total_inner_folds ({self.total_inner_folds})"
             )
-        if self.duration_seconds < 0:
-            raise ValueError(f"TrialResult.duration_seconds must be >= 0, got {self.duration_seconds}")
+        if not math.isfinite(self.duration_seconds) or self.duration_seconds < 0:
+            raise ValueError(f"TrialResult.duration_seconds must be a finite number >= 0, got {self.duration_seconds}")
         validate_json_primitive_mapping(self.sampled_hyperparameters, field_name="TrialResult.sampled_hyperparameters")
         if self.status is TrialStatus.COMPLETED:
             if self.primary_metric_aggregate is None:

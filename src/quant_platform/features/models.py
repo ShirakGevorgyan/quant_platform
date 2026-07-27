@@ -197,8 +197,17 @@ class FeatureSpec:
 
     def fingerprint(self) -> str:
         """A deterministic sha256 of this spec's JSON representation, with
-        keys sorted so field-declaration order never affects the result."""
-        payload = json.dumps(self.to_json_dict(), sort_keys=True, default=str)
+        keys sorted so field-declaration order never affects the result.
+
+        NOT migrated to `canonical_json_bytes`: this feature schema
+        fingerprint propagates into `feature_registry_fingerprint`
+        (`FeatureRegistry.fingerprint`) and ultimately every downstream
+        dataset/experiment/execution/optimization identity that binds to
+        it -- see `features.manifests.write_artifacts`'s identical note.
+        `allow_nan=False` added below; `default=str`/key ordering/
+        separators intentionally untouched so bytes for any
+        already-finite spec are completely unchanged."""
+        payload = json.dumps(self.to_json_dict(), sort_keys=True, default=str, allow_nan=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

@@ -311,6 +311,134 @@ class TestExecutionCommands:
         assert "ERROR" in capsys.readouterr().err
 
 
+class TestCliBehaviorOnCorruptedDurableArtifacts:
+    """Milestone 4D.1, Section 12: corrupted durable JSON must produce a
+    non-zero exit code, a concise domain-specific stderr message, and NO
+    Python traceback under normal CLI operation -- never a partial,
+    misleading report."""
+
+    def _prepare_and_execute(self, ml_config: Path, capsys: pytest.CaptureFixture[str]) -> str:
+        rc = main(["prepare-experiment", "--config", str(ml_config)])
+        assert rc == 0
+        experiment_id = capsys.readouterr().out.split("experiment_id: ")[1].split("\n")[0].strip()
+        rc = main(["execute", "--config", str(ml_config), "--experiment-id", experiment_id])
+        assert rc == 0
+        capsys.readouterr()
+        return experiment_id
+
+    def _corrupt_fold_0_result(self, ml_config: Path, experiment_id: str, *, payload: bytes) -> None:
+        from quant_platform.execution.manifests import ExecutionManifestStore
+        from quant_platform.ml.artifacts import MLArtifactStore
+        from quant_platform.ml.models import ArtifactCategory
+
+        config_data = json.loads(ml_config.read_text())
+        artifact_store = MLArtifactStore(config_data["ml_artifacts_root"])
+        bad_ref = artifact_store.write_artifact(payload, category=ArtifactCategory.FOLD_RESULT)
+        manifest_store = ExecutionManifestStore(config_data["ml_artifacts_root"])
+        manifest_path = manifest_store._manifest_path(experiment_id)
+        raw = json.loads(manifest_path.read_text())
+        raw["fold_result_references"]["0"] = {
+            "category": "fold_result", "content_hash": bad_ref.content_hash,
+            "size_bytes": len(payload), "created_at": "2024-01-01T00:00:00+00:00",
+        }
+        manifest_path.write_text(json.dumps(raw))
+
+    def test_verify_execution_on_malformed_fold_result_fails_cleanly_no_traceback(
+        self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        experiment_id = self._prepare_and_execute(ml_config_walk_forward, capsys)
+        self._corrupt_fold_0_result(ml_config_walk_forward, experiment_id, payload=b"{not valid json")
+
+        rc = main(["verify-execution", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        out, err = capsys.readouterr()
+        assert rc == 2, "verify-execution itself does not raise for corruption -- it REPORTS it, then exits 2 (not-ready)"
+        assert "is_ready: False" in out
+        assert "fold_result_unverifiable" in out
+        assert "Traceback" not in out and "Traceback" not in err
+
+    def test_verify_execution_on_nan_poisoned_fold_result_fails_cleanly_no_traceback(
+        self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        experiment_id = self._prepare_and_execute(ml_config_walk_forward, capsys)
+        poisoned = (
+            b'{"schema_version": 1, "fold_index": 0, "train_start": "2024-01-01T00:00:00+00:00", '
+            b'"train_end": "2024-01-01T00:00:00+00:00", "test_start": "2024-01-01T00:00:00+00:00", '
+            b'"test_end": "2024-01-01T00:00:00+00:00", "train_size": 1, "test_size": 1, "status": "completed", '
+            b'"duration_seconds": NaN, "validation_size": 0, "artifact_references": [], "metrics": {}, '
+            b'"failure_reason": null}'
+        )
+        self._corrupt_fold_0_result(ml_config_walk_forward, experiment_id, payload=poisoned)
+
+        rc = main(["verify-execution", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        out, err = capsys.readouterr()
+        assert rc == 2
+        assert "is_ready: False" in out
+        assert "fold_result_unverifiable" in out
+        assert "Traceback" not in out and "Traceback" not in err
+
+    def test_inspect_fold_on_malformed_fold_result_returns_domain_error_no_traceback(
+        self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        experiment_id = self._prepare_and_execute(ml_config_walk_forward, capsys)
+        self._corrupt_fold_0_result(ml_config_walk_forward, experiment_id, payload=b"{not valid json")
+
+        rc = main(["inspect-fold", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id, "--fold-index", "0"])
+        out, err = capsys.readouterr()
+        assert rc == 1
+        assert "ERROR" in err
+        assert "Traceback" not in out and "Traceback" not in err
+
+    def test_resume_on_completed_execution_with_corrupted_summary_fails_cleanly_no_traceback(
+        self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The idempotent-resume path (`ExecutionRunner._load_existing_
+        aggregate`) specifically -- exercised via `execute` called a
+        SECOND time on an already-COMPLETED execution, exactly like
+        `test_execute_is_idempotent`, except the EXECUTION_SUMMARY
+        artifact has been corrupted in between."""
+        from quant_platform.execution.manifests import ExecutionManifestStore
+        from quant_platform.ml.artifacts import MLArtifactStore
+        from quant_platform.ml.models import ArtifactCategory
+
+        experiment_id = self._prepare_and_execute(ml_config_walk_forward, capsys)
+        config_data = json.loads(ml_config_walk_forward.read_text())
+        artifact_store = MLArtifactStore(config_data["ml_artifacts_root"])
+        bad_ref = artifact_store.write_artifact(b"{not valid json", category=ArtifactCategory.EXECUTION_SUMMARY)
+        manifest_store = ExecutionManifestStore(config_data["ml_artifacts_root"])
+        manifest_path = manifest_store._manifest_path(experiment_id)
+        raw = json.loads(manifest_path.read_text())
+        for ref in raw["artifact_references"]:
+            if ref["category"] == "execution_summary":
+                ref["content_hash"] = bad_ref.content_hash
+        manifest_path.write_text(json.dumps(raw))
+
+        rc = main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        out, err = capsys.readouterr()
+        assert rc == 1
+        assert "ERROR" in err
+        assert "Traceback" not in out and "Traceback" not in err
+
+
+class TestCliJsonOutputNeverContainsNonFiniteTokens:
+    def test_inspect_execution_json_output_is_standards_compliant(
+        self, ml_config_walk_forward: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        rc = main(["prepare-experiment", "--config", str(ml_config_walk_forward)])
+        assert rc == 0
+        experiment_id = capsys.readouterr().out.split("experiment_id: ")[1].split("\n")[0].strip()
+        main(["execute", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id])
+        capsys.readouterr()
+
+        rc = main([
+            "inspect-execution", "--config", str(ml_config_walk_forward), "--experiment-id", experiment_id, "--format", "json",
+        ])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "NaN" not in out
+        assert "Infinity" not in out
+        json.loads(out)  # standard `json` module: would itself reject a bare NaN/Infinity token
+
+
 _WALK_FORWARD_SPLIT: dict[str, object] = {
     "strategy": "expanding_walk_forward",
     "params": {"n_splits": 3, "test_size": 100, "purge_bars": 5, "embargo_bars": 2},

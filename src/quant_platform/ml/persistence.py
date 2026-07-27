@@ -2,27 +2,25 @@
 (specs, identities, manifests, validation reports, artifact metadata,
 environment snapshots, seed configurations, tracking events).
 
-THE THREE GUARANTEES THIS MODULE EXISTS TO ENFORCE
---------------------------------------------------------------------------
-1. **Determinism.** `canonical_json_bytes` sorts dictionary keys and uses
-   compact, fixed separators -- the same logical payload always produces
-   the same bytes, independent of insertion order, process, or machine.
-   List/tuple ORDER is deliberately NOT touched (callers decide whether
-   order is semantically meaningful, e.g. an ordered feature list).
-2. **No non-finite floats.** Both the write path (`allow_nan=False`) and
-   the read path (`parse_constant` rejecting the `NaN`/`Infinity`/
-   `-Infinity` tokens Python's `json` module otherwise accepts as a
-   non-standard extension) refuse `NaN`/`Infinity` -- a durable experiment
-   record silently containing `NaN` is exactly the kind of corruption this
-   platform's "never silently repair" philosophy forbids.
-3. **No arbitrary Python object serialization.** Every function in this
-   module operates on plain JSON-native structures (`dict`/`list`/`str`/
-   `int`/`float`/`bool`/`None`) -- there is no code path here that can
-   serialize or deserialize an arbitrary Python object, let alone execute
-   one. Model artifacts that genuinely need a richer (and unsafe) format
-   are an explicit, separately-trusted concern for a later milestone's
-   model serializer -- never this generic layer (see `ml/artifacts.py`'s
-   module docstring).
+`canonical_json_bytes`, `parse_json_strict`, `sha256_hex_bytes`, and
+`write_json_atomic` are RE-EXPORTED, byte-for-byte unchanged, from
+`quant_platform.core.json` (Milestone 4D.1's dependency-neutral home for
+these primitives -- see that module's docstring for the full rationale:
+`historical`/`features` need them too, and importing `quant_platform.ml`
+from either would invert this platform's dependency graph). This module
+adds ML-specific concerns on top: path-containment (`assert_within_root`),
+schema-version enforcement (`require_schema_version`), JSON-primitive type
+narrowing (`as_json_dict`/`as_json_list`), UTC timestamp formatting, and
+`read_json_file` -- a convenience wrapper that additionally translates a
+missing/unreadable/malformed file into `ArtifactCorruptionError`, the
+ML-domain exception `core.json` itself deliberately has no opinion on.
+
+There is exactly ONE implementation of `canonical_json_bytes`/
+`parse_json_strict`/`sha256_hex_bytes`/`write_json_atomic` in this
+codebase, in `quant_platform.core.json`; nothing here reimplements or
+overrides their behavior -- `quant_platform.ml.persistence.
+parse_json_strict is quant_platform.core.json.parse_json_strict` (and
+likewise for the other three) holds by construction, not by convention.
 
 All durable JSON structures carry an explicit integer `schema_version`
 field; `require_schema_version` rejects anything this code version does
@@ -31,9 +29,6 @@ not know how to read rather than guessing.
 
 from __future__ import annotations
 
-import hashlib
-import json
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +39,12 @@ from quant_platform.core.exceptions import (
     MLError,
     PathSecurityError,
     SchemaVersionError,
+)
+from quant_platform.core.json import (
+    canonical_json_bytes,
+    parse_json_strict,
+    sha256_hex_bytes,
+    write_json_atomic,
 )
 
 
@@ -78,41 +79,6 @@ def assert_within_root(path: Path, *, root: Path) -> None:
         )
 
 
-def sha256_hex_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def canonical_json_bytes(payload: dict[str, Any]) -> bytes:
-    """Deterministic JSON encoding used for BOTH content fingerprinting and
-    durable storage. Raises `ValueError` if `payload` contains a NaN/
-    Infinity float anywhere (rather than silently encoding a non-standard
-    token another reader might not accept, or worse, mis-fingerprinting)."""
-    try:
-        text = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False, ensure_ascii=True)
-    except ValueError as exc:
-        raise ValueError(
-            f"Payload contains a non-finite float (NaN/Infinity), which is forbidden in "
-            f"durable ML JSON: {exc}"
-        ) from exc
-    return text.encode("utf-8")
-
-
-def _reject_non_finite_constant(token: str) -> float:
-    raise ValueError(f"Non-finite JSON token {token!r} is forbidden in durable ML JSON")
-
-
-def parse_json_strict(text: str) -> Any:
-    """`json.loads` with `NaN`/`Infinity`/`-Infinity` tokens rejected --
-    Python's `json` module accepts them by default as a non-standard
-    extension, which would otherwise let a corrupted or malicious file
-    smuggle a non-finite value straight past `canonical_json_bytes`'s
-    write-side guard."""
-    try:
-        return json.loads(text, parse_constant=_reject_non_finite_constant)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Malformed JSON: {exc}") from exc
-
-
 def utc_now() -> pd.Timestamp:
     return pd.Timestamp.now(tz="UTC")
 
@@ -133,21 +99,6 @@ def parse_utc_timestamp(value: str) -> pd.Timestamp:
     return ts.tz_convert("UTC")
 
 
-def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    """Temp-file-then-rename atomic write, consistent with every other
-    storage layer in this platform (`historical.canonical_store`,
-    `features.manifests`, ...) -- a reader never observes a partially
-    written file under the final path."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
-    try:
-        tmp_path.write_bytes(canonical_json_bytes(payload))
-        tmp_path.replace(path)
-    except BaseException:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-
 def read_json_file(path: Path) -> Any:
     if not path.is_file():
         raise ArtifactCorruptionError(
@@ -155,7 +106,7 @@ def read_json_file(path: Path) -> Any:
         )
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ArtifactCorruptionError(
             f"Failed to read JSON file {path}: {exc}", context={"path": str(path)}
         ) from exc

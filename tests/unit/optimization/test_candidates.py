@@ -123,6 +123,27 @@ class TestNonFiniteMetricsAreRejectedAtConstruction:
         table = rank_trials([finite_trial], primary_metric="accuracy")
         assert table.winner is not None and table.winner.trial_number == 1
 
+    @pytest.mark.parametrize("bad_value", [math.nan, math.inf, -math.inf])
+    def test_trial_result_rejects_non_finite_duration_seconds(self, bad_value: float) -> None:
+        """Milestone 4D.1 regression: `duration_seconds < 0` alone does
+        not reject NaN (`nan < 0` is `False`), so this earlier check
+        silently accepted a NaN duration despite the class's own `>= 0`
+        intent."""
+        with pytest.raises(ValueError, match="must be a finite number"):
+            TrialResult(
+                schema_version=1, optimization_id=OPT_ID, outer_fold_index=0, trial_number=0, status=TrialStatus.COMPLETED,
+                sampled_hyperparameters={}, inner_fold_metrics=(), primary_metric_aggregate=0.5, successful_inner_folds=1,
+                total_inner_folds=1, duration_seconds=bad_value,
+            )
+
+    @pytest.mark.parametrize("bad_value", [math.nan, math.inf, -math.inf])
+    def test_inner_fold_trial_metrics_rejects_non_finite_duration_seconds(self, bad_value: float) -> None:
+        with pytest.raises(ValueError, match="must be a finite number"):
+            InnerFoldTrialMetrics(
+                inner_fold_index=0, primary_metric_value=0.5, secondary_metrics={}, selected_feature_count=1,
+                feature_selection_result_reference=None, best_iteration=None, duration_seconds=bad_value,
+            )
+
 
 class TestEstimateModelComplexity:
     def test_none_when_no_recognized_rounds_key(self) -> None:

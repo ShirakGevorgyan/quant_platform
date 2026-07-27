@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
 from quant_platform.ml.comparison import (
     ComparisonOutcome,
+    ModelComparisonReport,
     ModelFoldMetrics,
+    RankedModel,
     compare_to_baseline,
     compare_to_baselines,
     rank_candidates,
@@ -282,6 +286,40 @@ class TestRankCandidates:
         ranked = ranking.ranked_models[0]
         assert ranked.comparison_report.candidate_name == "candidate"
         assert ranked.outperforms_all_baselines == ranked.comparison_report.outperforms_all_baselines("accuracy")
+
+
+class TestRankedModelFiniteNumberInvariant:
+    """Regression test for Milestone 4D.1: `RankedModel` had no
+    `__post_init__` at all -- a non-finite `primary_metric_mean` would
+    silently corrupt `rank_candidates`' `ranked.sort(key=lambda m: m.
+    primary_metric_mean, ...)` (Python's `sort` has no defined behavior
+    for a NaN key; a NaN-scored model is not guaranteed to sort to either
+    end, so it could be silently reported as the winner)."""
+
+    @staticmethod
+    def _empty_report(name: str = "candidate") -> ModelComparisonReport:
+        return ModelComparisonReport(candidate_name=name, baseline_reports=())
+
+    def test_rejects_nan_primary_metric_mean(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            RankedModel(
+                model_name="m", primary_metric_mean=math.nan, outperforms_all_baselines=False,
+                comparison_report=self._empty_report(),
+            )
+
+    def test_rejects_infinite_primary_metric_mean(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            RankedModel(
+                model_name="m", primary_metric_mean=math.inf, outperforms_all_baselines=False,
+                comparison_report=self._empty_report(),
+            )
+
+    def test_accepts_finite_primary_metric_mean(self) -> None:
+        ranked = RankedModel(
+            model_name="m", primary_metric_mean=0.75, outperforms_all_baselines=True,
+            comparison_report=self._empty_report(),
+        )
+        assert ranked.primary_metric_mean == 0.75
 
 
 class TestJsonSerialization:

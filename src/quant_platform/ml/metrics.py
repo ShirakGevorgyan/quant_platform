@@ -64,6 +64,7 @@ IMPLEMENT: Calibration").
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -308,6 +309,14 @@ class MetricAggregate:
     def __post_init__(self) -> None:
         if self.n < 1:
             raise ValueError(f"MetricAggregate.n must be >= 1, got {self.n}")
+        for name in ("mean", "std", "min", "max", "median"):
+            value = getattr(self, name)
+            if not math.isfinite(value):
+                raise ValueError(f"MetricAggregate.{name} must be finite, got {value!r}")
+        if self.std < 0:
+            raise ValueError(f"MetricAggregate.std must be >= 0 (it is a standard deviation), got {self.std}")
+        if self.min > self.max:
+            raise ValueError(f"MetricAggregate.min ({self.min}) must be <= MetricAggregate.max ({self.max})")
 
     def to_json_dict(self) -> dict[str, object]:
         return {"mean": self.mean, "std": self.std, "min": self.min, "max": self.max, "median": self.median, "n": self.n}

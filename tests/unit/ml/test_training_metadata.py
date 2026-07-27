@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from quant_platform.ml.persistence import format_utc_timestamp, utc_now
@@ -32,6 +34,8 @@ class TestConstructionValidation:
             ("library_version", "", "library_version"),
             ("seed", -1, "seed"),
             ("training_duration_seconds", -0.5, "training_duration_seconds"),
+            ("training_duration_seconds", math.nan, "training_duration_seconds"),
+            ("training_duration_seconds", math.inf, "training_duration_seconds"),
             ("feature_schema_fingerprint", "", "feature_schema_fingerprint"),
             ("dataset_content_id", "", "dataset_content_id"),
         ],
@@ -70,3 +74,9 @@ class TestRoundTrip:
         tm = _make(hyperparameters={})
         restored = TrainingMetadata.from_json_dict(tm.to_json_dict())
         assert restored.hyperparameters == {}
+
+    def test_string_coerced_nan_duration_rejected_on_from_json_dict(self) -> None:
+        raw = _make().to_json_dict()
+        raw["training_duration_seconds"] = "nan"
+        with pytest.raises(ValueError, match="finite"):
+            TrainingMetadata.from_json_dict(raw)

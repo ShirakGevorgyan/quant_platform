@@ -27,6 +27,7 @@ only reports where WITHIN an already-fixed space winners tend to land.
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -59,6 +60,18 @@ class JaccardSummary:
     min: float
     max: float
     n_pairs: int
+
+    def __post_init__(self) -> None:
+        if self.n_pairs < 1:
+            raise ValueError(f"JaccardSummary.n_pairs must be >= 1, got {self.n_pairs}")
+        for name in ("mean", "min", "max"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not (0.0 <= value <= 1.0):
+                raise ValueError(f"JaccardSummary.{name} must be a finite value in [0, 1] (a Jaccard similarity), got {value!r}")
+        if not math.isfinite(self.std) or self.std < 0:
+            raise ValueError(f"JaccardSummary.std must be a finite number >= 0, got {self.std!r}")
+        if self.min > self.max:
+            raise ValueError(f"JaccardSummary.min ({self.min}) must be <= JaccardSummary.max ({self.max})")
 
     def to_json_dict(self) -> dict[str, object]:
         return {"mean": self.mean, "std": self.std, "min": self.min, "max": self.max, "n_pairs": self.n_pairs}
@@ -95,6 +108,29 @@ class FeatureStabilityEntry:
     mean_score: float | None = None
     score_std: float | None = None
 
+    def __post_init__(self) -> None:
+        if self.times_selected < 0:
+            raise ValueError(f"FeatureStabilityEntry.times_selected must be >= 0, got {self.times_selected}")
+        if self.eligible_evaluations < 0:
+            raise ValueError(f"FeatureStabilityEntry.eligible_evaluations must be >= 0, got {self.eligible_evaluations}")
+        if self.times_selected > self.eligible_evaluations:
+            raise ValueError(
+                f"FeatureStabilityEntry.times_selected ({self.times_selected}) cannot exceed "
+                f"eligible_evaluations ({self.eligible_evaluations})"
+            )
+        for frequency_name in ("selection_frequency", "selected_in_winning_candidate_frequency"):
+            value = getattr(self, frequency_name)
+            if not math.isfinite(value) or not (0.0 <= value <= 1.0):
+                raise ValueError(f"FeatureStabilityEntry.{frequency_name} must be a finite value in [0, 1], got {value!r}")
+        if self.mean_rank is not None and not math.isfinite(self.mean_rank):
+            raise ValueError(f"FeatureStabilityEntry.mean_rank must be finite if set, got {self.mean_rank!r}")
+        if self.rank_std is not None and (not math.isfinite(self.rank_std) or self.rank_std < 0):
+            raise ValueError(f"FeatureStabilityEntry.rank_std must be a finite number >= 0 if set, got {self.rank_std!r}")
+        if self.mean_score is not None and not math.isfinite(self.mean_score):
+            raise ValueError(f"FeatureStabilityEntry.mean_score must be finite if set, got {self.mean_score!r}")
+        if self.score_std is not None and (not math.isfinite(self.score_std) or self.score_std < 0):
+            raise ValueError(f"FeatureStabilityEntry.score_std must be a finite number >= 0 if set, got {self.score_std!r}")
+
     def to_json_dict(self) -> dict[str, object]:
         return {
             "feature_name": self.feature_name, "times_selected": self.times_selected,
@@ -125,6 +161,10 @@ class FeatureStabilityReport:
     feature_count_distribution: Mapping[int, int]
     pairwise_jaccard: JaccardSummary | None = None
     warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.total_evaluations < 0:
+            raise ValueError(f"FeatureStabilityReport.total_evaluations must be >= 0, got {self.total_evaluations}")
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -236,6 +276,28 @@ class NumericParameterStability:
     high_bound: float
     boundary_hit_frequency: float
 
+    def __post_init__(self) -> None:
+        for name in ("mean", "min", "max", "low_bound", "high_bound"):
+            value = getattr(self, name)
+            if not math.isfinite(value):
+                raise ValueError(f"NumericParameterStability.{name} must be finite, got {value!r}")
+        if not math.isfinite(self.std) or self.std < 0:
+            raise ValueError(f"NumericParameterStability.std must be a finite number >= 0, got {self.std!r}")
+        if self.min > self.max:
+            raise ValueError(f"NumericParameterStability.min ({self.min}) must be <= max ({self.max})")
+        if self.low_bound > self.high_bound:
+            raise ValueError(
+                f"NumericParameterStability.low_bound ({self.low_bound}) must be <= high_bound ({self.high_bound})"
+            )
+        if not math.isfinite(self.boundary_hit_frequency) or not (0.0 <= self.boundary_hit_frequency <= 1.0):
+            raise ValueError(
+                f"NumericParameterStability.boundary_hit_frequency must be a finite value in [0, 1], "
+                f"got {self.boundary_hit_frequency!r}"
+            )
+        for value in self.values:
+            if not math.isfinite(value):
+                raise ValueError(f"NumericParameterStability.values must all be finite, found {value!r}")
+
     def to_json_dict(self) -> dict[str, object]:
         return {
             "parameter_name": self.parameter_name, "values": list(self.values), "mean": self.mean, "std": self.std,
@@ -258,6 +320,14 @@ class NumericParameterStability:
 class CategoricalParameterStability:
     parameter_name: str
     choice_frequencies: Mapping[str, float]
+
+    def __post_init__(self) -> None:
+        for choice, frequency in self.choice_frequencies.items():
+            if not math.isfinite(frequency) or not (0.0 <= frequency <= 1.0):
+                raise ValueError(
+                    f"CategoricalParameterStability.choice_frequencies[{choice!r}] must be a finite value "
+                    f"in [0, 1], got {frequency!r}"
+                )
 
     def to_json_dict(self) -> dict[str, object]:
         return {"parameter_name": self.parameter_name, "choice_frequencies": dict(sorted(self.choice_frequencies.items()))}
@@ -282,6 +352,29 @@ class HyperparameterStabilityReport:
     best_iteration_distribution: Mapping[str, float] | None = None
     trial_score_dispersion: float | None = None
     warnings: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.outer_fold_count < 0:
+            raise ValueError(f"HyperparameterStabilityReport.outer_fold_count must be >= 0, got {self.outer_fold_count}")
+        if self.best_iteration_distribution is not None:
+            for key, value in self.best_iteration_distribution.items():
+                if not math.isfinite(value):
+                    raise ValueError(f"HyperparameterStabilityReport.best_iteration_distribution[{key!r}] must be finite, got {value!r}")
+                if key == "std" and value < 0:
+                    raise ValueError(f"HyperparameterStabilityReport.best_iteration_distribution['std'] must be >= 0, got {value!r}")
+            dist_min, dist_max = self.best_iteration_distribution.get("min"), self.best_iteration_distribution.get("max")
+            if dist_min is not None and dist_max is not None and dist_min > dist_max:
+                raise ValueError(
+                    f"HyperparameterStabilityReport.best_iteration_distribution['min'] ({dist_min}) must be "
+                    f"<= ['max'] ({dist_max})"
+                )
+        if self.trial_score_dispersion is not None and (
+            not math.isfinite(self.trial_score_dispersion) or self.trial_score_dispersion < 0
+        ):
+            raise ValueError(
+                f"HyperparameterStabilityReport.trial_score_dispersion must be a finite number >= 0 if set "
+                f"(it is a standard deviation), got {self.trial_score_dispersion!r}"
+            )
 
     def to_json_dict(self) -> dict[str, object]:
         return {

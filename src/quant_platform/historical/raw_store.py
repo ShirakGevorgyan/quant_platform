@@ -33,7 +33,6 @@ later corruption, not a race condition to work around).
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import shutil
 import time
@@ -44,6 +43,7 @@ from pathlib import Path
 import pandas as pd
 
 from quant_platform.core.exceptions import PathSecurityError, SnapshotError
+from quant_platform.core.json import canonical_json_bytes, parse_json_strict
 from quant_platform.core.types import Timeframe
 from quant_platform.data.interfaces import DataSource
 from quant_platform.historical.models import (
@@ -243,7 +243,7 @@ class RawSnapshotStore:
                 content_checksum=checksum, min_open_time=min_open_time, max_open_time=max_open_time,
                 is_complete=is_complete,
             )
-            (tmp_dir / _METADATA_FILE).write_text(json.dumps(metadata.to_json_dict(), indent=2))
+            (tmp_dir / _METADATA_FILE).write_bytes(canonical_json_bytes(metadata.to_json_dict()))
             (tmp_dir / _SUCCESS_MARKER).write_text("")
         except Exception:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -274,13 +274,15 @@ class RawSnapshotStore:
         if not metadata_path.is_file():
             raise SnapshotError("Snapshot metadata.json is missing", context={"path": str(snapshot_dir)})
         try:
-            raw_metadata = json.loads(metadata_path.read_text())
-        except json.JSONDecodeError as exc:
+            raw_metadata = parse_json_strict(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_metadata, dict):
+                raise ValueError(f"expected a JSON object, got {type(raw_metadata).__name__}")
+            metadata = SnapshotMetadata.from_json_dict(raw_metadata)
+        except (UnicodeDecodeError, KeyError, ValueError, TypeError) as exc:
             raise SnapshotError(
-                f"Snapshot metadata.json is corrupted (invalid JSON): {exc}",
+                f"Snapshot metadata.json is corrupted (invalid JSON or wrong structure): {exc}",
                 context={"path": str(snapshot_dir)},
             ) from exc
-        metadata = SnapshotMetadata.from_json_dict(raw_metadata)
 
         data_path = snapshot_dir / _DATA_FILE
         if not data_path.is_file():

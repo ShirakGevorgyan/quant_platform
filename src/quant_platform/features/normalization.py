@@ -177,7 +177,12 @@ class TransformPipeline:
         return pipeline
 
     def fingerprint(self) -> str:
-        blob = json.dumps(self.to_json_dict(), sort_keys=True)
+        """NOT migrated to `canonical_json_bytes`: this directly computes
+        `fitted_preprocessing_fingerprint`, propagated into
+        `compute_dataset_id` -- see `features.manifests.write_artifacts`'s
+        identical note. `allow_nan=False` added; bytes for any
+        already-finite pipeline are completely unchanged."""
+        blob = json.dumps(self.to_json_dict(), sort_keys=True, allow_nan=False)
         return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 

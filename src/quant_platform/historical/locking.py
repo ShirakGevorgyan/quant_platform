@@ -33,7 +33,7 @@ process that ignores it -- it protects cooperating callers
 
 from __future__ import annotations
 
-import json
+import contextlib
 import logging
 import os
 import socket
@@ -45,6 +45,7 @@ from types import TracebackType
 import pandas as pd
 
 from quant_platform.core.exceptions import DatasetLockError
+from quant_platform.core.json import canonical_json_bytes, parse_json_strict
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,7 @@ class DatasetLock:
         or already has its complete, valid content the moment it exists
         at all."""
         tmp_path = self._lock_path.with_name(f".{self._lock_path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
-        tmp_path.write_text(json.dumps(info.to_json_dict()))
+        tmp_path.write_bytes(canonical_json_bytes(info.to_json_dict()))
         try:
             os.link(tmp_path, self._lock_path)
             return True
@@ -164,7 +165,22 @@ class DatasetLock:
         # once, via the SAME atomic write-then-link publish path `acquire`
         # itself uses. A second collision here means a genuine concurrent
         # acquisition race lost -- surface that rather than looping.
-        self._lock_path.unlink(missing_ok=True)
+        #
+        # `missing_ok=True` alone is not enough: it only swallows
+        # `FileNotFoundError` (this path was already gone). Found via a
+        # deterministic two-thread reclaim-race regression test: on
+        # Windows, when a SECOND thread/process concurrently unlinks the
+        # SAME path a moment after the first, NTFS's delete semantics can
+        # raise `PermissionError` (access denied / sharing violation)
+        # instead of "not found" for the loser of that micro-race. That
+        # is not a real failure to guard against here -- the actual
+        # arbiter of "who gets the lock" is `_try_publish`'s `os.link`
+        # call immediately below, which is atomic regardless of whether
+        # THIS unlink succeeded, failed benignly, or was a no-op. Any
+        # `OSError` here is therefore treated exactly like "already
+        # gone": proceed to `_try_publish` and let ITS atomicity decide.
+        with contextlib.suppress(OSError):
+            self._lock_path.unlink(missing_ok=True)
         if not self._try_publish(new_info):
             raise DatasetLockError(
                 f"Lost a race reclaiming stale lock {self._lock_path} against another process",
@@ -174,10 +190,63 @@ class DatasetLock:
         logger.info("Dataset lock reclaimed and acquired: path=%s pid=%d", self._lock_path, new_info.pid)
 
     def _read_existing_lock(self) -> LockInfo | None:
+        """`None` means "treat this lock as reclaimable" -- deliberately
+        the SAME outcome for every failure mode below, a decision made
+        (not merely inherited) when this module was migrated onto
+        `core.json.parse_json_strict`/`canonical_json_bytes`. This is
+        fail-OPEN-to-reclaim by design, safe specifically BECAUSE
+        `_try_publish`'s write-temp-then-`os.link` protocol (unchanged by
+        this migration) makes a lock file observable in exactly two
+        states: fully absent, or fully present with complete, valid
+        content -- there is no code path in THIS module that could ever
+        leave a live, currently-held lock in any of the states below.
+        Reaching one of them therefore means either (a) a genuine benign
+        race (the lock was concurrently released/reclaimed between the
+        existence check and this read -- os.link's own atomicity is what
+        actually adjudicates any real collision, not this method), or
+        (b) external interference (hand-editing, disk corruption) this
+        local-filesystem advisory lock never claimed to defend against
+        (see module docstring: "does not protect against a process that
+        ignores it"). Explicitly decided per failure mode:
+
+          * malformed lock JSON (`parse_json_strict` -> `ValueError`):
+            reclaimable.
+          * non-object root, e.g. a JSON array (`LockInfo.from_json_dict`
+            indexing a non-dict -> `TypeError`): reclaimable. Previously
+            UNCAUGHT here (a real, now-fixed gap: the pre-migration
+            except tuple had no `TypeError`, so this specific case would
+            have raised out of `_read_existing_lock` uncaught instead of
+            being treated as reclaimable).
+          * NaN/Infinity fields (`parse_json_strict` -> `ValueError`,
+            rejected at parse time -- previously would have reached
+            `int(str(raw["pid"]))`'s own `ValueError` instead, same
+            outcome either way): reclaimable.
+          * duplicate keys (`parse_json_strict` -> `ValueError`,
+            rejected at parse time -- previously silently resolved to
+            the last occurrence and NOT treated as corruption; the
+            platform-wide duplicate-key-rejection policy applies here
+            too): reclaimable.
+          * missing owner fields, e.g. no `pid` (`KeyError`):
+            reclaimable.
+          * invalid/unparseable timestamp (`pd.Timestamp(...)` ->
+            `ValueError`): reclaimable.
+          * partial/truncated file (malformed JSON, same as the first
+            case -- and per the atomicity argument above, only reachable
+            via external interference, never this module's own write
+            path): reclaimable.
+          * the file vanished between the caller's existence check and
+            this read (`OSError`/`FileNotFoundError`): reclaimable --
+            there is genuinely nothing there any more.
+
+        None of these silently treats a lock as reclaimable WITHOUT
+        first attempting `os.link`'s own atomic collision check in
+        `_try_publish` -- a "reclaim" that loses that race still raises
+        `DatasetLockError` (see `_handle_existing_lock`), so a live
+        holder that races past this exact window is still protected."""
         try:
-            raw = json.loads(self._lock_path.read_text())
+            raw = parse_json_strict(self._lock_path.read_text(encoding="utf-8"))
             return LockInfo.from_json_dict(raw)
-        except (OSError, json.JSONDecodeError, KeyError, ValueError):
+        except (OSError, UnicodeDecodeError, KeyError, ValueError, TypeError):
             return None
 
     def release(self) -> None:

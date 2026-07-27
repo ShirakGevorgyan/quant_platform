@@ -151,3 +151,60 @@ class TestDatasetIdStability:
         id_xau = store.compute_dataset_id(symbol="XAUUSD", timeframe=Timeframe.M1, source_name="mt5", broker="B")
         id_eur = store.compute_dataset_id(symbol="EURUSD", timeframe=Timeframe.M1, source_name="mt5", broker="B")
         assert id_xau != id_eur
+
+
+class TestCorruptedManifestFilesFailClosed:
+    """Milestone 4D.1 completion: `historical.manifest` now reads through
+    `quant_platform.core.json.parse_json_strict` (previously plain
+    `json.loads`) -- these prove the migration is wired in, not just
+    present in the module, and that every corruption mode still surfaces
+    as `ManifestError`, never a raw stdlib exception."""
+
+    def _saved_manifest_path(self, tmp_path) -> tuple[ManifestStore, object]:
+        store = ManifestStore(tmp_path)
+        manifest = _manifest(store)
+        version = store.save(manifest)
+        path = store._dataset_dir(symbol="XAUUSD", timeframe=Timeframe.M1) / f"{version}.json"
+        return store, path
+
+    def test_malformed_json_rejected(self, tmp_path) -> None:
+        store, path = self._saved_manifest_path(tmp_path)
+        path.write_text("{not valid json")
+        with pytest.raises(ManifestError, match="corrupted"):
+            store.load(symbol="XAUUSD", timeframe=Timeframe.M1)
+
+    def test_nan_rejected(self, tmp_path) -> None:
+        store, path = self._saved_manifest_path(tmp_path)
+        raw = path.read_text()
+        path.write_text(raw.replace('"row_count":100', '"row_count":NaN'))
+        with pytest.raises(ManifestError, match="corrupted"):
+            store.load(symbol="XAUUSD", timeframe=Timeframe.M1)
+
+    def test_infinity_rejected(self, tmp_path) -> None:
+        store, path = self._saved_manifest_path(tmp_path)
+        path.write_text('{"row_count": Infinity}')
+        with pytest.raises(ManifestError, match="corrupted"):
+            store.load(symbol="XAUUSD", timeframe=Timeframe.M1)
+
+    def test_invalid_utf8_rejected(self, tmp_path) -> None:
+        store, path = self._saved_manifest_path(tmp_path)
+        path.write_bytes(b"\xff\xfe\x00invalid utf8 \x80\x81")
+        with pytest.raises(ManifestError, match="corrupted"):
+            store.load(symbol="XAUUSD", timeframe=Timeframe.M1)
+
+    def test_non_object_root_rejected(self, tmp_path) -> None:
+        store, path = self._saved_manifest_path(tmp_path)
+        path.write_text("[1, 2, 3]")
+        with pytest.raises(ManifestError, match="corrupted"):
+            store.load(symbol="XAUUSD", timeframe=Timeframe.M1)
+
+    def test_duplicate_key_rejected(self, tmp_path) -> None:
+        store, path = self._saved_manifest_path(tmp_path)
+        path.write_text('{"dataset_id": "a", "dataset_id": "b"}')
+        with pytest.raises(ManifestError, match="corrupted"):
+            store.load(symbol="XAUUSD", timeframe=Timeframe.M1)
+
+    def test_valid_manifest_remains_readable_after_migration(self, tmp_path) -> None:
+        store, _ = self._saved_manifest_path(tmp_path)
+        loaded = store.load(symbol="XAUUSD", timeframe=Timeframe.M1)
+        assert loaded.symbol == "XAUUSD"
