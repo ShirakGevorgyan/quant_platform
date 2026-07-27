@@ -1,6 +1,7 @@
 """Command-line interface for the ML core infrastructure and artifact
 foundation (Milestone 4A), the time-safe execution engine (Milestone 4B),
-and the baseline predictive model framework (Milestone 4C).
+the baseline predictive model framework (Milestone 4C), and the leakage-
+safe feature-selection/hyperparameter-optimization engine (Milestone 4D).
 
     python -m quant_platform.ml_cli list-model-definitions
     python -m quant_platform.ml_cli describe-model-definition --name constant_test_model --version 1
@@ -21,6 +22,15 @@ and the baseline predictive model framework (Milestone 4C).
     python -m quant_platform.ml_cli validate-model --config config.json
     python -m quant_platform.ml_cli train --config config.json --experiment-id ID
     python -m quant_platform.ml_cli compare --config config.json --candidate-experiment-id ID --baseline-experiment-id ID [--baseline-experiment-id ID ...] --primary-metric roc_auc
+    python -m quant_platform.ml_cli optimize --config opt_config.json
+    python -m quant_platform.ml_cli resume-optimization --config opt_config.json --optimization-id ID
+    python -m quant_platform.ml_cli inspect-optimization --config opt_config.json --optimization-id ID
+    python -m quant_platform.ml_cli list-trials --config opt_config.json --optimization-id ID --outer-fold-index N
+    python -m quant_platform.ml_cli inspect-trial --config opt_config.json --optimization-id ID --outer-fold-index N --trial-number M
+    python -m quant_platform.ml_cli verify-optimization --config opt_config.json --optimization-id ID
+    python -m quant_platform.ml_cli compare-optimization-candidates --config opt_config.json --optimization-id ID --outer-fold-index N
+    python -m quant_platform.ml_cli feature-stability --config opt_config.json --optimization-id ID
+    python -m quant_platform.ml_cli hyperparameter-stability --config opt_config.json --optimization-id ID
 
 Same operability conventions as `data_cli`/`feature_cli`: every command
 returns 0 on success, non-zero on failure, and prints an actionable
@@ -67,6 +77,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from quant_platform.config.ml_schemas import MLExperimentConfig
+from quant_platform.config.optimization_schemas import OptimizationConfig
 from quant_platform.core.exceptions import QuantPlatformError
 from quant_platform.execution.executor import DeterministicFoldExecutor, MetricsFoldExecutor
 from quant_platform.execution.manifests import ExecutionManifestStore
@@ -86,12 +97,14 @@ from quant_platform.ml import model_zoo as mz
 from quant_platform.ml.artifacts import MLArtifactStore
 from quant_platform.ml.comparison import ModelFoldMetrics, compare_to_baselines
 from quant_platform.ml.environment import capture_code_revision_binding
+from quant_platform.ml.experiment_identity import compute_experiment_identity
 from quant_platform.ml.experiment_manager import ExperimentPreparer
 from quant_platform.ml.experiment_spec import ExperimentSpec
 from quant_platform.ml.interfaces import FeatureSchema
 from quant_platform.ml.manifests import ExperimentManifest, ExperimentManifestStore
 from quant_platform.ml.model_validation import validate_training_data
 from quant_platform.ml.models import (
+    ArtifactCategory,
     DatasetBinding,
     ExperimentStatus,
     FeatureBinding,
@@ -106,6 +119,29 @@ from quant_platform.ml.reporting import build_report_json, render_report_markdow
 from quant_platform.ml.testing import TEST_MODEL_NAME, TEST_MODEL_VERSION, ConstantTestModelFactory
 from quant_platform.ml.tracking import ExperimentEventStore
 from quant_platform.ml.validation import validate_experiment_spec
+from quant_platform.optimization.candidates import RankingTable, TrialResult
+from quant_platform.optimization.manifests import (
+    OptimizationEventStore,
+    OptimizationManifest,
+    OptimizationManifestStore,
+    trial_references_for_outer_fold,
+)
+from quant_platform.optimization.models import (
+    OptimizationSpec,
+    OptimizationStage,
+)
+from quant_platform.optimization.outer_fold import OuterFoldResult
+from quant_platform.optimization.reporting import (
+    build_optimization_report_json,
+    render_optimization_report_markdown,
+)
+from quant_platform.optimization.runner import OptimizationRunner
+from quant_platform.optimization.stability import (
+    FeatureStabilityReport,
+    HyperparameterStabilityReport,
+    flag_near_tied_top_candidates,
+)
+from quant_platform.optimization.verification import verify_optimization
 
 _TIMESTAMP_COLUMN = "open_time"
 _LABEL_COLUMN = "label"
@@ -555,6 +591,266 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0 if outperforms else 2
 
 
+def _load_optimization_config(path: Path) -> OptimizationConfig:
+    return OptimizationConfig.model_validate_json(path.read_text())
+
+
+def _resolve_optimization_spec(config: OptimizationConfig, *, model_registry: ModelRegistry) -> tuple[OptimizationSpec, str]:
+    experiment_config = _load_config(config.experiment_config_path)
+    experiment_spec, _ = build_experiment_spec(experiment_config)
+    parent_experiment_id = compute_experiment_identity(experiment_spec).experiment_id
+    optimization_spec = config.build(experiment=experiment_spec, parent_experiment_id=parent_experiment_id, model_registry=model_registry)
+    return optimization_spec, parent_experiment_id
+
+
+def _build_optimization_runner(config: OptimizationConfig) -> OptimizationRunner:
+    experiment_config = _load_config(config.experiment_config_path)
+    return OptimizationRunner(
+        ml_artifacts_root=config.ml_artifacts_root, model_registry=build_model_registry(),
+        research_manifest_store=ResearchManifestStore(experiment_config.dataset.research_storage_root),
+        research_dataset_store=ResearchDatasetStore(experiment_config.dataset.research_storage_root),
+        experiment_manifest_store=ExperimentManifestStore(config.ml_artifacts_root),
+        additional_serializers=mz.default_serializer_registry(),
+    )
+
+
+def cmd_optimize(args: argparse.Namespace) -> int:
+    """Runs (or transparently resumes, if a manifest already exists for
+    this exact `OptimizationSpec`'s identity) a full nested walk-forward
+    search: for every outer fold, an inner trial search selects a winner
+    using ONLY inner-fold evidence, then that winner is refit on the
+    complete outer-train partition and evaluated exactly once on the
+    untouched outer-test partition. Requires the referenced parent
+    experiment to already be prepared (see `prepare-experiment`)."""
+    config = _load_optimization_config(Path(args.config))
+    registry = build_model_registry()
+    optimization_spec, _ = _resolve_optimization_spec(config, model_registry=registry)
+    runner = _build_optimization_runner(config)
+    outcome = runner.run(optimization_spec)
+    print(f"optimization_id: {outcome.manifest.optimization_id}")
+    print(f"stage: {outcome.manifest.stage.value}")
+    print(
+        f"trials: completed={outcome.manifest.total_trials_completed} failed={outcome.manifest.total_trials_failed} "
+        f"invalid={outcome.manifest.total_trials_invalid} pruned={outcome.manifest.total_trials_pruned}"
+    )
+    print(f"winning_trial_by_outer_fold: {dict(sorted(outcome.manifest.winning_trial_by_outer_fold.items()))}")
+    if outcome.manifest.failure_summary:
+        print(f"failure_summary: {outcome.manifest.failure_summary}")
+    return 0 if outcome.manifest.stage is OptimizationStage.COMPLETED else 2
+
+
+def cmd_resume_optimization(args: argparse.Namespace) -> int:
+    """Resumes a prior, non-terminal optimization -- fails if there is
+    nothing to resume. The `OptimizationSpec` is re-loaded from the
+    optimization's OWN recorded `OPTIMIZATION_SPEC` artifact (never
+    rebuilt from `--config` again), so this command only needs `--config`
+    to construct the runner's stores/registry."""
+    config = _load_optimization_config(Path(args.config))
+    runner = _build_optimization_runner(config)
+    outcome = runner.resume(args.optimization_id)
+    print(f"optimization_id: {outcome.manifest.optimization_id}")
+    print(f"stage: {outcome.manifest.stage.value}")
+    print(
+        f"trials: completed={outcome.manifest.total_trials_completed} failed={outcome.manifest.total_trials_failed} "
+        f"invalid={outcome.manifest.total_trials_invalid} pruned={outcome.manifest.total_trials_pruned}"
+    )
+    print(f"resume_count: {outcome.manifest.resume_count}")
+    return 0 if outcome.manifest.stage is OptimizationStage.COMPLETED else 2
+
+
+def _optimization_manifest_store(config: OptimizationConfig) -> OptimizationManifestStore:
+    return OptimizationManifestStore(config.ml_artifacts_root)
+
+
+def _load_outer_fold_results(manifest: OptimizationManifest, artifact_store: MLArtifactStore) -> dict[int, OuterFoldResult]:
+    results: dict[int, OuterFoldResult] = {}
+    for outer_fold_index, ref in manifest.outer_fold_result_references.items():
+        raw = artifact_store.read_artifact(ref.content_hash)
+        results[outer_fold_index] = OuterFoldResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    return results
+
+
+def _load_ranking_tables(outer_fold_results: dict[int, OuterFoldResult], artifact_store: MLArtifactStore) -> dict[int, RankingTable]:
+    tables: dict[int, RankingTable] = {}
+    for outer_fold_index, result in outer_fold_results.items():
+        if result.search_summary_reference is None:
+            continue
+        raw = artifact_store.read_artifact(result.search_summary_reference.content_hash)
+        tables[outer_fold_index] = RankingTable.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    return tables
+
+
+def _load_optimization_spec(manifest: OptimizationManifest, artifact_store: MLArtifactStore) -> OptimizationSpec | None:
+    ref = next((r for r in manifest.artifact_references if r.category is ArtifactCategory.OPTIMIZATION_SPEC), None)
+    if ref is None:
+        return None
+    raw = artifact_store.read_artifact(ref.content_hash)
+    return OptimizationSpec.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+
+
+def _load_summary_by_category(manifest: OptimizationManifest, artifact_store: MLArtifactStore, category: ArtifactCategory) -> bytes | None:
+    ref = next((r for r in manifest.summary_references if r.category is category), None)
+    if ref is None:
+        return None
+    return artifact_store.read_artifact(ref.content_hash)
+
+
+def cmd_inspect_optimization(args: argparse.Namespace) -> int:
+    config = _load_optimization_config(Path(args.config))
+    manifest = _optimization_manifest_store(config).load(args.optimization_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+
+    spec = _load_optimization_spec(manifest, artifact_store)
+    outer_fold_results = _load_outer_fold_results(manifest, artifact_store)
+    ranking_tables = _load_ranking_tables(outer_fold_results, artifact_store)
+    feature_stability_raw = _load_summary_by_category(manifest, artifact_store, ArtifactCategory.FEATURE_STABILITY)
+    hyperparameter_stability_raw = _load_summary_by_category(manifest, artifact_store, ArtifactCategory.HYPERPARAMETER_STABILITY)
+    feature_stability = FeatureStabilityReport.from_json_dict(parse_json_strict(feature_stability_raw.decode("utf-8"))) if feature_stability_raw else None
+    hyperparameter_stability = (
+        HyperparameterStabilityReport.from_json_dict(parse_json_strict(hyperparameter_stability_raw.decode("utf-8")))
+        if hyperparameter_stability_raw else None
+    )
+
+    if args.format == "json":
+        import json
+
+        payload = build_optimization_report_json(
+            manifest, spec=spec, outer_fold_results=list(outer_fold_results.values()), ranking_tables=ranking_tables,
+            feature_stability=feature_stability, hyperparameter_stability=hyperparameter_stability,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(render_optimization_report_markdown(
+            manifest, spec=spec, outer_fold_results=list(outer_fold_results.values()), ranking_tables=ranking_tables,
+            feature_stability=feature_stability, hyperparameter_stability=hyperparameter_stability,
+        ))
+    return 0
+
+
+def cmd_list_trials(args: argparse.Namespace) -> int:
+    config = _load_optimization_config(Path(args.config))
+    manifest = _optimization_manifest_store(config).load(args.optimization_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    refs = trial_references_for_outer_fold(manifest, args.outer_fold_index)
+    if not refs:
+        print(f"No trials recorded yet for optimization_id={args.optimization_id!r} outer_fold_index={args.outer_fold_index}", file=sys.stderr)
+        return 1
+    for trial_number in sorted(refs):
+        raw = artifact_store.read_artifact(refs[trial_number].content_hash)
+        trial = TrialResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+        print(
+            f"trial {trial.trial_number}: status={trial.status.value} "
+            f"primary_metric_aggregate={trial.primary_metric_aggregate} "
+            f"successful_inner_folds={trial.successful_inner_folds}/{trial.total_inner_folds}"
+        )
+    return 0
+
+
+def cmd_inspect_trial(args: argparse.Namespace) -> int:
+    config = _load_optimization_config(Path(args.config))
+    manifest = _optimization_manifest_store(config).load(args.optimization_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    refs = trial_references_for_outer_fold(manifest, args.outer_fold_index)
+    ref = refs.get(args.trial_number)
+    if ref is None:
+        print(f"No trial recorded for optimization_id={args.optimization_id!r} outer_fold_index={args.outer_fold_index} trial_number={args.trial_number}", file=sys.stderr)
+        return 1
+    raw = artifact_store.read_artifact(ref.content_hash)
+    trial = TrialResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    for key, value in trial.to_json_dict().items():
+        print(f"{key}: {value}")
+    return 0
+
+
+def cmd_verify_optimization(args: argparse.Namespace) -> int:
+    """Re-audits everything the named optimization has ever recorded --
+    see `optimization.verification.verify_optimization`'s module
+    docstring for exactly what is checked, including the outer-test-
+    isolation event-ordering proof. Returns 2 (not 1) when the report
+    contains any CRITICAL/ERROR issue."""
+    config = _load_optimization_config(Path(args.config))
+    report = verify_optimization(
+        args.optimization_id, optimization_manifest_store=_optimization_manifest_store(config),
+        experiment_manifest_store=ExperimentManifestStore(config.ml_artifacts_root),
+        artifact_store=MLArtifactStore(config.ml_artifacts_root),
+        event_store=OptimizationEventStore(config.ml_artifacts_root),
+    )
+    for issue in report.issues:
+        print(f"[{issue.severity.value}] {issue.code}: {issue.message}")
+    print(f"is_ready: {report.is_ready}")
+    return 0 if report.is_ready else 2
+
+
+def cmd_compare_optimization_candidates(args: argparse.Namespace) -> int:
+    """Prints one outer fold's complete, deterministic trial ranking
+    table (see `optimization.candidates.rank_trials`) plus a near-tie
+    flag between the winner and its closest competitor -- never a
+    statistical test between every pair of trials."""
+    config = _load_optimization_config(Path(args.config))
+    manifest = _optimization_manifest_store(config).load(args.optimization_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    outer_fold_results = _load_outer_fold_results(manifest, artifact_store)
+    result = outer_fold_results.get(args.outer_fold_index)
+    if result is None or result.search_summary_reference is None:
+        print(f"No completed ranking table for optimization_id={args.optimization_id!r} outer_fold_index={args.outer_fold_index}", file=sys.stderr)
+        return 1
+    raw = artifact_store.read_artifact(result.search_summary_reference.content_hash)
+    table = RankingTable.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    print(f"primary_metric: {table.primary_metric}")
+    for entry in table.entries:
+        print(
+            f"rank {entry.rank}: trial={entry.trial_number} valid={entry.is_valid} "
+            f"primary_metric_aggregate={entry.primary_metric_aggregate} "
+            f"successful_inner_folds={entry.successful_inner_folds} "
+            f"mean_selected_feature_count={entry.mean_selected_feature_count}"
+        )
+    for warning in flag_near_tied_top_candidates(table):
+        print(f"WARNING: {warning}")
+    return 0
+
+
+def cmd_feature_stability(args: argparse.Namespace) -> int:
+    config = _load_optimization_config(Path(args.config))
+    manifest = _optimization_manifest_store(config).load(args.optimization_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    raw = _load_summary_by_category(manifest, artifact_store, ArtifactCategory.FEATURE_STABILITY)
+    if raw is None:
+        print(f"No feature-stability summary recorded yet for optimization_id={args.optimization_id!r}", file=sys.stderr)
+        return 1
+    report = FeatureStabilityReport.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    print(f"total_evaluations: {report.total_evaluations}")
+    for entry in report.entries:
+        print(
+            f"{entry.feature_name}: selection_frequency={entry.selection_frequency:.3f} "
+            f"selected_in_winning_candidate_frequency={entry.selected_in_winning_candidate_frequency:.3f} "
+            f"mean_rank={entry.mean_rank} mean_score={entry.mean_score}"
+        )
+    if report.pairwise_jaccard is not None:
+        print(f"pairwise_jaccard_mean: {report.pairwise_jaccard.mean:.3f}")
+    for warning in report.warnings:
+        print(f"WARNING: {warning}")
+    return 0
+
+
+def cmd_hyperparameter_stability(args: argparse.Namespace) -> int:
+    config = _load_optimization_config(Path(args.config))
+    manifest = _optimization_manifest_store(config).load(args.optimization_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    raw = _load_summary_by_category(manifest, artifact_store, ArtifactCategory.HYPERPARAMETER_STABILITY)
+    if raw is None:
+        print(f"No hyperparameter-stability summary recorded yet for optimization_id={args.optimization_id!r}", file=sys.stderr)
+        return 1
+    report = HyperparameterStabilityReport.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    for numeric in report.numeric_parameters:
+        print(f"{numeric.parameter_name}: mean={numeric.mean:.6g} std={numeric.std:.6g} boundary_hit_frequency={numeric.boundary_hit_frequency:.3f}")
+    for categorical in report.categorical_parameters:
+        print(f"{categorical.parameter_name}: {dict(sorted(categorical.choice_frequencies.items()))}")
+    print(f"trial_score_dispersion: {report.trial_score_dispersion}")
+    for warning in report.warnings:
+        print(f"WARNING: {warning}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m quant_platform.ml_cli",
@@ -683,6 +979,73 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--baseline-experiment-id", action="append", required=True, help="Repeatable -- at least one required.")
     compare_parser.add_argument("--primary-metric", required=True)
     compare_parser.set_defaults(handler=cmd_compare)
+
+    optimize_parser = subparsers.add_parser(
+        "optimize", help="Milestone 4D: run (or transparently resume) a leakage-safe nested feature-selection/hyperparameter-optimization search.",
+    )
+    optimize_parser.add_argument("--config", required=True)
+    optimize_parser.set_defaults(handler=cmd_optimize)
+
+    resume_optimization_parser = subparsers.add_parser(
+        "resume-optimization", help="Milestone 4D: resume a prior, non-terminal optimization.",
+    )
+    resume_optimization_parser.add_argument("--config", required=True)
+    resume_optimization_parser.add_argument("--optimization-id", required=True)
+    resume_optimization_parser.set_defaults(handler=cmd_resume_optimization)
+
+    inspect_optimization_parser = subparsers.add_parser(
+        "inspect-optimization", help="Milestone 4D: print a human-readable (or JSON) optimization report.",
+    )
+    inspect_optimization_parser.add_argument("--config", required=True)
+    inspect_optimization_parser.add_argument("--optimization-id", required=True)
+    inspect_optimization_parser.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    inspect_optimization_parser.set_defaults(handler=cmd_inspect_optimization)
+
+    list_trials_parser = subparsers.add_parser(
+        "list-trials", help="Milestone 4D: list every trial recorded for one outer fold, with status and score.",
+    )
+    list_trials_parser.add_argument("--config", required=True)
+    list_trials_parser.add_argument("--optimization-id", required=True)
+    list_trials_parser.add_argument("--outer-fold-index", type=int, required=True)
+    list_trials_parser.set_defaults(handler=cmd_list_trials)
+
+    inspect_trial_parser = subparsers.add_parser(
+        "inspect-trial", help="Milestone 4D: print one trial's full persisted TrialResult.",
+    )
+    inspect_trial_parser.add_argument("--config", required=True)
+    inspect_trial_parser.add_argument("--optimization-id", required=True)
+    inspect_trial_parser.add_argument("--outer-fold-index", type=int, required=True)
+    inspect_trial_parser.add_argument("--trial-number", type=int, required=True)
+    inspect_trial_parser.set_defaults(handler=cmd_inspect_trial)
+
+    verify_optimization_parser = subparsers.add_parser(
+        "verify-optimization", help="Milestone 4D: re-verify every artifact/event an optimization has recorded, including outer-test isolation.",
+    )
+    verify_optimization_parser.add_argument("--config", required=True)
+    verify_optimization_parser.add_argument("--optimization-id", required=True)
+    verify_optimization_parser.set_defaults(handler=cmd_verify_optimization)
+
+    compare_candidates_parser = subparsers.add_parser(
+        "compare-optimization-candidates", help="Milestone 4D: print one outer fold's complete deterministic trial ranking table.",
+    )
+    compare_candidates_parser.add_argument("--config", required=True)
+    compare_candidates_parser.add_argument("--optimization-id", required=True)
+    compare_candidates_parser.add_argument("--outer-fold-index", type=int, required=True)
+    compare_candidates_parser.set_defaults(handler=cmd_compare_optimization_candidates)
+
+    feature_stability_parser = subparsers.add_parser(
+        "feature-stability", help="Milestone 4D: print the feature-selection stability report for a completed optimization.",
+    )
+    feature_stability_parser.add_argument("--config", required=True)
+    feature_stability_parser.add_argument("--optimization-id", required=True)
+    feature_stability_parser.set_defaults(handler=cmd_feature_stability)
+
+    hyperparameter_stability_parser = subparsers.add_parser(
+        "hyperparameter-stability", help="Milestone 4D: print the hyperparameter stability report for a completed optimization.",
+    )
+    hyperparameter_stability_parser.add_argument("--config", required=True)
+    hyperparameter_stability_parser.add_argument("--optimization-id", required=True)
+    hyperparameter_stability_parser.set_defaults(handler=cmd_hyperparameter_stability)
 
     return parser
 

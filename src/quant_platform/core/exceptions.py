@@ -376,3 +376,52 @@ class TrainingDataValidationError(ExecutionError):
     caught by `execution.runner` exactly like any other fold-level
     exception (that fold is marked `FAILED`, the run continues to the
     remaining folds)."""
+
+
+# --------------------------------------------------------------------------
+# Leakage-safe feature selection and hyperparameter optimization (Milestone 4D)
+# --------------------------------------------------------------------------
+class OptimizationError(QuantPlatformError):
+    """Base class for every failure in the leakage-safe feature-selection
+    and hyperparameter-optimization engine (`quant_platform.optimization`).
+    Distinct from `MLError`/`ExecutionError` -- this milestone governs
+    nested (outer/inner) search over an already-`ready`, already-
+    executable `ExperimentSpec`, never experiment identity or plain
+    walk-forward execution directly."""
+
+
+class OptimizationIdentityError(OptimizationError):
+    """Raised when a deterministic `optimization_id` cannot be computed
+    from an `OptimizationSpec` -- the optimization-level analogue of
+    `ExperimentIdentityError`."""
+
+
+class OptimizationStateError(OptimizationError):
+    """Raised for illegal `OptimizationStage` transitions, or an attempt
+    to silently overwrite an already-terminal `OptimizationManifest` with
+    inconsistent content -- the optimization-level analogue of
+    `ExecutionStateError`."""
+
+
+class TrialExecutionError(OptimizationError):
+    """Raised when a trial cannot be executed at all due to a structural
+    problem (a sampled hyperparameter combination the model wrapper
+    rejects outright, a malformed search space, a search-space/sampled-
+    value mismatch) -- distinct from a trial that runs to completion but
+    is legitimately marked `INVALID`/`FAILED`/`PRUNED` as a normal,
+    expected outcome of a bad-but-well-formed candidate."""
+
+
+class OptimizationResumeError(OptimizationError):
+    """Raised when an optimization resume attempt cannot proceed safely:
+    a completed trial's recorded artifact is missing or corrupted, the
+    requested optimization has no prior manifest to resume, an already-
+    terminal optimization is asked to resume, or a resumed TPE sampler's
+    replayed trial sequence cannot be reconstructed deterministically."""
+
+
+class OptimizationVerificationError(OptimizationError):
+    """Raised by `optimization.verification.verify_optimization` (or a
+    caller consuming its report) when a FATAL cross-consistency check
+    fails and the caller has asked for that to raise rather than merely
+    be reported as an issue."""

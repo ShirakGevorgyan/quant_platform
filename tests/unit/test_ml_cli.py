@@ -91,7 +91,9 @@ def ml_config_walk_forward(tmp_path: Path) -> Path:
 
 
 class TestBuildParser:
-    def test_all_nineteen_commands_registered(self) -> None:
+    def test_all_twenty_eight_commands_registered(self) -> None:
+        """19 Milestone 4A-4C commands plus 9 Milestone 4D optimization
+        commands, all registered on the one shared `ml_cli.py` parser."""
         parser = build_parser()
         subparsers_action = next(a for a in parser._actions if a.dest == "command")
         assert set(subparsers_action.choices) == {
@@ -99,6 +101,8 @@ class TestBuildParser:
             "inspect-experiment", "inspect-experiment-manifest", "verify-artifact", "list-experiment-events",
             "execute", "resume", "inspect-execution", "inspect-fold", "list-folds", "verify-execution",
             "list-models", "inspect-model", "validate-model", "train", "compare",
+            "optimize", "resume-optimization", "inspect-optimization", "list-trials", "inspect-trial",
+            "verify-optimization", "compare-optimization-candidates", "feature-stability", "hyperparameter-stability",
         }
 
 

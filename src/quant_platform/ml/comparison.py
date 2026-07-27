@@ -87,6 +87,24 @@ def _is_higher_better(metric_name: str) -> bool:
     )
 
 
+def is_higher_better(metric_name: str) -> bool:
+    """The PUBLIC accessor for this module's one authoritative metric-
+    direction registry -- added for Milestone 4D (`optimization.objectives`),
+    which must derive ranking/pruning/early-stopping direction from THIS
+    registry and must never define a second, competing one. Raises
+    `ValueError` for any metric name not declared in `_HIGHER_IS_BETTER`/
+    `_LOWER_IS_BETTER`, exactly like every internal call site already
+    does -- there is no silent default direction."""
+    return _is_higher_better(metric_name)
+
+
+def known_metric_names() -> frozenset[str]:
+    """Every metric name this registry declares a direction for -- the
+    complete, authoritative set `optimization.objectives` validates a
+    caller-declared `primary_metric` against."""
+    return _HIGHER_IS_BETTER | _LOWER_IS_BETTER
+
+
 @dataclass(frozen=True, slots=True)
 class ModelFoldMetrics:
     """One model's (candidate OR baseline) per-fold metric values.

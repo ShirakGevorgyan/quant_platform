@@ -40,6 +40,19 @@ dependencies = [
     "catboost>=1.2,<2.0",
     "scikit-learn>=1.4,<2.0",
     "scipy>=1.11,<2.0",
+    # Milestone 4D leakage-safe optimization engine: imported directly by
+    # quant_platform.optimization.study (sampler construction, ask()/tell()
+    # resume replay). The declared range is WIDER than what has actually
+    # been empirically verified (only 4.9.0, the installed patch at
+    # delivery time) -- deterministic TPE/Random sampler resume depends on
+    # Optuna's internal RNG-consumption order, which is not part of its
+    # public API contract and could change across any release in this
+    # range. `OptimizationRunner` binds the ACTUAL installed Optuna version
+    # into the persisted `ENVIRONMENT_SNAPSHOT` artifact at optimization
+    # creation time and fails closed (`OptimizationResumeError`) on
+    # `.resume()` if the currently installed version differs -- see
+    # optimization/runner.py's `_require_compatible_optuna_version`.
+    "optuna>=4.0,<5.0",
 ]
 
 [project.optional-dependencies]

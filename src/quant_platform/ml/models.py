@@ -105,6 +105,42 @@ class ArtifactCategory(Enum):
     dataset content id, and experiment id, all in one place distinct from
     the `MODEL` artifact itself (the fitted model's own serialized bytes
     carry `ModelMetadata`, not this provenance record)."""
+    OPTIMIZATION_SPEC = "optimization_spec"
+    """Milestone 4D: one immutable `optimization.models.OptimizationSpec`
+    record -- the canonical, content-addressed record of every
+    scientifically material search choice for one optimization run."""
+    TRIAL_RESULT = "trial_result"
+    """Milestone 4D: one immutable `optimization.trial_executor.TrialResult`
+    per (outer_fold_index, trial_number) -- inner-fold metrics, aggregated
+    score, status, and every artifact reference produced while evaluating
+    one sampled candidate."""
+    FEATURE_SELECTION_RESULT = "feature_selection_result"
+    """Milestone 4D: one immutable `optimization.feature_selection.
+    FeatureSelectionResult` per (trial, inner fold) -- the exact selected/
+    rejected feature sets a selector strategy produced, fitted on
+    inner-train only."""
+    SEARCH_SUMMARY = "search_summary"
+    """Milestone 4D: the full trial ranking table for one outer fold."""
+    FEATURE_STABILITY = "feature_stability"
+    """Milestone 4D: a `optimization.stability.FeatureStabilityReport` --
+    selection frequency/rank/score summaries across inner folds, trials,
+    and outer folds."""
+    HYPERPARAMETER_STABILITY = "hyperparameter_stability"
+    """Milestone 4D: a `optimization.stability.HyperparameterStabilityReport`
+    -- winning-parameter distributions and boundary-hit flags across outer
+    folds."""
+    OUTER_FOLD_SELECTION = "outer_fold_selection"
+    """Milestone 4D: one immutable `optimization.outer_fold.
+    OuterFoldResult` -- the winning candidate refit on the complete
+    outer-train partition and evaluated exactly once on outer-test."""
+    OPTIMIZATION_REPORT = "optimization_report"
+    """Milestone 4D: the final JSON/Markdown optimization report."""
+    ENVIRONMENT_SNAPSHOT = "environment_snapshot"
+    """Milestone 4D: one `EnvironmentSnapshot` captured ONCE per
+    optimization run and referenced (by content hash) from every
+    `optimization.candidates.TrialResult` -- captured once because the
+    runtime environment does not change between trials of the same run,
+    never re-captured/re-written per trial."""
 
 
 class ExperimentStatus(Enum):

@@ -51,6 +51,13 @@ _TRACKED_PACKAGES = (
     # looked up from this SAME already-captured snapshot rather than a
     # second, parallel introspection mechanism.
     "lightgbm", "xgboost", "catboost", "scikit-learn", "scipy",
+    # Milestone 4D: Optuna's sampler resume determinism is empirically
+    # verified, not guaranteed by its public API contract, across the
+    # declared dependency range -- `optimization.runner` reads THIS
+    # package's version back out of the persisted snapshot to fail closed
+    # on a resume attempted under a different installed version (see
+    # `optimization.runner._require_compatible_optuna_version`).
+    "optuna",
 )
 _GIT_TIMEOUT_SECONDS = 5
 
