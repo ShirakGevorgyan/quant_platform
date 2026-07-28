@@ -188,6 +188,192 @@ class TestGenuineWriteFailures:
             store.write_artifact(b"data", category=ArtifactCategory.MODEL)
 
 
+class TestDedupReVerification:
+    """Milestone 5.2, Section 5: `write_artifact`'s dedup path must
+    re-verify pre-existing bytes (recompute their hash, check the
+    sidecar's recorded size) before trusting them -- never accept a
+    hash-named path on the strength of `is_file()` alone."""
+
+    def test_pre_existing_corrupted_content_artifact_is_detected_and_atomically_repaired(self, tmp_path: Path) -> None:
+        store = MLArtifactStore(tmp_path)
+        data = b"the genuinely correct content"
+        ref = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        content_path = store._content_path(ref.content_hash)
+        content_path.write_bytes(b"CORRUPTED BYTES, DIFFERENT LENGTH TOO")
+
+        # Re-writing the SAME original data (same hash) must detect the
+        # corruption and self-heal, not silently hand back a reference
+        # to the corrupted bytes.
+        ref2 = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        assert ref2.content_hash == ref.content_hash
+        assert ref2.size_bytes == len(data)
+        assert store.read_artifact(ref.content_hash) == data
+        assert content_path.read_bytes() == data
+
+    def test_pre_existing_wrong_category_artifact_fails_closed_not_repaired(self, tmp_path: Path) -> None:
+        """The OTHER mismatch kind (Section 5's explicit distinction):
+        category conflicts are never auto-repaired, only content/size
+        corruption is -- both claims about the bytes are equally
+        "valid," so this store cannot pick one silently."""
+        store = MLArtifactStore(tmp_path)
+        data = b"identical bytes, ambiguous category"
+        store.write_artifact(data, category=ArtifactCategory.MODEL)
+        with pytest.raises(ArtifactCorruptionError, match="already stored under category"):
+            store.write_artifact(data, category=ArtifactCategory.METRICS)
+        # And the original, untouched artifact must still read back fine.
+        original_hash = store.write_artifact(data, category=ArtifactCategory.MODEL).content_hash
+        assert store.read_artifact(original_hash) == data
+
+    def test_pre_existing_semantically_mismatched_sidecar_size_is_detected_and_repaired(self, tmp_path: Path) -> None:
+        """A sidecar whose `size_bytes` disagrees with the ACTUAL
+        (correctly-hashing) content bytes -- metadata corruption
+        distinct from content corruption, also never trusted on sight."""
+        import json
+
+        store = MLArtifactStore(tmp_path)
+        data = b"content with a tampered metadata size field"
+        ref = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        metadata_path = store._metadata_path(ref.content_hash)
+        raw = json.loads(metadata_path.read_text())
+        raw["size_bytes"] = 1
+        metadata_path.write_text(json.dumps(raw))
+
+        ref2 = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        assert ref2.size_bytes == len(data)
+        # The re-verification round-trip through `read_artifact` (which
+        # itself checks size consistency) must now succeed.
+        assert store.read_artifact(ref.content_hash) == data
+
+    def test_valid_matching_artifact_dedups_without_any_repair(self, tmp_path: Path) -> None:
+        store = MLArtifactStore(tmp_path)
+        data = b"perfectly valid, untampered content"
+        ref1 = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        content_mtime_before = store._content_path(ref1.content_hash).stat().st_mtime_ns
+        ref2 = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        assert ref1 == ref2
+        # No repair/rewrite should have touched the content file at all.
+        assert store._content_path(ref1.content_hash).stat().st_mtime_ns == content_mtime_before
+        assert store.read_artifact(ref2.content_hash) == data
+
+    def test_concurrent_dedup_attempts_against_a_pre_existing_artifact_are_safe(self, tmp_path: Path) -> None:
+        store = MLArtifactStore(tmp_path)
+        data = b"concurrently deduped content" * 50
+        first_ref = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        errors: list[BaseException] = []
+        results: list[object] = []
+
+        def write() -> None:
+            try:
+                results.append(store.write_artifact(data, category=ArtifactCategory.MODEL))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert all(r == first_ref for r in results)
+        assert store.read_artifact(first_ref.content_hash) == data
+
+    def test_interrupted_replacement_is_safely_retried_on_the_next_call(self, tmp_path: Path) -> None:
+        """If the atomic-rename step of a corruption REPAIR is itself
+        interrupted (raises), the store must not end up in a state that
+        silently looks fine -- and a subsequent call must still be able
+        to detect and complete the repair."""
+        store = MLArtifactStore(tmp_path)
+        data = b"content that will need a repair replay"
+        ref = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        content_path = store._content_path(ref.content_hash)
+        content_path.write_bytes(b"CORRUPTED")
+
+        with patch("pathlib.Path.replace", side_effect=OSError("interrupted mid-repair")), pytest.raises(OSError, match="interrupted mid-repair"):
+            store.write_artifact(data, category=ArtifactCategory.MODEL)
+        # The corruption is still present (the interrupted repair did not
+        # silently "succeed") -- no tmp files were left behind either.
+        assert content_path.read_bytes() == b"CORRUPTED"
+        assert list(tmp_path.rglob(".*.tmp")) == []
+
+        # A subsequent, uninterrupted call must detect and complete the repair.
+        ref2 = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        assert ref2.content_hash == ref.content_hash
+        assert store.read_artifact(ref.content_hash) == data
+
+    def test_truncated_content_is_detected_and_repaired(self, tmp_path: Path) -> None:
+        """FINAL MILESTONE 5 AUDIT, Section 5: a truncated file (fewer
+        bytes than the original, a distinct corruption mode from
+        `test_pre_existing_corrupted_content_artifact_is_detected_and_
+        atomically_repaired`'s "different bytes, similar length" case)
+        must be detected via the same content-hash recomputation, not
+        merely a size check that a byte-for-byte-different-but-same-
+        length corruption would also need."""
+        store = MLArtifactStore(tmp_path)
+        data = b"the genuinely correct and complete content, all of it"
+        ref = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        content_path = store._content_path(ref.content_hash)
+        content_path.write_bytes(data[:5])  # truncated
+
+        ref2 = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        assert ref2.size_bytes == len(data)
+        assert store.read_artifact(ref.content_hash) == data
+
+    def test_wrong_sidecar_schema_version_fails_closed_loudly(self, tmp_path: Path) -> None:
+        """FINAL MILESTONE 5 AUDIT, Section 5: an unsupported sidecar
+        schema_version must never be silently accepted or coerced -- it
+        must raise a specific, typed, loud error (`SchemaVersionError`),
+        distinct from `ArtifactCorruptionError`'s content/size mismatch
+        cases, so an operator/caller can tell the two failure modes apart."""
+        import json
+
+        from quant_platform.core.exceptions import SchemaVersionError
+
+        store = MLArtifactStore(tmp_path)
+        data = b"content with a sidecar from a future/unsupported schema"
+        ref = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        metadata_path = store._metadata_path(ref.content_hash)
+        raw = json.loads(metadata_path.read_text())
+        raw["schema_version"] = 999
+        metadata_path.write_text(json.dumps(raw))
+
+        with pytest.raises(SchemaVersionError, match="schema_version"):
+            store.write_artifact(data, category=ArtifactCategory.MODEL)
+
+    def test_concurrent_corruption_repair_is_safe_and_a_losing_race_is_retryable(self, tmp_path: Path) -> None:
+        """FINAL MILESTONE 5 AUDIT, Section 5: TWO threads racing to
+        repair the SAME corruption. Per `_atomic_write_content`'s own
+        documented policy (no tolerance on the repair path -- a losing
+        repair race simply fails and is retried by its own caller, never
+        silently guessed at), at most one thread may raise; a retry after
+        any such failure must always succeed, and the final on-disk state
+        must be the correct content either way."""
+        store = MLArtifactStore(tmp_path)
+        data = b"content two threads will race to repair" * 20
+        ref = store.write_artifact(data, category=ArtifactCategory.MODEL)
+        content_path = store._content_path(ref.content_hash)
+        content_path.write_bytes(b"CORRUPTED" * 5)
+
+        errors: list[BaseException] = []
+
+        def repair() -> None:
+            try:
+                store.write_artifact(data, category=ArtifactCategory.MODEL)
+            except OSError as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=repair) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Whether or not any thread lost a race (raised), a follow-up
+        # call must always succeed and leave the store correctly repaired.
+        store.write_artifact(data, category=ArtifactCategory.MODEL)
+        assert store.read_artifact(ref.content_hash) == data
+
+
 def test_artifact_reference_round_trips_through_store(tmp_path: Path) -> None:
     store = MLArtifactStore(tmp_path)
     ref = store.write_artifact(b"content", category=ArtifactCategory.PREDICTIONS)

@@ -92,6 +92,14 @@ class DatasetLock:
         self._stale_after = stale_after
         self._held = False
 
+    @property
+    def lock_path(self) -> Path:
+        return self._lock_path
+
+    @property
+    def stale_after(self) -> pd.Timedelta:
+        return self._stale_after
+
     def acquire(self) -> None:
         self._lock_path.parent.mkdir(parents=True, exist_ok=True)
         info = LockInfo(pid=os.getpid(), hostname=socket.gethostname(), acquired_at=pd.Timestamp.now(tz="UTC"))
@@ -188,6 +196,19 @@ class DatasetLock:
             )
         self._held = True
         logger.info("Dataset lock reclaimed and acquired: path=%s pid=%d", self._lock_path, new_info.pid)
+
+    def peek(self) -> LockInfo | None:
+        """Milestone 5.2, Section 6: a PUBLIC, read-only accessor for an
+        operator diagnostic/recovery tool (e.g. `backtesting.runner.
+        inspect_backtest_lock`) that needs to inspect a lock's current
+        owner/age WITHOUT acquiring it, contesting it, or reclaiming it --
+        unlike `acquire()`, this never writes, unlinks, or blocks. Reuses
+        `_read_existing_lock`'s exact fail-open-to-`None` semantics (see
+        that method's own docstring for the full per-failure-mode
+        rationale) so there is only ONE place that decides what counts as
+        "an unreadable lock file", not two independently-maintained
+        readers of the same on-disk format."""
+        return self._read_existing_lock()
 
     def _read_existing_lock(self) -> LockInfo | None:
         """`None` means "treat this lock as reclaimable" -- deliberately

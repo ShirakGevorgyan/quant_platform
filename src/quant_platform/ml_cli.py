@@ -39,6 +39,16 @@ safe feature-selection/hyperparameter-optimization engine (Milestone 4D).
     python -m quant_platform.ml_cli inspect-calibration-fold --config cal_config.json --calibration-id ID --outer-fold-index N
     python -m quant_platform.ml_cli verify-calibration --config cal_config.json --calibration-id ID
     python -m quant_platform.ml_cli compare-calibration --config cal_config.json --calibration-id ID --baseline-calibration-id ID --metric accuracy
+    python -m quant_platform.ml_cli create-backtest-spec --config bt_config.json
+    python -m quant_platform.ml_cli run-backtest --config bt_config.json
+    python -m quant_platform.ml_cli resume-backtest --config bt_config.json --backtest-id ID
+    python -m quant_platform.ml_cli inspect-backtest --config bt_config.json --backtest-id ID
+    python -m quant_platform.ml_cli report-backtest --config bt_config.json --backtest-id ID
+    python -m quant_platform.ml_cli inspect-backtest-fold --config bt_config.json --backtest-id ID --outer-fold-index N
+    python -m quant_platform.ml_cli verify-backtest --config bt_config.json --backtest-id ID
+    python -m quant_platform.ml_cli inspect-backtest-lock --config bt_config.json --backtest-id ID
+    python -m quant_platform.ml_cli recover-backtest-lock --config bt_config.json --backtest-id ID [--force]
+    python -m quant_platform.ml_cli compare-backtests --config bt_config.json --backtest-id ID --baseline-backtest-id ID --metric total_net_return
 
 Same operability conventions as `data_cli`/`feature_cli`: every command
 returns 0 on success, non-zero on failure, and prints an actionable
@@ -80,10 +90,31 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from quant_platform.backtesting.manifests import (
+    BacktestEventStore,
+    BacktestManifest,
+    BacktestManifestStore,
+)
+from quant_platform.backtesting.models import BacktestStage
+from quant_platform.backtesting.reporting import (
+    build_backtest_report_json,
+    render_backtest_report_markdown,
+)
+from quant_platform.backtesting.runner import (
+    BacktestLockDiagnostics,
+    BacktestRunner,
+    OuterFoldBacktestResult,
+    inspect_backtest_lock,
+    recover_backtest_lock,
+)
+from quant_platform.backtesting.specs import BacktestSpec, compute_backtest_identity
+from quant_platform.backtesting.stitching import StitchedWalkForwardEquity
+from quant_platform.backtesting.verification import verify_backtest
 from quant_platform.calibration.manifests import (
     CalibrationEventStore,
     CalibrationManifest,
@@ -97,6 +128,7 @@ from quant_platform.calibration.reporting import (
 from quant_platform.calibration.runner import CalibrationRunner, OuterFoldCalibrationResult
 from quant_platform.calibration.specs import CalibrationSpec, compute_calibration_identity
 from quant_platform.calibration.verification import verify_calibration
+from quant_platform.config.backtesting_schemas import BacktestConfig
 from quant_platform.config.calibration_schemas import CalibrationConfig
 from quant_platform.config.ml_schemas import MLExperimentConfig
 from quant_platform.config.optimization_schemas import OptimizationConfig
@@ -115,6 +147,9 @@ from quant_platform.features.manifests import (
     ResearchDatasetStore,
     ResearchManifestStore,
 )
+from quant_platform.historical.canonical_store import CanonicalStore
+from quant_platform.historical.loader import DatasetLoader
+from quant_platform.historical.manifest import ManifestStore
 from quant_platform.ml import model_zoo as mz
 from quant_platform.ml.artifacts import MLArtifactStore
 from quant_platform.ml.comparison import ModelFoldMetrics, compare_to_baselines
@@ -1050,6 +1085,253 @@ def cmd_compare_calibration(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_backtest_config(path: Path) -> BacktestConfig:
+    return BacktestConfig.model_validate_json(path.read_text())
+
+
+def _backtest_manifest_store(config: BacktestConfig) -> BacktestManifestStore:
+    return BacktestManifestStore(config.ml_artifacts_root)
+
+
+def _resolve_backtest_spec(config: BacktestConfig) -> BacktestSpec:
+    calibration_manifest = CalibrationManifestStore(config.ml_artifacts_root).load(config.source_calibration_id)
+    experiment_manifest = ExperimentManifestStore(config.ml_artifacts_root).load(calibration_manifest.source_experiment_id)
+    return config.build(calibration_manifest=calibration_manifest, experiment_spec=experiment_manifest.spec)
+
+
+@dataclass(frozen=True, slots=True)
+class _BacktestSourceStores:
+    """Milestone 5.2, Section 3: the same source-resolution stores
+    `BacktestRunner` itself needs (`resolve_backtest_inputs`'s exact
+    dependency list) -- extracted so `cmd_verify_backtest` can pass them
+    to `verify_backtest`'s raw-source reconstruction without duplicating
+    `_build_backtest_runner`'s construction logic."""
+
+    calibration_manifest_store: CalibrationManifestStore
+    experiment_manifest_store: ExperimentManifestStore
+    execution_manifest_store: ExecutionManifestStore
+    research_manifest_store: ResearchManifestStore
+    research_dataset_store: ResearchDatasetStore
+    dataset_loader: DatasetLoader
+
+
+def _backtest_source_stores(config: BacktestConfig) -> _BacktestSourceStores:
+    return _BacktestSourceStores(
+        calibration_manifest_store=CalibrationManifestStore(config.ml_artifacts_root),
+        experiment_manifest_store=ExperimentManifestStore(config.ml_artifacts_root), execution_manifest_store=ExecutionManifestStore(config.ml_artifacts_root),
+        research_manifest_store=ResearchManifestStore(config.research_storage_root), research_dataset_store=ResearchDatasetStore(config.research_storage_root),
+        dataset_loader=DatasetLoader(CanonicalStore(config.historical_storage_root), ManifestStore(config.historical_storage_root)),
+    )
+
+
+def _build_backtest_runner(config: BacktestConfig) -> BacktestRunner:
+    stores = _backtest_source_stores(config)
+    return BacktestRunner(
+        ml_artifacts_root=config.ml_artifacts_root, calibration_manifest_store=stores.calibration_manifest_store,
+        experiment_manifest_store=stores.experiment_manifest_store, execution_manifest_store=stores.execution_manifest_store,
+        research_manifest_store=stores.research_manifest_store, research_dataset_store=stores.research_dataset_store,
+        dataset_loader=stores.dataset_loader,
+    )
+
+
+def cmd_create_backtest_spec(args: argparse.Namespace) -> int:
+    """Dry-run: resolves `--source-calibration-id`'s bound calibration/
+    experiment, builds and validates a `BacktestSpec` from `--config`, and
+    prints its deterministic `backtest_id` -- writes nothing. Mirrors
+    `create-calibration-spec`'s identical "preflight, no side effects"
+    convention."""
+    config = _load_backtest_config(Path(args.config))
+    spec = _resolve_backtest_spec(config)
+    identity = compute_backtest_identity(spec)
+    print(f"backtest_id: {identity.backtest_id}")
+    print(f"source_calibration_id: {spec.source_calibration_id}")
+    print(f"source_experiment_id: {spec.source_experiment_id}")
+    print(f"instrument_identity: {spec.instrument_identity} @ {spec.bar_interval.value}")
+    print(f"signal_mapping: {spec.signal_mapping.kind.value}, position_mode: {spec.position_mode.value}")
+    return 0
+
+
+def cmd_run_backtest(args: argparse.Namespace) -> int:
+    """Runs (or transparently resumes, if a manifest already exists for
+    this exact `BacktestSpec`'s identity) a full leakage-safe backtest:
+    for every outer fold, independently re-verified calibrated
+    predictions are mapped to signals, simulated into fills and trades
+    under the declared cost model, and evaluated into equity curves,
+    drawdown, financial metrics, benchmarks, cost sensitivity, and
+    confidence/uncertainty bucket analysis. Requires the referenced
+    source calibration to already be `COMPLETED` (see `run-calibration`)
+    and the referenced source execution to already be `COMPLETED`."""
+    config = _load_backtest_config(Path(args.config))
+    spec = _resolve_backtest_spec(config)
+    runner = _build_backtest_runner(config)
+    outcome = runner.run(spec)
+    print(f"backtest_id: {outcome.manifest.backtest_id}")
+    print(f"stage: {outcome.manifest.stage.value}")
+    print(f"completed_outer_fold_indices: {list(outcome.manifest.completed_outer_fold_indices)}")
+    if outcome.manifest.failure_summary:
+        print(f"failure_summary: {outcome.manifest.failure_summary}")
+    return 0 if outcome.manifest.stage is BacktestStage.COMPLETED else 2
+
+
+def cmd_resume_backtest(args: argparse.Namespace) -> int:
+    """Resumes a prior backtest. An already-`COMPLETED` backtest is a safe
+    idempotent no-op (exit 0, matching `run-backtest`'s own idempotency
+    guarantee). The `BacktestSpec` is re-loaded from the backtest's OWN
+    recorded `BACKTEST_SPEC` artifact (never rebuilt from `--config`
+    again), so this command only needs `--config` to construct the
+    runner's stores."""
+    config = _load_backtest_config(Path(args.config))
+    runner = _build_backtest_runner(config)
+    outcome = runner.resume(args.backtest_id)
+    print(f"backtest_id: {outcome.manifest.backtest_id}")
+    print(f"stage: {outcome.manifest.stage.value}")
+    print(f"completed_outer_fold_indices: {list(outcome.manifest.completed_outer_fold_indices)}")
+    print(f"resume_count: {outcome.manifest.resume_count}")
+    return 0 if outcome.manifest.stage is BacktestStage.COMPLETED else 2
+
+
+def _print_backtest_lock_diagnostics(diagnostics: BacktestLockDiagnostics) -> None:
+    for key, value in diagnostics.to_json_dict().items():
+        print(f"{key}: {value}")
+
+
+def cmd_inspect_backtest_lock(args: argparse.Namespace) -> int:
+    """Milestone 5.2, Section 6: read-only lock diagnostics -- never
+    acquires, contests, or removes the lock. Safe to run at any time,
+    including against a genuinely live run."""
+    config = _load_backtest_config(Path(args.config))
+    diagnostics = inspect_backtest_lock(args.backtest_id, ml_artifacts_root=config.ml_artifacts_root)
+    _print_backtest_lock_diagnostics(diagnostics)
+    return 0
+
+
+def cmd_recover_backtest_lock(args: argparse.Namespace) -> int:
+    """Milestone 5.2, Section 6: the explicit, diagnosed, auditable
+    alternative to undocumented manual deletion of `.backtest_run.lock`.
+    Always prints the diagnostics it based its decision on. Without
+    `--force`, refuses to touch a lock that has not gone stale by age
+    (never steals a live lock). `--force` must only be passed after a
+    human has reviewed the printed diagnostics and independently
+    confirmed the owning process is dead -- see `recover_backtest_lock`'s
+    own docstring."""
+    config = _load_backtest_config(Path(args.config))
+    diagnostics = recover_backtest_lock(args.backtest_id, ml_artifacts_root=config.ml_artifacts_root, force=args.force)
+    _print_backtest_lock_diagnostics(diagnostics)
+    print("recovered: " + ("nothing to do (no lock present)" if not diagnostics.lock_exists else "yes"))
+    return 0
+
+
+def _load_backtest_outer_fold_results(manifest: BacktestManifest, artifact_store: MLArtifactStore) -> dict[int, OuterFoldBacktestResult]:
+    results: dict[int, OuterFoldBacktestResult] = {}
+    for outer_fold_index, ref in manifest.outer_fold_result_references.items():
+        raw = artifact_store.read_artifact(ref.content_hash)
+        results[outer_fold_index] = OuterFoldBacktestResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    return results
+
+
+def _load_backtest_spec_artifact(manifest: BacktestManifest, artifact_store: MLArtifactStore) -> BacktestSpec | None:
+    if manifest.spec_reference is None:
+        return None
+    raw = artifact_store.read_artifact(manifest.spec_reference.content_hash)
+    return BacktestSpec.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+
+
+def _load_backtest_stitched_equity(manifest: BacktestManifest, artifact_store: MLArtifactStore) -> StitchedWalkForwardEquity | None:
+    if manifest.stitched_equity_reference is None:
+        return None
+    raw = artifact_store.read_artifact(manifest.stitched_equity_reference.content_hash)
+    return StitchedWalkForwardEquity.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+
+
+def cmd_inspect_backtest(args: argparse.Namespace) -> int:
+    config = _load_backtest_config(Path(args.config))
+    manifest = _backtest_manifest_store(config).load(args.backtest_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    spec = _load_backtest_spec_artifact(manifest, artifact_store)
+    outer_fold_results = _load_backtest_outer_fold_results(manifest, artifact_store)
+    stitched = _load_backtest_stitched_equity(manifest, artifact_store)
+
+    if args.format == "json":
+        import json
+
+        payload = build_backtest_report_json(
+            manifest, spec=spec, outer_fold_results=list(outer_fold_results.values()), stitched=stitched,
+            stitched_equity_reference=manifest.stitched_equity_reference,
+        )
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print(render_backtest_report_markdown(
+            manifest, spec=spec, outer_fold_results=list(outer_fold_results.values()), stitched=stitched,
+            stitched_equity_reference=manifest.stitched_equity_reference,
+        ))
+    return 0
+
+
+def cmd_report_backtest(args: argparse.Namespace) -> int:
+    """Alias for `inspect-backtest` -- a completed backtest's aggregate
+    report IS what `inspect-backtest` prints (mirrors `calibration`'s
+    identical choice not to duplicate `inspect-calibration`'s content
+    under a second command name)."""
+    return cmd_inspect_backtest(args)
+
+
+def cmd_inspect_backtest_fold(args: argparse.Namespace) -> int:
+    config = _load_backtest_config(Path(args.config))
+    manifest = _backtest_manifest_store(config).load(args.backtest_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    reference = manifest.outer_fold_result_references.get(args.outer_fold_index)
+    if reference is None:
+        print(f"No recorded result for backtest_id={args.backtest_id!r} outer_fold_index={args.outer_fold_index}", file=sys.stderr)
+        return 1
+    raw = artifact_store.read_artifact(reference.content_hash)
+    result = OuterFoldBacktestResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    print(f"outer_fold_index: {result.outer_fold_index}")
+    print(f"outer_test_row_count: {result.outer_test_row_count}, closed_trade_count: {result.closed_trade_count}")
+    print(f"meets_minimum_trade_threshold: {result.meets_minimum_trade_threshold}")
+    print(f"financial_metrics: {dict(sorted(result.financial_metrics.items()))}")
+    if result.skipped_metrics:
+        print(f"skipped_metrics: {dict(sorted(result.skipped_metrics.items()))}")
+    return 0
+
+
+def cmd_verify_backtest(args: argparse.Namespace) -> int:
+    """Re-audits everything the named backtest has ever recorded -- see
+    `backtesting.verification.verify_backtest`'s module docstring for
+    exactly what is checked, including the recomputation proof that
+    persisted financial metrics are actually reproducible from a
+    persisted `TradeSet`. Returns 2 (not 1) when the report contains any
+    CRITICAL/ERROR issue."""
+    config = _load_backtest_config(Path(args.config))
+    stores = _backtest_source_stores(config)
+    report = verify_backtest(
+        args.backtest_id, backtest_manifest_store=_backtest_manifest_store(config),
+        artifact_store=MLArtifactStore(config.ml_artifacts_root), event_store=BacktestEventStore(config.ml_artifacts_root),
+        calibration_manifest_store=stores.calibration_manifest_store, experiment_manifest_store=stores.experiment_manifest_store,
+        execution_manifest_store=stores.execution_manifest_store, research_manifest_store=stores.research_manifest_store,
+        research_dataset_store=stores.research_dataset_store, dataset_loader=stores.dataset_loader,
+    )
+    for issue in report.issues:
+        print(f"[{issue.severity.value}] {issue.code}: {issue.message}")
+    print(f"is_ready: {report.is_ready}")
+    return 0 if report.is_ready else 2
+
+
+def cmd_compare_backtests(args: argparse.Namespace) -> int:
+    """Prints one metric's per-outer-fold values, side by side, for two
+    completed backtests -- never a statistical claim, just the raw
+    numbers a human compares."""
+    config = _load_backtest_config(Path(args.config))
+    store = _backtest_manifest_store(config)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    left = _load_backtest_outer_fold_results(store.load(args.backtest_id), artifact_store)
+    right = _load_backtest_outer_fold_results(store.load(args.baseline_backtest_id), artifact_store)
+    for outer_fold_index in sorted(set(left) | set(right)):
+        left_value = left[outer_fold_index].financial_metrics.get(args.metric) if outer_fold_index in left else None
+        right_value = right[outer_fold_index].financial_metrics.get(args.metric) if outer_fold_index in right else None
+        print(f"outer_fold {outer_fold_index}: {args.backtest_id[:12]}={left_value} {args.baseline_backtest_id[:12]}={right_value}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m quant_platform.ml_cli",
@@ -1304,6 +1586,83 @@ def build_parser() -> argparse.ArgumentParser:
     compare_calibration_parser.add_argument("--baseline-calibration-id", required=True)
     compare_calibration_parser.add_argument("--metric", required=True)
     compare_calibration_parser.set_defaults(handler=cmd_compare_calibration)
+
+    create_backtest_spec_parser = subparsers.add_parser(
+        "create-backtest-spec", help="Milestone 5: dry-run -- build/validate a BacktestSpec from --config and print its backtest_id. Writes nothing.",
+    )
+    create_backtest_spec_parser.add_argument("--config", required=True)
+    create_backtest_spec_parser.set_defaults(handler=cmd_create_backtest_spec)
+
+    run_backtest_parser = subparsers.add_parser(
+        "run-backtest", help="Milestone 5: run (or transparently resume) a full leakage-safe backtest.",
+    )
+    run_backtest_parser.add_argument("--config", required=True)
+    run_backtest_parser.set_defaults(handler=cmd_run_backtest)
+
+    resume_backtest_parser = subparsers.add_parser(
+        "resume-backtest", help="Milestone 5: resume a prior, non-terminal backtest run.",
+    )
+    resume_backtest_parser.add_argument("--config", required=True)
+    resume_backtest_parser.add_argument("--backtest-id", required=True)
+    resume_backtest_parser.set_defaults(handler=cmd_resume_backtest)
+
+    inspect_backtest_parser = subparsers.add_parser(
+        "inspect-backtest", help="Milestone 5: print a human-readable (or JSON) backtest report.",
+    )
+    inspect_backtest_parser.add_argument("--config", required=True)
+    inspect_backtest_parser.add_argument("--backtest-id", required=True)
+    inspect_backtest_parser.add_argument("--format", choices=["text", "json"], default="text")
+    inspect_backtest_parser.set_defaults(handler=cmd_inspect_backtest)
+
+    report_backtest_parser = subparsers.add_parser(
+        "report-backtest", help="Milestone 5: alias for inspect-backtest.",
+    )
+    report_backtest_parser.add_argument("--config", required=True)
+    report_backtest_parser.add_argument("--backtest-id", required=True)
+    report_backtest_parser.add_argument("--format", choices=["text", "json"], default="text")
+    report_backtest_parser.set_defaults(handler=cmd_report_backtest)
+
+    inspect_backtest_fold_parser = subparsers.add_parser(
+        "inspect-backtest-fold", help="Milestone 5: print one outer fold's persisted OuterFoldBacktestResult.",
+    )
+    inspect_backtest_fold_parser.add_argument("--config", required=True)
+    inspect_backtest_fold_parser.add_argument("--backtest-id", required=True)
+    inspect_backtest_fold_parser.add_argument("--outer-fold-index", type=int, required=True)
+    inspect_backtest_fold_parser.set_defaults(handler=cmd_inspect_backtest_fold)
+
+    verify_backtest_parser = subparsers.add_parser(
+        "verify-backtest", help="Milestone 5: re-verify every artifact/event a backtest has recorded, including the financial-metrics recomputation proof.",
+    )
+    verify_backtest_parser.add_argument("--config", required=True)
+    verify_backtest_parser.add_argument("--backtest-id", required=True)
+    verify_backtest_parser.set_defaults(handler=cmd_verify_backtest)
+
+    inspect_backtest_lock_parser = subparsers.add_parser(
+        "inspect-backtest-lock",
+        help="Milestone 5.2: read-only diagnostics for a backtest's run lock (age, owner PID/host, manifest state) -- never touches the lock.",
+    )
+    inspect_backtest_lock_parser.add_argument("--config", required=True)
+    inspect_backtest_lock_parser.add_argument("--backtest-id", required=True)
+    inspect_backtest_lock_parser.set_defaults(handler=cmd_inspect_backtest_lock)
+
+    recover_backtest_lock_parser = subparsers.add_parser(
+        "recover-backtest-lock",
+        help="Milestone 5.2: explicit, diagnosed recovery for an abandoned .backtest_run.lock -- replaces undocumented manual deletion. "
+        "Refuses to touch a lock that has not gone stale by age unless --force is passed.",
+    )
+    recover_backtest_lock_parser.add_argument("--config", required=True)
+    recover_backtest_lock_parser.add_argument("--backtest-id", required=True)
+    recover_backtest_lock_parser.add_argument("--force", action="store_true", help="Reclaim the lock even if it has not gone stale by age. Only use after confirming the owning process is dead.")
+    recover_backtest_lock_parser.set_defaults(handler=cmd_recover_backtest_lock)
+
+    compare_backtests_parser = subparsers.add_parser(
+        "compare-backtests", help="Milestone 5: print one metric's per-outer-fold values, side by side, for two completed backtests.",
+    )
+    compare_backtests_parser.add_argument("--config", required=True)
+    compare_backtests_parser.add_argument("--backtest-id", required=True)
+    compare_backtests_parser.add_argument("--baseline-backtest-id", required=True)
+    compare_backtests_parser.add_argument("--metric", required=True)
+    compare_backtests_parser.set_defaults(handler=cmd_compare_backtests)
 
     return parser
 

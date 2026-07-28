@@ -59,6 +59,41 @@ again under a DIFFERENT declared `category` than its first write, that
 is treated as store corruption (`ArtifactCorruptionError`), never
 silently accepted -- "no silent overwrite" applies to metadata, not
 just content.
+
+MILESTONE 5.2, SECTION 5: DEDUP MUST RE-VERIFY, NEVER TRUST ON SIGHT
+--------------------------------------------------------------------------
+`write_artifact`'s dedup path (content already present at the hash-named
+path) previously returned an `ArtifactReference` for that pre-existing
+content on the strength of `content_path.is_file()` and the METADATA
+sidecar's own `size_bytes` field alone -- it never re-read the actual
+bytes and recomputed their hash, unlike `read_artifact`, which always
+does. A caller could therefore be handed a reference to silently
+corrupted (or externally tampered) bytes that no longer actually hash to
+their own content-addressed filename. `_verify_and_reuse_existing` closes
+this: it re-reads the actual bytes, recomputes the hash, and compares
+against both the requested `content_hash` and the sidecar's recorded
+`size_bytes` before ever returning a dedup hit.
+
+TWO DIFFERENT MISMATCHES GET TWO DIFFERENT, EXPLICIT POLICIES:
+  - CATEGORY mismatch (unchanged, pre-existing behavior): the SAME bytes
+    are being claimed under two DIFFERENT categories -- both claims are
+    individually well-formed, so this store cannot resolve which is
+    right. FAIL CLOSED (`ArtifactCorruptionError`), no repair attempted.
+  - CONTENT-HASH or sidecar SIZE mismatch (new): a hash-named path whose
+    actual bytes do not hash to their own filename (or whose sidecar
+    disagrees with the actual byte count) is a plain integrity violation
+    with exactly ONE correct repair -- the caller's own `data` argument
+    passed to THIS `write_artifact` call is already cryptographically
+    proven (by construction, at the top of the function) to hash to
+    `content_hash`, so it IS the unique correct content for that address.
+    ATOMICALLY REPLACE the corrupted content and/or regenerate the
+    sidecar using the same tmp-write-then-atomic-rename pattern already
+    used for fresh writes (crash-safe: an interruption mid-replace
+    leaves either the OLD, still-detectably-corrupted file or the NEW,
+    correct one in place -- never a half-written one -- so a subsequent
+    call safely re-detects and retries). Every detected mismatch is
+    logged at ERROR/WARNING severity first -- this self-healing is never
+    silent.
 """
 
 from __future__ import annotations
@@ -163,10 +198,7 @@ class MLArtifactStore:
                         f"declared category {category.value!r} for the same bytes",
                         context={"content_hash": content_hash, "existing_category": existing.category.value, "requested_category": category.value},
                     )
-                logger.info("ML artifact already stored (dedup): content_hash=%s category=%s", content_hash[:12], category.value)
-                return ArtifactReference(
-                    category=category, content_hash=content_hash, size_bytes=existing.size_bytes, created_at=existing.created_at,
-                )
+                return self._verify_and_reuse_existing(content_path, metadata_path, data=data, content_hash=content_hash, existing=existing)
             # Content present but sidecar missing: an interrupted prior
             # write (crash between content rename and metadata rename).
             # Content is immutable and already verified complete by virtue
@@ -177,6 +209,45 @@ class MLArtifactStore:
                 content_hash[:12],
             )
 
+        self._atomic_write_content(content_path, data, tolerate_concurrent_identical_write=True)
+
+        created_at = format_utc_timestamp(utc_now())
+        sidecar = _ContentSidecar(
+            schema_version=_SCHEMA_VERSION, content_hash=content_hash, category=category,
+            size_bytes=len(data), created_at=created_at,
+        )
+        self._write_sidecar_tolerating_race(metadata_path, sidecar)
+
+        logger.info("ML artifact written: content_hash=%s category=%s size_bytes=%d", content_hash[:12], category.value, len(data))
+        return ArtifactReference(category=category, content_hash=content_hash, size_bytes=len(data), created_at=created_at)
+
+    def _atomic_write_content(self, content_path: Path, data: bytes, *, tolerate_concurrent_identical_write: bool) -> None:
+        """`tolerate_concurrent_identical_write=True` (the ordinary
+        fresh-write path) treats a rename failure as a benign lost race
+        whenever the destination already exists -- the proven-safe check
+        `historical.canonical_store.write_partition` also uses. This is
+        deliberately an EXISTENCE check, not a byte-comparison: reading
+        `content_path` back to compare bytes was tried during this
+        milestone's own implementation and made things WORSE, not better
+        -- reading a file that a concurrent thread is mid-rename on can
+        itself raise `PermissionError` on Windows (a second, DIFFERENT
+        race on top of the one being tolerated), turning an intended
+        tolerance path into a new, harder-to-reproduce flake (caught by
+        this milestone's own `TestConcurrentWrites` regression run, not
+        merely reasoned about).
+
+        `tolerate_concurrent_identical_write=False` (`_verify_and_reuse_
+        existing`'s corruption-REPAIR call) tolerates NOTHING: a
+        pre-existing file at this path is precisely the problem the
+        repair is trying to fix, so its mere existence must never be
+        mistaken for "already fixed" -- and, per the reasoning above,
+        attempting a byte-comparison instead is not a safe alternative
+        either. A rename failure here always propagates; on the rare
+        occasion two callers race to repair the SAME corruption
+        concurrently, the loser simply fails and is safely retried by
+        its own caller (mirrors `historical.locking.DatasetLock._handle_
+        existing_lock`'s identical "a second collision means a genuine
+        race lost -- surface it, don't loop" precedent)."""
         content_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_content_path = content_path.parent / f".{content_path.name}.{uuid.uuid4().hex}.tmp"
         try:
@@ -192,23 +263,54 @@ class MLArtifactStore:
             # On POSIX this branch is unreachable (rename onto an
             # existing path is atomic and simply "wins" or "loses"
             # silently); on Windows, `Path.replace` can raise
-            # `PermissionError` when another thread/process is
-            # renaming onto the same destination concurrently -- mirrors
+            # `PermissionError` when another thread/process is renaming
+            # onto the same destination concurrently -- mirrors
             # `historical.canonical_store.write_partition`'s identical
             # race-tolerant rename.
             tmp_content_path.unlink(missing_ok=True)
-            if not content_path.is_file():
+            if not (tolerate_concurrent_identical_write and content_path.is_file()):
                 raise
 
-        created_at = format_utc_timestamp(utc_now())
-        sidecar = _ContentSidecar(
-            schema_version=_SCHEMA_VERSION, content_hash=content_hash, category=category,
-            size_bytes=len(data), created_at=created_at,
-        )
-        self._write_sidecar_tolerating_race(metadata_path, sidecar)
+    def _verify_and_reuse_existing(
+        self, content_path: Path, metadata_path: Path, *, data: bytes, content_hash: str, existing: _ContentSidecar,
+    ) -> ArtifactReference:
+        """Milestone 5.2, Section 5 (see module docstring for the full
+        policy rationale): re-reads the actual on-disk bytes and
+        recomputes their hash + size before trusting a dedup hit. A
+        content-hash or size mismatch is atomically repaired using the
+        caller's OWN `data` (already proven, by construction, to hash to
+        `content_hash`) -- never silently trusted, never left corrupt."""
+        actual = content_path.read_bytes()
+        actual_hash = sha256_hex_bytes(actual)
+        if actual_hash != content_hash:
+            logger.error(
+                "ML artifact content corruption detected on dedup: path=%s expected_hash=%s actual_hash=%s -- "
+                "atomically repairing with the verified-correct incoming bytes",
+                content_path, content_hash[:12], actual_hash[:12],
+            )
+            self._atomic_write_content(content_path, data, tolerate_concurrent_identical_write=False)
+            repaired = _ContentSidecar(
+                schema_version=_SCHEMA_VERSION, content_hash=content_hash, category=existing.category,
+                size_bytes=len(data), created_at=existing.created_at,
+            )
+            self._write_sidecar_tolerating_race(metadata_path, repaired)
+            return ArtifactReference(category=existing.category, content_hash=content_hash, size_bytes=len(data), created_at=existing.created_at)
 
-        logger.info("ML artifact written: content_hash=%s category=%s size_bytes=%d", content_hash[:12], category.value, len(data))
-        return ArtifactReference(category=category, content_hash=content_hash, size_bytes=len(data), created_at=created_at)
+        if existing.size_bytes != len(actual):
+            logger.warning(
+                "ML artifact metadata sidecar corruption detected on dedup: path=%s recorded_size_bytes=%d actual_size_bytes=%d -- "
+                "atomically repairing the sidecar",
+                metadata_path, existing.size_bytes, len(actual),
+            )
+            repaired = _ContentSidecar(
+                schema_version=_SCHEMA_VERSION, content_hash=content_hash, category=existing.category,
+                size_bytes=len(actual), created_at=existing.created_at,
+            )
+            self._write_sidecar_tolerating_race(metadata_path, repaired)
+            return ArtifactReference(category=existing.category, content_hash=content_hash, size_bytes=len(actual), created_at=existing.created_at)
+
+        logger.info("ML artifact already stored (dedup, verified): content_hash=%s category=%s", content_hash[:12], existing.category.value)
+        return ArtifactReference(category=existing.category, content_hash=content_hash, size_bytes=existing.size_bytes, created_at=existing.created_at)
 
     def _write_sidecar_tolerating_race(self, metadata_path: Path, sidecar: _ContentSidecar) -> None:
         """Same race-tolerant atomic-rename pattern as the content write

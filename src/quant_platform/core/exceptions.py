@@ -512,3 +512,107 @@ class CalibrationVerificationError(CalibrationError):
     caller consuming its report) when a FATAL cross-consistency check
     fails and the caller has asked for that to raise rather than merely
     be reported as an issue."""
+
+
+# --------------------------------------------------------------------------
+# Leakage-safe financial evaluation, signal simulation, transaction-cost
+# modeling, and backtesting framework (Milestone 5)
+# --------------------------------------------------------------------------
+class BacktestError(QuantPlatformError):
+    """Base class for every failure in the financial evaluation/backtesting
+    framework (`quant_platform.backtesting`). Distinct from
+    `CalibrationError` -- this milestone governs turning already-verified,
+    already-calibrated outer-fold predictions into signals, fills, trades,
+    returns, and financial metrics under explicitly modeled execution
+    assumptions; it never re-selects a model, re-fits a calibrator, or
+    re-derives a threshold."""
+
+
+class BacktestValidationError(BacktestError):
+    """Raised when a `BacktestSpec` (or an embedded cost/entry/exit/
+    signal-mapping/overlap policy) is structurally invalid -- a non-finite
+    numeric field, a negative cost without an explicit rebate policy, an
+    impossible price basis, an invalid holding period, an unsupported
+    overlap behavior, an incompatible long/short mapping, invalid
+    confidence/uncertainty bounds, a missing source identity, an
+    inconsistent dataset/calibration binding, non-positive initial
+    notional, an invalid timezone, an unsupported bar interval, or an
+    entry policy that would fill before prediction availability. Never
+    silently repaired."""
+
+
+class BacktestStateError(BacktestError):
+    """Raised for illegal `BacktestStage` transitions, or an attempt to
+    silently overwrite an already-terminal `BacktestManifest` with
+    inconsistent content -- the backtest-level analogue of
+    `CalibrationStateError`."""
+
+
+class MarketDataBindingError(BacktestError):
+    """Raised when market-bar data cannot be bound to a verified
+    prediction set safely: a missing bar at a required decision/entry/exit
+    timestamp, a non-finite or non-positive price, an OHLC relationship
+    violation (`high < max(open, close, low)` or similar), `ask < bid`, a
+    negative spread, non-chronological or duplicate timestamps, an
+    unexpected bar-interval gap not explicitly permitted, or an
+    ambiguous/naive timestamp the market-data contract does not permit."""
+
+
+class SignalGenerationError(BacktestError):
+    """Raised when deterministic signal mapping cannot proceed safely: an
+    unsupported predicted class, an invalid probability/confidence/
+    uncertainty value, a signal-mapping policy inconsistent with the
+    declared position mode, or a reason code that cannot be assigned
+    unambiguously."""
+
+
+class ExecutionSimulationError(BacktestError):
+    """Raised when chronological entry/exit simulation encounters a
+    structural violation: an entry requested before its prediction was
+    available, an exit requested before its entry, a position crossing a
+    forbidden outer-fold boundary, or an overlap-policy state that cannot
+    be resolved deterministically."""
+
+
+class FillCalculationError(BacktestError):
+    """Raised when a fill price cannot be computed safely: a missing
+    observed market price, an invalid side/price-basis combination, a
+    spread applied more than once, or a resulting non-finite/non-positive
+    effective fill price."""
+
+
+class CostModelError(BacktestError):
+    """Raised when a spread/commission/slippage/financing model is
+    invalid or cannot be applied: a non-finite value, a negative cost
+    without explicit rebate support, an inconsistent unit convention, or
+    an instrument-incompatible cost shape."""
+
+
+class TradeConstructionError(BacktestError):
+    """Raised when a trade record cannot be constructed or is internally
+    inconsistent: a non-deterministic or colliding trade identity, an
+    exit before an entry, a non-finite return, or a cost breakdown that
+    does not sum to the persisted total."""
+
+
+class FinancialMetricError(BacktestError):
+    """Raised when a financial metric cannot be computed safely -- never
+    raised merely because a metric is mathematically undefined (that case
+    reports an explicit unavailable status/reason instead); raised only
+    for a genuine structural problem, e.g. annualizing without a valid bar
+    frequency."""
+
+
+class BacktestResumeError(BacktestError):
+    """Raised when a backtest resume attempt cannot proceed safely: a
+    completed outer fold's recorded artifact is missing or corrupted, the
+    requested backtest has no prior manifest to resume, an already-
+    terminal backtest is asked to resume, or the recorded environment is
+    incompatible with the current one under a STRICT determinism policy."""
+
+
+class BacktestVerificationError(BacktestError):
+    """Raised by `backtesting.verification.verify_backtest` (or a caller
+    consuming its report) when a FATAL cross-consistency check fails and
+    the caller has asked for that to raise rather than merely be reported
+    as an issue."""

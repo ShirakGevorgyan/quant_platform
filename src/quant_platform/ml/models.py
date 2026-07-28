@@ -173,6 +173,71 @@ class ArtifactCategory(Enum):
     CALIBRATION_REPORT = "calibration_report"
     """Milestone 4E: the final JSON/Markdown calibration report,
     aggregated across every outer fold."""
+    BACKTEST_SPEC = "backtest_spec"
+    """Milestone 5: one immutable `backtesting.specs.BacktestSpec` record
+    -- the canonical, content-addressed record of every scientifically
+    material execution/cost/signal-mapping/position assumption for one
+    backtest run."""
+    VERIFIED_PREDICTION_SET = "verified_prediction_set"
+    """Milestone 5: one `backtesting.models.VerifiedPredictionSet` per
+    outer fold -- the independently re-verified calibrated predictions a
+    backtest's signals are generated from, never trusted from calibration
+    artifacts by filename/hash alone."""
+    MARKET_DATA_BINDING = "market_data_binding"
+    """Milestone 5: one `backtesting.models.MarketDataBinding` per outer
+    fold -- which historical dataset version/content id supplied the raw
+    OHLC(V) bars a fold's fills were computed from."""
+    SIGNAL_SET = "signal_set"
+    """Milestone 5: one outer fold's complete, ordered set of deterministic
+    trading signals (accepted and rejected, with reason codes) derived
+    from verified predictions -- never touches outer-test financial
+    results."""
+    TRADING_POLICY = "trading_policy"
+    """Milestone 5: one outer fold's FROZEN trading policy (holding
+    period, confidence/uncertainty cutoffs, signal mapping) -- selected,
+    if at all, on training-side/inner-OOF financial simulation only,
+    before outer-test fills are ever computed."""
+    TRADE_SET = "trade_set"
+    """Milestone 5: one outer fold's complete set of trade records (open,
+    closed, and incomplete-per-policy), each carrying deterministic trade
+    identity and a fully itemized cost breakdown."""
+    RETURN_SERIES = "return_series"
+    """Milestone 5: one outer fold's period return series and equity
+    curve (gross and net, compounded and non-compounded as configured)."""
+    DRAWDOWN_REPORT = "drawdown_report"
+    """Milestone 5: one outer fold's drawdown episodes, recomputed
+    independently from the persisted equity curve at verification time."""
+    OUTER_FOLD_BACKTEST_RESULT = "outer_fold_backtest_result"
+    """Milestone 5: one immutable `backtesting.runner.
+    OuterFoldBacktestResult` -- trades, returns, equity, drawdown,
+    financial metrics, benchmark comparisons, and cost-sensitivity results
+    for one outer fold, evaluated exactly once on untouched outer-test
+    predictions through the frozen trading policy."""
+    BENCHMARK_REPORT = "benchmark_report"
+    """Milestone 5: one outer fold's benchmark comparison (always-flat,
+    always-long, buy-and-hold, raw/calibrated/abstention-aware signal,
+    zero-cost/net-cost variants)."""
+    COST_SENSITIVITY_REPORT = "cost_sensitivity_report"
+    """Milestone 5: one outer fold's bounded, pre-declared cost-scenario
+    sensitivity results -- transparency, never scenario selection."""
+    BUCKET_ANALYSIS_REPORT = "bucket_analysis_report"
+    """Milestone 5: one outer fold's confidence/uncertainty/probability-
+    bucket financial breakdown."""
+    BACKTEST_REPORT = "backtest_report"
+    """Milestone 5: the final JSON/Markdown aggregate walk-forward
+    backtest report, across every outer fold."""
+    BAR_RETURN_TIMELINE = "bar_return_timeline"
+    """Milestone 5.1: one outer fold's TRUE chronological bar-level
+    mark-to-market strategy-return timeline (`backtesting.timeline.
+    BarReturnTimeline`) -- one point per outer-test market bar, never
+    compressed to trade-exit events; the corrective replacement for
+    annualizing an event-sampled series at bar frequency."""
+    STITCHED_WALK_FORWARD_EQUITY = "stitched_walk_forward_equity"
+    """Milestone 5.1: the deterministic, chronologically-stitched
+    cross-fold equity curve (`backtesting.stitching.
+    StitchedWalkForwardEquity`) -- each fold's stitched segment starts
+    from the PREVIOUS fold's ending normalized equity; no position ever
+    crosses a fold boundary; never an average of per-fold curves."""
 
 
 class ExperimentStatus(Enum):
