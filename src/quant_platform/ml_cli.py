@@ -49,6 +49,16 @@ safe feature-selection/hyperparameter-optimization engine (Milestone 4D).
     python -m quant_platform.ml_cli inspect-backtest-lock --config bt_config.json --backtest-id ID
     python -m quant_platform.ml_cli recover-backtest-lock --config bt_config.json --backtest-id ID [--force]
     python -m quant_platform.ml_cli compare-backtests --config bt_config.json --backtest-id ID --baseline-backtest-id ID --metric total_net_return
+    python -m quant_platform.ml_cli create-robustness-spec --config rb_config.json
+    python -m quant_platform.ml_cli run-robustness --config rb_config.json
+    python -m quant_platform.ml_cli resume-robustness --config rb_config.json --robustness-id ID
+    python -m quant_platform.ml_cli inspect-robustness --config rb_config.json --robustness-id ID
+    python -m quant_platform.ml_cli report-robustness --config rb_config.json --robustness-id ID
+    python -m quant_platform.ml_cli verify-robustness --config rb_config.json --robustness-id ID
+    python -m quant_platform.ml_cli compare-robustness --config rb_config.json --robustness-id ID --baseline-robustness-id ID
+    python -m quant_platform.ml_cli inspect-promotion-decision --config rb_config.json --robustness-id ID
+    python -m quant_platform.ml_cli inspect-strategy-family --config rb_config.json --content-hash HASH
+    python -m quant_platform.ml_cli compare-strategy-candidates --config rb_config.json --robustness-id ID [--robustness-id ID ...]
 
 Same operability conventions as `data_cli`/`feature_cli`: every command
 returns 0 on success, non-zero on failure, and prints an actionable
@@ -90,8 +100,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 from pydantic import ValidationError
 
@@ -132,6 +144,7 @@ from quant_platform.config.backtesting_schemas import BacktestConfig
 from quant_platform.config.calibration_schemas import CalibrationConfig
 from quant_platform.config.ml_schemas import MLExperimentConfig
 from quant_platform.config.optimization_schemas import OptimizationConfig
+from quant_platform.config.robustness_schemas import RobustnessConfig
 from quant_platform.core.exceptions import QuantPlatformError
 from quant_platform.execution.executor import DeterministicFoldExecutor, MetricsFoldExecutor
 from quant_platform.execution.manifests import ExecutionManifestStore
@@ -199,6 +212,14 @@ from quant_platform.optimization.stability import (
     flag_near_tied_top_candidates,
 )
 from quant_platform.optimization.verification import verify_optimization
+from quant_platform.robustness.manifests import RobustnessManifest, RobustnessManifestStore
+from quant_platform.robustness.models import RobustnessStage
+from quant_platform.robustness.multiple_testing import StrategyFamily
+from quant_platform.robustness.promotion import PromotionDecision
+from quant_platform.robustness.runner import RobustnessRunner
+from quant_platform.robustness.selection import SelectionReport
+from quant_platform.robustness.specs import RobustnessSpec, compute_robustness_identity
+from quant_platform.robustness.verification import verify_robustness
 
 _TIMESTAMP_COLUMN = "open_time"
 _LABEL_COLUMN = "label"
@@ -1332,6 +1353,283 @@ def cmd_compare_backtests(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Milestone 6: statistical robustness / promotion-gate commands
+# --------------------------------------------------------------------------
+def _load_robustness_config(path: Path) -> RobustnessConfig:
+    return RobustnessConfig.model_validate_json(path.read_text())
+
+
+def _robustness_manifest_store(config: RobustnessConfig) -> RobustnessManifestStore:
+    return RobustnessManifestStore(config.ml_artifacts_root)
+
+
+@dataclass(frozen=True, slots=True)
+class _RobustnessSourceStores:
+    """The same source-resolution stores `RobustnessRunner` itself needs
+    -- extracted so `cmd_verify_robustness`/`cmd_create_robustness_spec`
+    can reuse them without duplicating `_build_robustness_runner`'s
+    construction logic (mirrors `_BacktestSourceStores`'s identical role
+    one layer down)."""
+
+    backtest_manifest_store: BacktestManifestStore
+    backtest_event_store: BacktestEventStore
+    calibration_manifest_store: CalibrationManifestStore
+    experiment_manifest_store: ExperimentManifestStore
+    execution_manifest_store: ExecutionManifestStore
+    research_manifest_store: ResearchManifestStore
+    research_dataset_store: ResearchDatasetStore
+    dataset_loader: DatasetLoader
+
+
+def _robustness_source_stores(config: RobustnessConfig) -> _RobustnessSourceStores:
+    return _RobustnessSourceStores(
+        backtest_manifest_store=BacktestManifestStore(config.ml_artifacts_root), backtest_event_store=BacktestEventStore(config.ml_artifacts_root),
+        calibration_manifest_store=CalibrationManifestStore(config.ml_artifacts_root), experiment_manifest_store=ExperimentManifestStore(config.ml_artifacts_root),
+        execution_manifest_store=ExecutionManifestStore(config.ml_artifacts_root), research_manifest_store=ResearchManifestStore(config.research_storage_root),
+        research_dataset_store=ResearchDatasetStore(config.research_storage_root),
+        dataset_loader=DatasetLoader(CanonicalStore(config.historical_storage_root), ManifestStore(config.historical_storage_root)),
+    )
+
+
+def _build_robustness_runner(config: RobustnessConfig) -> RobustnessRunner:
+    stores = _robustness_source_stores(config)
+    return RobustnessRunner(
+        ml_artifacts_root=config.ml_artifacts_root, backtest_manifest_store=stores.backtest_manifest_store, backtest_event_store=stores.backtest_event_store,
+        calibration_manifest_store=stores.calibration_manifest_store, experiment_manifest_store=stores.experiment_manifest_store,
+        execution_manifest_store=stores.execution_manifest_store, research_manifest_store=stores.research_manifest_store,
+        research_dataset_store=stores.research_dataset_store, dataset_loader=stores.dataset_loader,
+    )
+
+
+def _resolve_robustness_spec(config: RobustnessConfig) -> RobustnessSpec:
+    """Loads `--source-backtest-id`'s OWN persisted `BacktestSpec` and
+    derives every identity-bearing `RobustnessSpec` field from it --
+    exactly `RobustnessConfig.build`'s own documented reasoning, never a
+    hand-typed, driftable duplicate."""
+    backtest_manifest = BacktestManifestStore(config.ml_artifacts_root).load(config.source_backtest_id)
+    if backtest_manifest.spec_reference is None:
+        raise ValueError(f"Source backtest {config.source_backtest_id!r} has no recorded BACKTEST_SPEC artifact")
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    raw = artifact_store.read_artifact(backtest_manifest.spec_reference.content_hash)
+    backtest_spec = BacktestSpec.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    return config.build(source_backtest_spec=backtest_spec)
+
+
+_T = TypeVar("_T")
+
+
+def _load_robustness_named_artifact(
+    manifest: RobustnessManifest, artifact_store: MLArtifactStore, *, kind: str, decoder: Callable[[dict[str, object]], _T],
+) -> _T | None:
+    reference = manifest.artifact(kind)
+    if reference is None:
+        return None
+    raw = artifact_store.read_artifact(reference.content_hash)
+    return decoder(parse_json_strict(raw.decode("utf-8")))
+
+
+def cmd_create_robustness_spec(args: argparse.Namespace) -> int:
+    """Milestone 6: dry-run -- resolves `--source-backtest-id`'s own
+    persisted `BacktestSpec`, builds and validates a `RobustnessSpec` from
+    `--config`, and prints its deterministic `robustness_id`. Writes
+    nothing. Mirrors `create-backtest-spec`'s identical convention."""
+    config = _load_robustness_config(Path(args.config))
+    spec = _resolve_robustness_spec(config)
+    identity = compute_robustness_identity(spec)
+    print(f"robustness_id: {identity.robustness_id}")
+    print(f"source_backtest_id: {spec.source_backtest_id}")
+    print(f"return_series_kind: {spec.return_series_kind.value}")
+    print(f"bootstrap: method={spec.bootstrap_spec.method.value} repetitions={spec.bootstrap_spec.repetitions} confidence_level={spec.bootstrap_spec.confidence_level}")
+    print(f"multiple_testing_correction: {spec.multiple_testing_correction.value}")
+    print(f"minimum_fold_count={spec.minimum_fold_count} minimum_trade_count={spec.minimum_trade_count} minimum_effective_sample_size={spec.minimum_effective_sample_size}")
+    return 0
+
+
+def cmd_run_robustness(args: argparse.Namespace) -> int:
+    """Milestone 6: runs (or transparently resumes) a full statistical-
+    robustness analysis of `--source-backtest-id`'s own COMPLETED,
+    independently re-verified backtest: source verification, return-
+    series construction, dependence-aware bootstrap, downside analysis,
+    fold-stability/concentration analysis, parameter-sensitivity and
+    cost/latency stress analysis, regime analysis, standalone selection
+    eligibility, promotion-gate evaluation, and independent verification."""
+    config = _load_robustness_config(Path(args.config))
+    spec = _resolve_robustness_spec(config)
+    runner = _build_robustness_runner(config)
+    outcome = runner.run(spec)
+    print(f"robustness_id: {outcome.manifest.robustness_id}")
+    print(f"stage: {outcome.manifest.stage.value}")
+    if outcome.manifest.failure_summary:
+        print(f"failure_summary: {outcome.manifest.failure_summary}")
+    return 0 if outcome.manifest.stage is RobustnessStage.COMPLETED else 2
+
+
+def cmd_resume_robustness(args: argparse.Namespace) -> int:
+    """Milestone 6: resumes a prior, non-terminal robustness run. An
+    already-`COMPLETED` run is a safe idempotent no-op (exit 0). The
+    `RobustnessSpec` is re-loaded from the run's OWN recorded
+    `ROBUSTNESS_SPEC` artifact, never rebuilt from `--config` again."""
+    config = _load_robustness_config(Path(args.config))
+    runner = _build_robustness_runner(config)
+    outcome = runner.resume(args.robustness_id)
+    print(f"robustness_id: {outcome.manifest.robustness_id}")
+    print(f"stage: {outcome.manifest.stage.value}")
+    print(f"resume_count: {outcome.manifest.resume_count}")
+    return 0 if outcome.manifest.stage is RobustnessStage.COMPLETED else 2
+
+
+def cmd_inspect_robustness(args: argparse.Namespace) -> int:
+    """Milestone 6: prints a human-readable (or JSON) summary of one
+    robustness run -- its manifest, and, once recorded, its promotion
+    decision and every gate's measured value/outcome/reason."""
+    config = _load_robustness_config(Path(args.config))
+    manifest = _robustness_manifest_store(config).load(args.robustness_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+
+    if args.format == "json":
+        import json
+
+        payload = {
+            "robustness_id": manifest.robustness_id, "source_backtest_id": manifest.source_backtest_id, "stage": manifest.stage.value,
+            "created_at": manifest.created_at, "updated_at": manifest.updated_at, "completed_at": manifest.completed_at,
+            "failure_summary": manifest.failure_summary, "resume_count": manifest.resume_count,
+            "named_artifacts": {k: v.to_json_dict() for k, v in sorted(manifest.named_artifacts.items())},
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    print(f"robustness_id: {manifest.robustness_id}")
+    print(f"source_backtest_id: {manifest.source_backtest_id}")
+    print(f"stage: {manifest.stage.value}")
+    print(f"resume_count: {manifest.resume_count}")
+    if manifest.failure_summary:
+        print(f"failure_summary: {manifest.failure_summary}")
+    promotion = _load_robustness_named_artifact(manifest, artifact_store, kind="promotion_decision", decoder=PromotionDecision.from_json_dict)
+    if promotion is not None:
+        print(f"promotion_decision: {promotion.decision.value}")
+        print(f"promotion_decision_reason: {promotion.decision_reason}")
+        for gate in promotion.gate_evaluations:
+            print(f"  gate[{gate.gate_name}]: mandatory={gate.mandatory} outcome={gate.outcome.value} measured={gate.measured_value} min={gate.minimum_value} max={gate.maximum_value}")
+        print(f"disclaimer: {promotion.disclaimer}")
+    return 0
+
+
+def cmd_report_robustness(args: argparse.Namespace) -> int:
+    """Alias for `inspect-robustness` -- mirrors `report-backtest`'s
+    identical choice not to duplicate `inspect-backtest`'s content under a
+    second command name."""
+    return cmd_inspect_robustness(args)
+
+
+def cmd_verify_robustness(args: argparse.Namespace) -> int:
+    """Milestone 6: independently RECOMPUTES every deterministic analysis
+    this robustness run persisted and compares it against what was
+    recorded -- see `robustness.verification.verify_robustness`'s module
+    docstring. Returns 2 (not 1) when the report contains any CRITICAL/
+    ERROR issue."""
+    config = _load_robustness_config(Path(args.config))
+    stores = _robustness_source_stores(config)
+    report = verify_robustness(
+        args.robustness_id, robustness_manifest_store=_robustness_manifest_store(config), artifact_store=MLArtifactStore(config.ml_artifacts_root),
+        backtest_manifest_store=stores.backtest_manifest_store, backtest_event_store=stores.backtest_event_store,
+        calibration_manifest_store=stores.calibration_manifest_store, experiment_manifest_store=stores.experiment_manifest_store,
+        execution_manifest_store=stores.execution_manifest_store, research_manifest_store=stores.research_manifest_store,
+        research_dataset_store=stores.research_dataset_store, dataset_loader=stores.dataset_loader,
+    )
+    for issue in report.issues:
+        print(f"[{issue.severity.value}] {issue.code}: {issue.message}")
+    print(f"is_ready: {report.is_ready}")
+    return 0 if report.is_ready else 2
+
+
+def cmd_compare_robustness(args: argparse.Namespace) -> int:
+    """Milestone 6: prints two robustness runs' headline stage/promotion
+    outcome side by side -- never a statistical claim, just the raw
+    recorded outcomes a human compares."""
+    config = _load_robustness_config(Path(args.config))
+    store = _robustness_manifest_store(config)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    left = store.load(args.robustness_id)
+    right = store.load(args.baseline_robustness_id)
+    left_promotion = _load_robustness_named_artifact(left, artifact_store, kind="promotion_decision", decoder=PromotionDecision.from_json_dict)
+    right_promotion = _load_robustness_named_artifact(right, artifact_store, kind="promotion_decision", decoder=PromotionDecision.from_json_dict)
+    print(f"{args.robustness_id[:12]}: stage={left.stage.value} promotion_decision={left_promotion.decision.value if left_promotion else None}")
+    print(f"{args.baseline_robustness_id[:12]}: stage={right.stage.value} promotion_decision={right_promotion.decision.value if right_promotion else None}")
+    return 0
+
+
+def cmd_inspect_promotion_decision(args: argparse.Namespace) -> int:
+    """Milestone 6: prints one robustness run's `PromotionDecision` in
+    full -- every gate's name/measured value/required bound(s)/pass-fail-
+    skip outcome/reason, never merely the final verdict."""
+    config = _load_robustness_config(Path(args.config))
+    manifest = _robustness_manifest_store(config).load(args.robustness_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    promotion = _load_robustness_named_artifact(manifest, artifact_store, kind="promotion_decision", decoder=PromotionDecision.from_json_dict)
+    if promotion is None:
+        print(f"No promotion decision recorded yet for robustness_id={args.robustness_id!r} (stage={manifest.stage.value!r})", file=sys.stderr)
+        return 1
+    print(f"robustness_id: {promotion.robustness_id}")
+    print(f"decision: {promotion.decision.value}")
+    print(f"decision_reason: {promotion.decision_reason}")
+    for gate in promotion.gate_evaluations:
+        print(f"gate[{gate.gate_name}] mandatory={gate.mandatory} outcome={gate.outcome.value} measured={gate.measured_value} minimum={gate.minimum_value} maximum={gate.maximum_value} reason={gate.reason}")
+    print(f"disclaimer: {promotion.disclaimer}")
+    return 0
+
+
+def cmd_inspect_strategy_family(args: argparse.Namespace) -> int:
+    """Milestone 6: prints one durable `StrategyFamily` record, looked up
+    by its content-addressed `--content-hash` (mirrors `verify-artifact`'s
+    identical content-hash-based lookup convention -- `StrategyFamily`
+    has no dedicated manifest store of its own; the caller who originally
+    built and persisted it via `multiple_testing.build_strategy_family`
+    already has the `ArtifactReference` this command needs)."""
+    config = _load_robustness_config(Path(args.config))
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    raw = artifact_store.read_artifact(args.content_hash)
+    family = StrategyFamily.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    print(f"family_id: {family.family_id}")
+    print(f"candidate_count: {family.candidate_count}")
+    print(f"candidate_backtest_ids: {list(family.candidate_backtest_ids)}")
+    print(f"candidate_experiment_ids: {list(family.candidate_experiment_ids)}")
+    print(f"candidate_calibration_ids: {list(family.candidate_calibration_ids)}")
+    print(f"candidate_optimization_identities: {list(family.candidate_optimization_identities)}")
+    print(f"search_space_identity: {family.search_space_identity}")
+    print(f"selection_metric: {family.selection_metric}")
+    print(f"eligibility_rules_description: {family.eligibility_rules_description}")
+    print(f"created_at: {family.created_at}")
+    return 0
+
+
+def cmd_compare_strategy_candidates(args: argparse.Namespace) -> int:
+    """Milestone 6: prints each `--robustness-id` candidate's OWN
+    standalone selection evaluation (Section 12) side by side --
+    eligibility, rejection reasons (if any), and ranking metric values.
+    Each robustness run's own `selection_report` was already computed as
+    a single-candidate `SelectionReport` during its own pipeline; this
+    command loads and juxtaposes what was already persisted for each,
+    never re-running `selection.compute_selection_report` itself."""
+    config = _load_robustness_config(Path(args.config))
+    store = _robustness_manifest_store(config)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    for robustness_id in args.robustness_id:
+        manifest = store.load(robustness_id)
+        selection = _load_robustness_named_artifact(manifest, artifact_store, kind="selection_report", decoder=SelectionReport.from_json_dict)
+        print(f"robustness_id: {robustness_id}")
+        if selection is None:
+            print(f"  no selection_report recorded yet (stage={manifest.stage.value!r})")
+            continue
+        for eligibility in selection.candidate_eligibility:
+            print(f"  eligible: {eligibility.eligible}")
+            for reason in eligibility.rejection_reasons:
+                print(f"    rejected: {reason}")
+        for ranking in selection.ranking:
+            print(f"  ranking_metrics: {dict(sorted(ranking.metric_values.items()))}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m quant_platform.ml_cli",
@@ -1663,6 +1961,77 @@ def build_parser() -> argparse.ArgumentParser:
     compare_backtests_parser.add_argument("--baseline-backtest-id", required=True)
     compare_backtests_parser.add_argument("--metric", required=True)
     compare_backtests_parser.set_defaults(handler=cmd_compare_backtests)
+
+    create_robustness_spec_parser = subparsers.add_parser(
+        "create-robustness-spec", help="Milestone 6: dry-run -- build/validate a RobustnessSpec from --config and print its robustness_id. Writes nothing.",
+    )
+    create_robustness_spec_parser.add_argument("--config", required=True)
+    create_robustness_spec_parser.set_defaults(handler=cmd_create_robustness_spec)
+
+    run_robustness_parser = subparsers.add_parser(
+        "run-robustness", help="Milestone 6: run (or transparently resume) a full statistical-robustness analysis of an already-COMPLETED backtest.",
+    )
+    run_robustness_parser.add_argument("--config", required=True)
+    run_robustness_parser.set_defaults(handler=cmd_run_robustness)
+
+    resume_robustness_parser = subparsers.add_parser(
+        "resume-robustness", help="Milestone 6: resume a prior, non-terminal robustness run.",
+    )
+    resume_robustness_parser.add_argument("--config", required=True)
+    resume_robustness_parser.add_argument("--robustness-id", required=True)
+    resume_robustness_parser.set_defaults(handler=cmd_resume_robustness)
+
+    inspect_robustness_parser = subparsers.add_parser(
+        "inspect-robustness", help="Milestone 6: print a human-readable (or JSON) robustness run summary, including its promotion decision.",
+    )
+    inspect_robustness_parser.add_argument("--config", required=True)
+    inspect_robustness_parser.add_argument("--robustness-id", required=True)
+    inspect_robustness_parser.add_argument("--format", choices=["text", "json"], default="text")
+    inspect_robustness_parser.set_defaults(handler=cmd_inspect_robustness)
+
+    report_robustness_parser = subparsers.add_parser(
+        "report-robustness", help="Milestone 6: alias for inspect-robustness.",
+    )
+    report_robustness_parser.add_argument("--config", required=True)
+    report_robustness_parser.add_argument("--robustness-id", required=True)
+    report_robustness_parser.add_argument("--format", choices=["text", "json"], default="text")
+    report_robustness_parser.set_defaults(handler=cmd_report_robustness)
+
+    verify_robustness_parser = subparsers.add_parser(
+        "verify-robustness", help="Milestone 6: independently reconstruct and cross-check every deterministic analysis a robustness run persisted.",
+    )
+    verify_robustness_parser.add_argument("--config", required=True)
+    verify_robustness_parser.add_argument("--robustness-id", required=True)
+    verify_robustness_parser.set_defaults(handler=cmd_verify_robustness)
+
+    compare_robustness_parser = subparsers.add_parser(
+        "compare-robustness", help="Milestone 6: print two robustness runs' stage/promotion-decision outcome side by side.",
+    )
+    compare_robustness_parser.add_argument("--config", required=True)
+    compare_robustness_parser.add_argument("--robustness-id", required=True)
+    compare_robustness_parser.add_argument("--baseline-robustness-id", required=True)
+    compare_robustness_parser.set_defaults(handler=cmd_compare_robustness)
+
+    inspect_promotion_decision_parser = subparsers.add_parser(
+        "inspect-promotion-decision", help="Milestone 6: print one robustness run's full PromotionDecision -- every gate's name/measured value/bound(s)/outcome/reason.",
+    )
+    inspect_promotion_decision_parser.add_argument("--config", required=True)
+    inspect_promotion_decision_parser.add_argument("--robustness-id", required=True)
+    inspect_promotion_decision_parser.set_defaults(handler=cmd_inspect_promotion_decision)
+
+    inspect_strategy_family_parser = subparsers.add_parser(
+        "inspect-strategy-family", help="Milestone 6: print one durable StrategyFamily record, looked up by its content-addressed --content-hash.",
+    )
+    inspect_strategy_family_parser.add_argument("--config", required=True)
+    inspect_strategy_family_parser.add_argument("--content-hash", required=True)
+    inspect_strategy_family_parser.set_defaults(handler=cmd_inspect_strategy_family)
+
+    compare_strategy_candidates_parser = subparsers.add_parser(
+        "compare-strategy-candidates", help="Milestone 6: print each candidate's own standalone selection evaluation (eligibility, ranking metrics) side by side.",
+    )
+    compare_strategy_candidates_parser.add_argument("--config", required=True)
+    compare_strategy_candidates_parser.add_argument("--robustness-id", required=True, action="append", help="May be passed more than once, one per candidate to compare.")
+    compare_strategy_candidates_parser.set_defaults(handler=cmd_compare_strategy_candidates)
 
     return parser
 

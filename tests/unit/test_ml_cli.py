@@ -91,11 +91,12 @@ def ml_config_walk_forward(tmp_path: Path) -> Path:
 
 
 class TestBuildParser:
-    def test_all_forty_six_commands_registered(self) -> None:
+    def test_all_fifty_six_commands_registered(self) -> None:
         """19 Milestone 4A-4C commands, 9 Milestone 4D optimization
         commands, 8 Milestone 4E calibration commands, 8 Milestone 5
-        backtest commands, and 2 Milestone 5.2 Section 6 lock-recovery
-        commands, all registered on the one shared `ml_cli.py` parser."""
+        backtest commands, 2 Milestone 5.2 Section 6 lock-recovery
+        commands, and 10 Milestone 6 robustness/promotion commands, all
+        registered on the one shared `ml_cli.py` parser."""
         parser = build_parser()
         subparsers_action = next(a for a in parser._actions if a.dest == "command")
         assert set(subparsers_action.choices) == {
@@ -110,6 +111,9 @@ class TestBuildParser:
             "create-backtest-spec", "run-backtest", "resume-backtest", "inspect-backtest",
             "report-backtest", "inspect-backtest-fold", "verify-backtest", "compare-backtests",
             "inspect-backtest-lock", "recover-backtest-lock",
+            "create-robustness-spec", "run-robustness", "resume-robustness", "inspect-robustness",
+            "report-robustness", "verify-robustness", "compare-robustness", "inspect-promotion-decision",
+            "inspect-strategy-family", "compare-strategy-candidates",
         }
 
 

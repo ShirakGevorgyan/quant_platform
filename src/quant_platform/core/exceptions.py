@@ -616,3 +616,116 @@ class BacktestVerificationError(BacktestError):
     consuming its report) when a FATAL cross-consistency check fails and
     the caller has asked for that to raise rather than merely be reported
     as an issue."""
+
+
+# --------------------------------------------------------------------------
+# Leakage-safe statistical robustness, strategy selection, and promotion-gate
+# framework (Milestone 6)
+# --------------------------------------------------------------------------
+class RobustnessError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.robustness`. This
+    package NEVER refits a model, never re-simulates fills, and never
+    claims profitability -- it only statistically characterizes an
+    already-verified, already-COMPLETED backtest's own persisted results,
+    and decides whether that evidence clears configurable, fail-closed
+    promotion gates for paper trading (never live trading)."""
+
+
+class RobustnessValidationError(RobustnessError):
+    """Raised when a `RobustnessSpec` (or an embedded bootstrap/stress/
+    regime/promotion policy) is structurally invalid -- a non-finite
+    numeric field, an empty perturbation grid, an unsupported bootstrap
+    method, a non-positive repetition count, a missing mandatory gate, or
+    an internally inconsistent threshold. Never silently repaired."""
+
+
+class RobustnessStateError(RobustnessError):
+    """Raised for illegal `RobustnessStage` transitions, or an attempt to
+    silently overwrite an already-terminal `RobustnessManifest` with
+    inconsistent content."""
+
+
+class RobustnessSourceVerificationError(RobustnessError):
+    """Raised when the source backtest this robustness run analyzes
+    cannot be trusted: `verify_backtest` did not return `is_ready=True`,
+    a source identity (dataset/split-plan/instrument) does not match the
+    declared `RobustnessSpec`, or a required fold/stitched artifact is
+    missing or fails decode-time validation. A robustness run must NEVER
+    proceed past this check on an unverified backtest."""
+
+
+class ReturnSeriesError(RobustnessError):
+    """Raised when a requested analysis return series cannot be built
+    safely: an unsupported `ReturnSeriesKind`, an attempt to mix bar-level
+    and trade-level observations, an empty series, or a source artifact
+    that does not match the series' own declared sampling frequency."""
+
+
+class BootstrapError(RobustnessError):
+    """Raised when a dependence-aware bootstrap procedure cannot proceed
+    safely: an unsupported method, a block length that does not fit the
+    series length, a non-deterministic seed request, or every repetition
+    for a statistic failing (leaving no valid resample to report)."""
+
+
+class MultipleTestingError(RobustnessError):
+    """Raised when a multiple-testing correction or a probabilistic/
+    deflated Sharpe estimate cannot proceed safely: an empty candidate
+    family, a p-value outside `[0, 1]`, or (for deflated Sharpe) missing
+    required assumptions this package refuses to silently fabricate."""
+
+
+class StabilityAnalysisError(RobustnessError):
+    """Raised when fold-stability or concentration-risk analysis cannot
+    proceed safely: fewer folds than `RobustnessSpec.minimum_fold_count`,
+    or a fold-level input inconsistent with the source backtest's own
+    persisted fold count."""
+
+
+class SensitivityAnalysisError(RobustnessError):
+    """Raised when parameter/decision-stability (perturbation) analysis
+    cannot proceed safely: an undeclared perturbation axis, or an attempt
+    to re-optimize rather than merely perturb around the already-selected
+    operating point."""
+
+
+class StressAnalysisError(RobustnessError):
+    """Raised when cost/latency/execution stress analysis cannot proceed
+    safely: an invalid stress multiplier, or a break-even search whose
+    declared bounds are internally inconsistent."""
+
+
+class RegimeAnalysisError(RobustnessError):
+    """Raised when regime-robustness analysis cannot proceed safely: a
+    regime definition that would require information not yet available
+    at or before the evaluated bar (a leakage violation), or a regime
+    requiring source data this platform does not yet persist time-aligned."""
+
+
+class SelectionError(RobustnessError):
+    """Raised when champion/challenger candidate selection cannot proceed
+    safely: an empty `StrategyFamily`, a candidate whose robustness
+    analysis is not itself COMPLETED/verified, or an ill-defined
+    eligibility-gate/ranking configuration."""
+
+
+class PromotionError(RobustnessError):
+    """Raised when promotion-gate evaluation cannot proceed safely: a
+    mandatory gate with no measurable input (must fail closed, never be
+    silently skipped), or an attempt to construct a `PromotionDecision`
+    of `ELIGIBLE_FOR_LIVE_TRADING` (never a decision this milestone may
+    output)."""
+
+
+class RobustnessResumeError(RobustnessError):
+    """Raised when a robustness run cannot be legally resumed: no
+    manifest exists, the manifest already reached a terminal stage, or a
+    provided `RobustnessSpec` does not reproduce the `robustness_id`
+    being resumed."""
+
+
+class RobustnessVerificationError(RobustnessError):
+    """Raised by `robustness.verification.verify_robustness` (or a
+    caller consuming its report) when a FATAL cross-consistency check
+    fails and the caller has asked for that to raise rather than merely
+    be reported as an issue."""

@@ -238,6 +238,68 @@ class ArtifactCategory(Enum):
     StitchedWalkForwardEquity`) -- each fold's stitched segment starts
     from the PREVIOUS fold's ending normalized equity; no position ever
     crosses a fold boundary; never an average of per-fold curves."""
+    ROBUSTNESS_SPEC = "robustness_spec"
+    """Milestone 6: one immutable `robustness.specs.RobustnessSpec`
+    record -- the canonical, content-addressed record of every setting
+    that can affect a statistical-robustness analysis of one backtest."""
+    SOURCE_VERIFICATION_REPORT = "source_verification_report"
+    """Milestone 6: the `verify_backtest` report a robustness run
+    independently re-ran against its own declared `source_backtest_id`
+    before analyzing anything -- persisted so a reader never has to trust
+    "the manifest says it was verified" alone."""
+    RETURN_SERIES_BUNDLE = "return_series_bundle"
+    """Milestone 6: one `robustness.models.ReturnSeriesBundle` -- every
+    distinct analysis return series (bar/trade, gross/net, per-fold/
+    stitched/benchmark-relative) this run analyzed, each carrying its own
+    sampling frequency, observation count, effective sample count, and
+    source artifact reference -- never silently mixed."""
+    BOOTSTRAP_REPORT = "bootstrap_report"
+    """Milestone 6: one `robustness.bootstrap.BootstrapReport` -- point
+    estimate/CI/valid-and-skipped-repetition-count for every bootstrapped
+    statistic, for one return series, under one declared bootstrap
+    method."""
+    DOWNSIDE_ANALYSIS_REPORT = "downside_analysis_report"
+    """Milestone 6: resampling-based estimated loss/underperformance
+    probabilities (never described as guaranteed future probabilities)."""
+    STRATEGY_FAMILY = "strategy_family"
+    """Milestone 6: one immutable `robustness.multiple_testing.
+    StrategyFamily` -- the durable, traceable record of every candidate a
+    selection was drawn from, so a selected candidate is never treated as
+    if it were the only strategy tested."""
+    MULTIPLE_TESTING_REPORT = "multiple_testing_report"
+    """Milestone 6: Bonferroni/Holm/Benjamini-Hochberg-corrected
+    significance results (and, where assumptions permit, probabilistic/
+    deflated Sharpe) for one `StrategyFamily`."""
+    FOLD_STABILITY_REPORT = "fold_stability_report"
+    """Milestone 6: cross-fold performance-stability and concentration-
+    risk analysis for one backtest's own persisted outer folds."""
+    SENSITIVITY_REPORT = "sensitivity_report"
+    """Milestone 6: the local performance surface around the ALREADY-
+    SELECTED operating point under declared parameter perturbations --
+    never a second optimization pass."""
+    STRESS_REPORT = "stress_report"
+    """Milestone 6: deterministic cost/latency/execution stress-scenario
+    results and, where derivable, break-even values."""
+    REGIME_REPORT = "regime_report"
+    """Milestone 6: per-regime performance breakdown, regimes derived
+    only from information available at or before the evaluated bar."""
+    SELECTION_REPORT = "selection_report"
+    """Milestone 6: every `StrategyFamily` candidate's eligibility
+    decision, rejection reason (if any), ranking inputs, and the final
+    selected candidate's deterministic selection identity -- no
+    candidate ever silently disappears from this report."""
+    PROMOTION_DECISION = "promotion_decision"
+    """Milestone 6: one `robustness.promotion.PromotionDecision` -- every
+    gate's name/measured value/required value/pass-fail-skip/reason,
+    never merely the final verdict. Never `ELIGIBLE_FOR_LIVE_TRADING`."""
+    ROBUSTNESS_REPORT = "robustness_report"
+    """Milestone 6: the final JSON/Markdown aggregate robustness report
+    for one backtest, mirroring `BACKTEST_REPORT`'s role one layer up."""
+    ROBUSTNESS_VERIFICATION_REPORT = "robustness_verification_report"
+    """Milestone 6: the `robustness.verification.verify_robustness`
+    result -- persisted so a reader never has to trust "the manifest says
+    stage=VERIFIED" alone; every mismatch between a persisted analysis
+    artifact and its independent recomputation is recorded here."""
 
 
 class ExperimentStatus(Enum):
