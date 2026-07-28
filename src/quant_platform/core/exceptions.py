@@ -425,3 +425,90 @@ class OptimizationVerificationError(OptimizationError):
     caller consuming its report) when a FATAL cross-consistency check
     fails and the caller has asked for that to raise rather than merely
     be reported as an issue."""
+
+
+# --------------------------------------------------------------------------
+# Leakage-safe prediction calibration, thresholding, confidence, and
+# uncertainty framework (Milestone 4E)
+# --------------------------------------------------------------------------
+class CalibrationError(QuantPlatformError):
+    """Base class for every failure in the calibration/threshold/
+    confidence/uncertainty framework (`quant_platform.calibration`).
+    Distinct from `OptimizationError` -- this milestone governs
+    post-processing an already-selected, already-refit base model's raw
+    outputs, never model/feature/hyperparameter selection itself."""
+
+
+class CalibrationStateError(CalibrationError):
+    """Raised for illegal `CalibrationStage` transitions, or an attempt to
+    silently overwrite an already-terminal `CalibrationManifest` with
+    inconsistent content -- the calibration-level analogue of
+    `OptimizationStateError`."""
+
+
+class CalibrationValidationError(CalibrationError):
+    """Raised when a `CalibrationSpec`/`ThresholdSpec`/`ConfidenceSpec`/
+    `UncertaintySpec`/`AbstentionSpec` (or a raw prediction contract) is
+    structurally invalid -- an unknown method, an impossible class
+    requirement, an invalid probability/threshold/bucket bound, a
+    non-finite numeric field, or an inconsistent source identity. Never
+    silently repaired."""
+
+
+class CalibrationDataError(CalibrationError):
+    """Raised when raw or inner out-of-fold prediction data violates the
+    raw prediction contract: row-count mismatch, timestamp-order
+    mismatch, duplicate sample identity, non-finite score, a probability
+    outside `[0, 1]`, class-order mismatch, fold mismatch, or source
+    identity mismatch."""
+
+
+class CalibrationFitError(CalibrationError):
+    """Raised when a calibration-method candidate cannot be fit at all
+    due to a structural problem (insufficient samples, a missing class,
+    a malformed input representation) -- distinct from a candidate that
+    fits but is legitimately rejected during selection (see
+    `CalibrationSelectionError`)."""
+
+
+class CalibrationSelectionError(CalibrationError):
+    """Raised when calibrator selection cannot produce ANY usable
+    candidate -- every candidate (including the always-available identity
+    baseline) failed or emitted invalid probabilities. Should be rare:
+    identity can virtually never legitimately fail."""
+
+
+class ThresholdSelectionError(CalibrationError):
+    """Raised when decision-threshold selection cannot produce a valid
+    threshold: no feasible candidate satisfies a declared constraint and
+    the spec's fallback policy has no further recourse, or a supplied
+    cost matrix is invalid."""
+
+
+class ConfidencePolicyError(CalibrationError):
+    """Raised when a `ConfidenceSpec` cannot be applied to a given
+    prediction -- an undefined component, an out-of-range boundary, or a
+    category configuration inconsistent with the declared boundaries."""
+
+
+class UncertaintyPolicyError(CalibrationError):
+    """Raised when an `UncertaintySpec` cannot be applied to a given
+    prediction -- an undefined component, an inconsistent inner-model
+    ensemble (mismatched class ordering, missing model identity), or an
+    out-of-range aggregate."""
+
+
+class CalibrationResumeError(CalibrationError):
+    """Raised when a calibration resume attempt cannot proceed safely: a
+    completed outer fold's recorded artifact is missing or corrupted, the
+    requested calibration has no prior manifest to resume, an already-
+    terminal calibration is asked to resume, or the recorded environment
+    is incompatible with the current one under a STRICT determinism
+    policy."""
+
+
+class CalibrationVerificationError(CalibrationError):
+    """Raised by `calibration.verification.verify_calibration` (or a
+    caller consuming its report) when a FATAL cross-consistency check
+    fails and the caller has asked for that to raise rather than merely
+    be reported as an issue."""

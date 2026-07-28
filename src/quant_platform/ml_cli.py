@@ -31,6 +31,14 @@ safe feature-selection/hyperparameter-optimization engine (Milestone 4D).
     python -m quant_platform.ml_cli compare-optimization-candidates --config opt_config.json --optimization-id ID --outer-fold-index N
     python -m quant_platform.ml_cli feature-stability --config opt_config.json --optimization-id ID
     python -m quant_platform.ml_cli hyperparameter-stability --config opt_config.json --optimization-id ID
+    python -m quant_platform.ml_cli create-calibration-spec --config cal_config.json
+    python -m quant_platform.ml_cli run-calibration --config cal_config.json
+    python -m quant_platform.ml_cli resume-calibration --config cal_config.json --calibration-id ID
+    python -m quant_platform.ml_cli inspect-calibration --config cal_config.json --calibration-id ID
+    python -m quant_platform.ml_cli report-calibration --config cal_config.json --calibration-id ID
+    python -m quant_platform.ml_cli inspect-calibration-fold --config cal_config.json --calibration-id ID --outer-fold-index N
+    python -m quant_platform.ml_cli verify-calibration --config cal_config.json --calibration-id ID
+    python -m quant_platform.ml_cli compare-calibration --config cal_config.json --calibration-id ID --baseline-calibration-id ID --metric accuracy
 
 Same operability conventions as `data_cli`/`feature_cli`: every command
 returns 0 on success, non-zero on failure, and prints an actionable
@@ -76,6 +84,20 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from quant_platform.calibration.manifests import (
+    CalibrationEventStore,
+    CalibrationManifest,
+    CalibrationManifestStore,
+)
+from quant_platform.calibration.models import CalibrationStage
+from quant_platform.calibration.reporting import (
+    build_calibration_report_json,
+    render_calibration_report_markdown,
+)
+from quant_platform.calibration.runner import CalibrationRunner, OuterFoldCalibrationResult
+from quant_platform.calibration.specs import CalibrationSpec, compute_calibration_identity
+from quant_platform.calibration.verification import verify_calibration
+from quant_platform.config.calibration_schemas import CalibrationConfig
 from quant_platform.config.ml_schemas import MLExperimentConfig
 from quant_platform.config.optimization_schemas import OptimizationConfig
 from quant_platform.core.exceptions import QuantPlatformError
@@ -851,6 +873,183 @@ def cmd_hyperparameter_stability(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_calibration_config(path: Path) -> CalibrationConfig:
+    return CalibrationConfig.model_validate_json(path.read_text())
+
+
+def _calibration_manifest_store(config: CalibrationConfig) -> CalibrationManifestStore:
+    return CalibrationManifestStore(config.ml_artifacts_root)
+
+
+def _resolve_calibration_spec(config: CalibrationConfig, *, model_registry: ModelRegistry) -> CalibrationSpec:
+    experiment_manifest_store = ExperimentManifestStore(config.ml_artifacts_root)
+    experiment_manifest = experiment_manifest_store.load(config.source_experiment_id)
+    model_definition = model_registry.get(experiment_manifest.spec.model_name, experiment_manifest.spec.model_version)
+    return config.build(experiment_spec=experiment_manifest.spec, model_definition=model_definition)
+
+
+def _build_calibration_runner(config: CalibrationConfig) -> CalibrationRunner:
+    return CalibrationRunner(
+        ml_artifacts_root=config.ml_artifacts_root, model_registry=build_model_registry(),
+        research_manifest_store=ResearchManifestStore(config.research_storage_root),
+        research_dataset_store=ResearchDatasetStore(config.research_storage_root),
+        experiment_manifest_store=ExperimentManifestStore(config.ml_artifacts_root),
+        optimization_manifest_store=(OptimizationManifestStore(config.ml_artifacts_root) if config.source_optimization_id else None),
+        additional_serializers=mz.default_serializer_registry(),
+    )
+
+
+def cmd_create_calibration_spec(args: argparse.Namespace) -> int:
+    """Dry-run: resolves `--source-experiment-id`'s bound experiment,
+    builds and validates a `CalibrationSpec` from `--config`, and prints
+    its deterministic `calibration_id` -- writes nothing. Mirrors
+    `validate-experiment`'s "preflight, no side effects" convention."""
+    config = _load_calibration_config(Path(args.config))
+    spec = _resolve_calibration_spec(config, model_registry=build_model_registry())
+    identity = compute_calibration_identity(spec)
+    print(f"calibration_id: {identity.calibration_id}")
+    print(f"source_experiment_id: {spec.source_experiment_id}")
+    print(f"source_optimization_id: {spec.source_optimization_id}")
+    print(f"calibration_method_candidates: {[m.value for m in spec.calibration_method_candidates]}")
+    print(f"threshold_policy: {spec.threshold_spec.policy.value}")
+    return 0
+
+
+def cmd_run_calibration(args: argparse.Namespace) -> int:
+    """Runs (or transparently resumes, if a manifest already exists for
+    this exact `CalibrationSpec`'s identity) a full leakage-safe
+    calibration: for every outer fold, inner out-of-fold predictions fit
+    and freeze a calibrator/threshold/confidence/uncertainty/abstention
+    policy using ONLY inner-fold evidence, then the base model is refit
+    on the complete outer-train partition and evaluated exactly once on
+    the untouched outer-test partition. Requires the referenced source
+    experiment to already be prepared (see `prepare-experiment`)."""
+    config = _load_calibration_config(Path(args.config))
+    spec = _resolve_calibration_spec(config, model_registry=build_model_registry())
+    runner = _build_calibration_runner(config)
+    outcome = runner.run(spec)
+    print(f"calibration_id: {outcome.manifest.calibration_id}")
+    print(f"stage: {outcome.manifest.stage.value}")
+    print(f"completed_outer_fold_indices: {list(outcome.manifest.completed_outer_fold_indices)}")
+    if outcome.manifest.failure_summary:
+        print(f"failure_summary: {outcome.manifest.failure_summary}")
+    return 0 if outcome.manifest.stage is CalibrationStage.COMPLETED else 2
+
+
+def cmd_resume_calibration(args: argparse.Namespace) -> int:
+    """Resumes a prior calibration. An already-`COMPLETED` calibration is
+    a safe idempotent no-op (exit 0, matching `run-calibration`'s own
+    idempotency guarantee) -- this command does NOT raise for "nothing
+    left to resume" the way `resume-optimization` does; only a calibration
+    with no manifest at all, or one already `FAILED`, raises
+    `CalibrationResumeError` (exit 1). The `CalibrationSpec` is re-loaded
+    from the calibration's OWN recorded `CALIBRATION_SPEC` artifact (never
+    rebuilt from `--config` again), so this command only needs `--config`
+    to construct the runner's stores/registry."""
+    config = _load_calibration_config(Path(args.config))
+    runner = _build_calibration_runner(config)
+    outcome = runner.resume(args.calibration_id)
+    print(f"calibration_id: {outcome.manifest.calibration_id}")
+    print(f"stage: {outcome.manifest.stage.value}")
+    print(f"completed_outer_fold_indices: {list(outcome.manifest.completed_outer_fold_indices)}")
+    print(f"resume_count: {outcome.manifest.resume_count}")
+    return 0 if outcome.manifest.stage is CalibrationStage.COMPLETED else 2
+
+
+def _load_calibration_outer_fold_results(manifest: CalibrationManifest, artifact_store: MLArtifactStore) -> dict[int, OuterFoldCalibrationResult]:
+    results: dict[int, OuterFoldCalibrationResult] = {}
+    for outer_fold_index, ref in manifest.outer_fold_result_references.items():
+        raw = artifact_store.read_artifact(ref.content_hash)
+        results[outer_fold_index] = OuterFoldCalibrationResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    return results
+
+
+def _load_calibration_spec_artifact(manifest: CalibrationManifest, artifact_store: MLArtifactStore) -> CalibrationSpec | None:
+    if manifest.spec_reference is None:
+        return None
+    raw = artifact_store.read_artifact(manifest.spec_reference.content_hash)
+    return CalibrationSpec.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+
+
+def cmd_inspect_calibration(args: argparse.Namespace) -> int:
+    config = _load_calibration_config(Path(args.config))
+    manifest = _calibration_manifest_store(config).load(args.calibration_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    spec = _load_calibration_spec_artifact(manifest, artifact_store)
+    outer_fold_results = _load_calibration_outer_fold_results(manifest, artifact_store)
+
+    if args.format == "json":
+        import json
+
+        payload = build_calibration_report_json(manifest, spec=spec, outer_fold_results=list(outer_fold_results.values()))
+        print(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    else:
+        print(render_calibration_report_markdown(manifest, spec=spec, outer_fold_results=list(outer_fold_results.values())))
+    return 0
+
+
+def cmd_report_calibration(args: argparse.Namespace) -> int:
+    """Alias for `inspect-calibration` -- a completed calibration's
+    aggregate report IS what `inspect-calibration` prints (mirrors
+    `optimization`'s identical choice not to duplicate `inspect-
+    optimization`'s content under a second command name)."""
+    return cmd_inspect_calibration(args)
+
+
+def cmd_inspect_calibration_fold(args: argparse.Namespace) -> int:
+    config = _load_calibration_config(Path(args.config))
+    manifest = _calibration_manifest_store(config).load(args.calibration_id)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    reference = manifest.outer_fold_result_references.get(args.outer_fold_index)
+    if reference is None:
+        print(f"No recorded result for calibration_id={args.calibration_id!r} outer_fold_index={args.outer_fold_index}", file=sys.stderr)
+        return 1
+    raw = artifact_store.read_artifact(reference.content_hash)
+    result = OuterFoldCalibrationResult.from_json_dict(parse_json_strict(raw.decode("utf-8")))
+    print(f"outer_fold_index: {result.outer_fold_index}")
+    print(f"outer_train_row_count: {result.outer_train_row_count}, outer_test_row_count: {result.outer_test_row_count}")
+    print(f"classification_metrics: {dict(sorted(result.classification_metrics.items()))}")
+    print(f"calibration_metrics_on_outer_test: {dict(sorted(result.calibration_metrics_on_outer_test.items()))}")
+    print(f"selective_prediction_summary: {dict(sorted(result.selective_prediction_summary.items()))}")
+    decision_counts = {d: result.decisions.count(d) for d in sorted(set(result.decisions))}
+    print(f"decision_counts: {decision_counts}")
+    return 0
+
+
+def cmd_verify_calibration(args: argparse.Namespace) -> int:
+    """Re-audits everything the named calibration has ever recorded --
+    see `calibration.verification.verify_calibration`'s module docstring
+    for exactly what is checked, including the recomputation proof that
+    persisted calibrated probabilities/decisions are actually
+    reproducible from persisted parameters. Returns 2 (not 1) when the
+    report contains any CRITICAL/ERROR issue."""
+    config = _load_calibration_config(Path(args.config))
+    report = verify_calibration(
+        args.calibration_id, calibration_manifest_store=_calibration_manifest_store(config),
+        artifact_store=MLArtifactStore(config.ml_artifacts_root), event_store=CalibrationEventStore(config.ml_artifacts_root),
+    )
+    for issue in report.issues:
+        print(f"[{issue.severity.value}] {issue.code}: {issue.message}")
+    print(f"is_ready: {report.is_ready}")
+    return 0 if report.is_ready else 2
+
+
+def cmd_compare_calibration(args: argparse.Namespace) -> int:
+    """Prints one metric's per-outer-fold values, side by side, for two
+    completed calibrations -- never a statistical claim, just the raw
+    numbers a human compares."""
+    config = _load_calibration_config(Path(args.config))
+    store = _calibration_manifest_store(config)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    left = _load_calibration_outer_fold_results(store.load(args.calibration_id), artifact_store)
+    right = _load_calibration_outer_fold_results(store.load(args.baseline_calibration_id), artifact_store)
+    for outer_fold_index in sorted(set(left) | set(right)):
+        left_value = left[outer_fold_index].classification_metrics.get(args.metric) if outer_fold_index in left else None
+        right_value = right[outer_fold_index].classification_metrics.get(args.metric) if outer_fold_index in right else None
+        print(f"outer_fold {outer_fold_index}: {args.calibration_id[:12]}={left_value} {args.baseline_calibration_id[:12]}={right_value}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m quant_platform.ml_cli",
@@ -1046,6 +1245,65 @@ def build_parser() -> argparse.ArgumentParser:
     hyperparameter_stability_parser.add_argument("--config", required=True)
     hyperparameter_stability_parser.add_argument("--optimization-id", required=True)
     hyperparameter_stability_parser.set_defaults(handler=cmd_hyperparameter_stability)
+
+    create_calibration_spec_parser = subparsers.add_parser(
+        "create-calibration-spec", help="Milestone 4E: dry-run -- build/validate a CalibrationSpec from --config and print its calibration_id. Writes nothing.",
+    )
+    create_calibration_spec_parser.add_argument("--config", required=True)
+    create_calibration_spec_parser.set_defaults(handler=cmd_create_calibration_spec)
+
+    run_calibration_parser = subparsers.add_parser(
+        "run-calibration", help="Milestone 4E: run (or transparently resume) a full leakage-safe calibration.",
+    )
+    run_calibration_parser.add_argument("--config", required=True)
+    run_calibration_parser.set_defaults(handler=cmd_run_calibration)
+
+    resume_calibration_parser = subparsers.add_parser(
+        "resume-calibration", help="Milestone 4E: resume a prior, non-terminal calibration run.",
+    )
+    resume_calibration_parser.add_argument("--config", required=True)
+    resume_calibration_parser.add_argument("--calibration-id", required=True)
+    resume_calibration_parser.set_defaults(handler=cmd_resume_calibration)
+
+    inspect_calibration_parser = subparsers.add_parser(
+        "inspect-calibration", help="Milestone 4E: print a human-readable (or JSON) calibration report.",
+    )
+    inspect_calibration_parser.add_argument("--config", required=True)
+    inspect_calibration_parser.add_argument("--calibration-id", required=True)
+    inspect_calibration_parser.add_argument("--format", choices=["text", "json"], default="text")
+    inspect_calibration_parser.set_defaults(handler=cmd_inspect_calibration)
+
+    report_calibration_parser = subparsers.add_parser(
+        "report-calibration", help="Milestone 4E: alias for inspect-calibration.",
+    )
+    report_calibration_parser.add_argument("--config", required=True)
+    report_calibration_parser.add_argument("--calibration-id", required=True)
+    report_calibration_parser.add_argument("--format", choices=["text", "json"], default="text")
+    report_calibration_parser.set_defaults(handler=cmd_report_calibration)
+
+    inspect_calibration_fold_parser = subparsers.add_parser(
+        "inspect-calibration-fold", help="Milestone 4E: print one outer fold's persisted OuterFoldCalibrationResult.",
+    )
+    inspect_calibration_fold_parser.add_argument("--config", required=True)
+    inspect_calibration_fold_parser.add_argument("--calibration-id", required=True)
+    inspect_calibration_fold_parser.add_argument("--outer-fold-index", type=int, required=True)
+    inspect_calibration_fold_parser.set_defaults(handler=cmd_inspect_calibration_fold)
+
+    verify_calibration_parser = subparsers.add_parser(
+        "verify-calibration", help="Milestone 4E: re-verify every artifact/event a calibration has recorded, including the calibrated-probability recomputation proof.",
+    )
+    verify_calibration_parser.add_argument("--config", required=True)
+    verify_calibration_parser.add_argument("--calibration-id", required=True)
+    verify_calibration_parser.set_defaults(handler=cmd_verify_calibration)
+
+    compare_calibration_parser = subparsers.add_parser(
+        "compare-calibration", help="Milestone 4E: print one metric's per-outer-fold values, side by side, for two completed calibrations.",
+    )
+    compare_calibration_parser.add_argument("--config", required=True)
+    compare_calibration_parser.add_argument("--calibration-id", required=True)
+    compare_calibration_parser.add_argument("--baseline-calibration-id", required=True)
+    compare_calibration_parser.add_argument("--metric", required=True)
+    compare_calibration_parser.set_defaults(handler=cmd_compare_calibration)
 
     return parser
 

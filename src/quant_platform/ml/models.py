@@ -141,6 +141,38 @@ class ArtifactCategory(Enum):
     `optimization.candidates.TrialResult` -- captured once because the
     runtime environment does not change between trials of the same run,
     never re-captured/re-written per trial."""
+    CALIBRATION_SPEC = "calibration_spec"
+    """Milestone 4E: one immutable `calibration.specs.CalibrationSpec`
+    record -- the canonical, content-addressed record of every
+    scientifically material calibration/threshold/confidence/uncertainty
+    choice for one calibration run."""
+    INNER_OOF_PREDICTIONS = "inner_oof_predictions"
+    """Milestone 4E: one `calibration.fitting.InnerOofPredictionSet` per
+    outer fold -- the concatenated, time-safe inner out-of-fold
+    predictions (and full provenance) every calibrator/threshold/
+    confidence/uncertainty policy is fit on."""
+    CALIBRATOR_CANDIDATE_REPORT = "calibrator_candidate_report"
+    """Milestone 4E: every calibration-method candidate evaluated for one
+    outer fold, their training-side metrics, and which one was selected
+    (and why) -- the calibration-method analogue of `optimization.
+    candidates.RankingTable`."""
+    THRESHOLD_REPORT = "threshold_report"
+    """Milestone 4E: every decision-threshold candidate evaluated for one
+    outer fold, the selected threshold, and its inner-fold stability
+    summary."""
+    DECISION_POLICY = "decision_policy"
+    """Milestone 4E: one outer fold's FROZEN confidence/uncertainty/
+    abstention policy -- fit on inner OOF predictions only, before the
+    final base model is ever refit on complete outer-train data."""
+    OUTER_FOLD_CALIBRATION_RESULT = "outer_fold_calibration_result"
+    """Milestone 4E: one immutable `calibration.runner.
+    OuterFoldCalibrationResult` -- the final base model refit on complete
+    outer-train data, evaluated exactly once on untouched outer-test data
+    through the frozen calibration/threshold/confidence/uncertainty/
+    abstention policy."""
+    CALIBRATION_REPORT = "calibration_report"
+    """Milestone 4E: the final JSON/Markdown calibration report,
+    aggregated across every outer fold."""
 
 
 class ExperimentStatus(Enum):
