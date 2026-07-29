@@ -300,6 +300,54 @@ class ArtifactCategory(Enum):
     result -- persisted so a reader never has to trust "the manifest says
     stage=VERIFIED" alone; every mismatch between a persisted analysis
     artifact and its independent recomputation is recorded here."""
+    PAPER_TRADING_SPEC = "paper_trading_spec"
+    """Milestone 7: the immutable `paper_trading.specs.PaperTradingSpec`
+    a session was created from."""
+    ELIGIBILITY_VERIFICATION_REPORT = "eligibility_verification_report"
+    """Milestone 7: `paper_trading.eligibility.EligibilityVerificationReport`
+    -- the persisted proof a session's ELIGIBLE_FOR_PAPER_TRADING chain was
+    independently re-verified before the session was ever created."""
+    PAPER_SESSION_MANIFEST = "paper_session_manifest"
+    """Milestone 7: `paper_trading.manifests.PaperSessionManifest`."""
+    MARKET_EVENT_LEDGER = "market_event_ledger"
+    """Milestone 7: the ordered `MARKET_EVENT_ACCEPTED` entries of a
+    paper/shadow session's event ledger, exported as one artifact."""
+    STRATEGY_DECISION_LEDGER = "strategy_decision_ledger"
+    """Milestone 7: the ordered `STRATEGY_DECISION` entries (including
+    abstentions) of a paper/shadow session's event ledger."""
+    ORDER_LEDGER = "order_ledger"
+    """Milestone 7: the ordered `ORDER_STATE_EVENT` entries of a paper
+    session's event ledger."""
+    FILL_LEDGER = "fill_ledger"
+    """Milestone 7: the ordered `FILL` entries of a paper session's event
+    ledger."""
+    RISK_DECISION_LEDGER = "risk_decision_ledger"
+    """Milestone 7: the ordered `RISK_DECISION`/`HALT_TRIGGERED` entries of
+    a paper session's event ledger."""
+    ACCOUNT_SNAPSHOT_LEDGER = "account_snapshot_ledger"
+    """Milestone 7: the ordered `ACCOUNT_SNAPSHOT` entries of a paper
+    session's event ledger."""
+    PAPER_RECONCILIATION_REPORT = "paper_reconciliation_report"
+    """Milestone 7: `paper_trading.reconciliation.ReconciliationReport`."""
+    PAPER_SESSION_REPORT = "paper_session_report"
+    """Milestone 7: `paper_trading.reports.PaperSessionReport`."""
+    EXECUTION_QUALITY_REPORT = "execution_quality_report"
+    """Milestone 7: the execution-quality sub-summary of a
+    `PaperSessionReport` (fill rate, execution delay), persisted standalone
+    when a caller needs it independent of the full session report."""
+    SHADOW_OBSERVATION_REPORT = "shadow_observation_report"
+    """Milestone 7: `paper_trading.reports.ShadowObservationSummary`, or
+    the raw ordered `SHADOW_OBSERVATION` ledger entries for a shadow
+    session, exported as one artifact -- never merged with real-account
+    P&L (Section 19)."""
+    PAPER_VERIFICATION_REPORT = "paper_verification_report"
+    """Milestone 7: the `paper_trading.verification.verify_paper_session`
+    result -- mirrors `ROBUSTNESS_VERIFICATION_REPORT`'s role one layer up,
+    stating its own independence classification explicitly rather than a
+    bare pass/fail."""
+    BACKTEST_PAPER_COMPARISON_REPORT = "backtest_paper_comparison_report"
+    """Milestone 7: `paper_trading.reports.BacktestComparisonReport` --
+    diagnostic only, never a promotion decision (Section 28)."""
 
 
 class ExperimentStatus(Enum):

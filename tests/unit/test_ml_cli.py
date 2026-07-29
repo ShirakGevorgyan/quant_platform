@@ -91,12 +91,17 @@ def ml_config_walk_forward(tmp_path: Path) -> Path:
 
 
 class TestBuildParser:
-    def test_all_fifty_six_commands_registered(self) -> None:
+    def test_all_seventy_commands_registered(self) -> None:
         """19 Milestone 4A-4C commands, 9 Milestone 4D optimization
         commands, 8 Milestone 4E calibration commands, 8 Milestone 5
         backtest commands, 2 Milestone 5.2 Section 6 lock-recovery
-        commands, and 10 Milestone 6 robustness/promotion commands, all
-        registered on the one shared `ml_cli.py` parser."""
+        commands, 10 Milestone 6 robustness/promotion commands, and 14
+        Milestone 7 paper-trading/shadow-execution commands, all
+        registered on the one shared `ml_cli.py` parser. No command name
+        anywhere in this set resembles live order transmission -- see
+        `test_safety_scan.py::TestCliHasNoLiveCommands` for the explicit
+        negative check (`run-live`/`submit-live-order`/`connect-broker`/
+        `execute-mt5`/`deploy-live`)."""
         parser = build_parser()
         subparsers_action = next(a for a in parser._actions if a.dest == "command")
         assert set(subparsers_action.choices) == {
@@ -114,6 +119,10 @@ class TestBuildParser:
             "create-robustness-spec", "run-robustness", "resume-robustness", "inspect-robustness",
             "report-robustness", "verify-robustness", "compare-robustness", "inspect-promotion-decision",
             "inspect-strategy-family", "compare-strategy-candidates",
+            "create-paper-trading-spec", "run-paper-session", "resume-paper-session", "pause-paper-session",
+            "inspect-paper-session", "report-paper-session", "verify-paper-session", "compare-paper-to-backtest",
+            "inspect-paper-orders", "inspect-paper-fills", "inspect-paper-risk-events", "inspect-paper-reconciliation",
+            "run-shadow-session", "report-shadow-session",
         }
 
 

@@ -729,3 +729,162 @@ class RobustnessVerificationError(RobustnessError):
     caller consuming its report) when a FATAL cross-consistency check
     fails and the caller has asked for that to raise rather than merely
     be reported as an issue."""
+
+
+# --------------------------------------------------------------------------
+# Deterministic paper trading and shadow execution (Milestone 7)
+# --------------------------------------------------------------------------
+class PaperTradingError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.paper_trading`.
+    This package NEVER transmits an order to a broker, exchange, MT5
+    terminal, or any live-trading API -- it only deterministically
+    simulates the trading lifecycle (decisions, orders, fills, positions,
+    accounting) for a strategy already promoted `ELIGIBLE_FOR_PAPER_
+    TRADING` by Milestone 6. There is no `ELIGIBLE_FOR_LIVE_TRADING` and
+    no live-execution code path anywhere in this package."""
+
+
+class PaperTradingSpecError(PaperTradingError):
+    """Raised when a `PaperTradingSpec` (or an embedded instrument/order/
+    execution/risk policy) is structurally invalid: a non-finite numeric
+    field, an unsupported enum value, a LIVE-like mode string, a broker
+    credential/endpoint field, or an internally inconsistent policy.
+    Never silently repaired."""
+
+
+class PaperTradingIdentityError(PaperTradingError):
+    """Raised when a `paper_session_spec_id` cannot be computed or a
+    provided spec does not reproduce the identity being resumed/verified
+    against."""
+
+
+class PaperTradingEligibilityError(PaperTradingError):
+    """Raised when the eligibility chain (verified `PromotionDecision` ->
+    verified robustness result -> verified source backtest) cannot be
+    established: a missing/tampered decision, a decision kind other than
+    `ELIGIBLE_FOR_PAPER_TRADING`, a decision referencing a different
+    candidate, or any upstream artifact that fails independent
+    re-verification. A paper session must NEVER start without this check
+    passing."""
+
+
+class PaperTradingStateError(PaperTradingError):
+    """Raised for illegal `PaperSessionStage` transitions, or an attempt
+    to silently overwrite an already-terminal session manifest with
+    inconsistent content."""
+
+
+class PaperTradingManifestError(PaperTradingError):
+    """Raised when a `PaperSessionManifest` is structurally invalid or
+    references an artifact kind this package does not recognize."""
+
+
+class PaperTradingArtifactError(PaperTradingError):
+    """Raised when a durable paper-trading artifact (ledger record,
+    snapshot, report) cannot be read, decoded, or reconstructed safely."""
+
+
+class PaperTradingVerificationError(PaperTradingError):
+    """Raised by `paper_trading.verification.verify_paper_session` (or a
+    caller consuming its report) when a FATAL cross-consistency check
+    fails and the caller has asked for that to raise rather than merely
+    be reported as an issue."""
+
+
+class MarketEventError(PaperTradingError):
+    """Raised when a normalized market event is structurally invalid:
+    non-finite/non-positive prices, `ask < bid`, a bar whose high/low do
+    not bound open/close, a naive (non-timezone-aware) timestamp, or an
+    unsupported interval."""
+
+
+class MarketEventOrderError(MarketEventError):
+    """Raised when a market-event sequence violates strict ordering (a
+    forward/live stream may never be silently reordered), contains an
+    unresolved duplicate, or otherwise breaks this package's event-time
+    correctness guarantee."""
+
+
+class ClockError(PaperTradingError):
+    """Raised for an illegal clock operation: requesting a time before
+    the clock has been advanced, stepping a `ReplayClock` past the end of
+    its source sequence, or supplying a non-monotonic manual time to a
+    clock mode that requires monotonicity."""
+
+
+class StrategyRuntimeError(PaperTradingError):
+    """Raised when a `StrategyRuntime` cannot safely produce a decision:
+    a feature/model artifact identity mismatch against the eligibility
+    chain, a non-JSON-safe diagnostic value, or an internal strategy
+    failure that must halt rather than fabricate a decision."""
+
+
+class OrderValidationError(PaperTradingError):
+    """Raised when an `OrderRequest` is structurally invalid or violates
+    a pre-trade policy: non-positive/mis-quantized quantity, missing
+    required price for its order type, unsupported order type/time-in-
+    force, or a duplicate `client_order_id`."""
+
+
+class OrderStateError(PaperTradingError):
+    """Raised for an illegal `OrderState` transition, or an attempt to
+    mutate an order outside its defined lifecycle."""
+
+
+class FillValidationError(PaperTradingError):
+    """Raised when a `Fill` is structurally invalid: non-positive
+    quantity, cumulative fill exceeding order quantity, a non-finite cost
+    component, a side mismatched with its order, or an attempt to mutate
+    an already-persisted fill."""
+
+
+class PositionAccountingError(PaperTradingError):
+    """Raised when position accounting cannot be reconciled: a fill that
+    would drive quantity/cost-basis inconsistent with its own recorded
+    formula for LONG/SHORT/scale-in/reversal."""
+
+
+class PortfolioReconciliationError(PaperTradingError):
+    """Raised when portfolio/account reconciliation fails: `equity !=
+    cash + marked_position_value - liabilities - accrued_costs` (or an
+    equivalent exact-arithmetic check) outside tolerance."""
+
+
+class RiskLimitError(PaperTradingError):
+    """Raised when a risk check cannot be evaluated safely (e.g. a
+    mandatory limit with no measurable input) -- fails closed, never
+    silently skipped."""
+
+
+class RiskHaltError(PaperTradingError):
+    """Raised to signal a risk-driven session halt/flatten action -- the
+    kill switch's own typed escalation, never a silent no-op."""
+
+
+class DuplicateEventError(PaperTradingError):
+    """Raised when an event ledger append would introduce a duplicate
+    deterministic event identity."""
+
+
+class DuplicateOrderError(PaperTradingError):
+    """Raised when an order create would introduce a duplicate
+    `client_order_id` or duplicate deterministic order identity."""
+
+
+class DuplicateFillError(PaperTradingError):
+    """Raised when a fill apply would introduce a duplicate deterministic
+    fill identity -- recognized and rejected idempotently, never applied
+    twice."""
+
+
+class SessionLockError(PaperTradingError):
+    """Raised when a second writer attempts to run/resume the same
+    `paper_session_id` concurrently, or a stale-lock recovery is
+    attempted without the required explicit force."""
+
+
+class ResumeError(PaperTradingError):
+    """Raised when a paper session cannot be legally resumed: no manifest
+    exists, the manifest already reached a terminal, non-recoverable
+    stage, or a provided `PaperTradingSpec` does not reproduce the
+    `paper_session_spec_id` being resumed."""

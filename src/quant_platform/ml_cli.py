@@ -59,6 +59,32 @@ safe feature-selection/hyperparameter-optimization engine (Milestone 4D).
     python -m quant_platform.ml_cli inspect-promotion-decision --config rb_config.json --robustness-id ID
     python -m quant_platform.ml_cli inspect-strategy-family --config rb_config.json --content-hash HASH
     python -m quant_platform.ml_cli compare-strategy-candidates --config rb_config.json --robustness-id ID [--robustness-id ID ...]
+    python -m quant_platform.ml_cli create-paper-trading-spec --config pt_config.json
+    python -m quant_platform.ml_cli run-paper-session --config pt_config.json --replay-source events.jsonl --feature-name candle_body_ratio [--feature-name ...]
+    python -m quant_platform.ml_cli resume-paper-session --config pt_config.json --paper-session-id ID --replay-source events.jsonl --feature-name candle_body_ratio
+    python -m quant_platform.ml_cli pause-paper-session --config pt_config.json --paper-session-id ID
+    python -m quant_platform.ml_cli inspect-paper-session --config pt_config.json --paper-session-id ID
+    python -m quant_platform.ml_cli report-paper-session --config pt_config.json --paper-session-id ID [--verify]
+    python -m quant_platform.ml_cli verify-paper-session --config pt_config.json --paper-session-id ID
+    python -m quant_platform.ml_cli compare-paper-to-backtest --config pt_config.json --paper-session-id ID --backtest-id ID
+    python -m quant_platform.ml_cli inspect-paper-orders --config pt_config.json --paper-session-id ID
+    python -m quant_platform.ml_cli inspect-paper-fills --config pt_config.json --paper-session-id ID
+    python -m quant_platform.ml_cli inspect-paper-risk-events --config pt_config.json --paper-session-id ID
+    python -m quant_platform.ml_cli inspect-paper-reconciliation --config pt_config.json --paper-session-id ID
+    python -m quant_platform.ml_cli run-shadow-session --config pt_config.json --replay-source events.jsonl --feature-name candle_body_ratio
+    python -m quant_platform.ml_cli report-shadow-session --config pt_config.json --paper-session-id ID
+
+MILESTONE 7 (PAPER TRADING / SHADOW EXECUTION) -- NO LIVE ORDER TRANSMISSION
+--------------------------------------------------------------------------
+Every `run-paper-session`/`resume-paper-session`/`run-shadow-session`
+invocation prints an explicit "no live orders are sent" notice. There is
+no command named `run-live`/`submit-live-order`/`connect-broker`/
+`execute-mt5`/`deploy-live` anywhere on this parser, and none can be --
+`paper_trading` contains no network/broker client of any kind (Section 35's
+safety scan proves this structurally, not by convention). `--paper-
+session-id` for shadow sessions is `run-shadow-session`'s own printed
+`paper_session_id` -- the SAME identity space as a real paper session
+(both are `PaperTradingSpec`-addressed), never a separate namespace.
 
 Same operability conventions as `data_cli`/`feature_cli`: every command
 returns 0 on success, non-zero on failure, and prints an actionable
@@ -144,8 +170,15 @@ from quant_platform.config.backtesting_schemas import BacktestConfig
 from quant_platform.config.calibration_schemas import CalibrationConfig
 from quant_platform.config.ml_schemas import MLExperimentConfig
 from quant_platform.config.optimization_schemas import OptimizationConfig
+from quant_platform.config.paper_trading_schemas import PaperTradingConfig
 from quant_platform.config.robustness_schemas import RobustnessConfig
-from quant_platform.core.exceptions import QuantPlatformError
+from quant_platform.core.exceptions import (
+    PaperTradingEligibilityError,
+    PaperTradingIdentityError,
+    PaperTradingStateError,
+    QuantPlatformError,
+)
+from quant_platform.core.json import write_json_atomic
 from quant_platform.execution.executor import DeterministicFoldExecutor, MetricsFoldExecutor
 from quant_platform.execution.manifests import ExecutionManifestStore
 from quant_platform.execution.reporting import build_execution_report_json, render_execution_report_markdown
@@ -183,7 +216,7 @@ from quant_platform.ml.models import (
     PreprocessingBinding,
     ValidationReport,
 )
-from quant_platform.ml.persistence import parse_json_strict
+from quant_platform.ml.persistence import as_json_dict, as_json_list, parse_json_strict, read_json_file
 from quant_platform.ml.registry import ModelDefinition, ModelRegistry
 from quant_platform.ml.reporting import build_report_json, render_report_markdown
 from quant_platform.ml.testing import TEST_MODEL_NAME, TEST_MODEL_VERSION, ConstantTestModelFactory
@@ -212,6 +245,29 @@ from quant_platform.optimization.stability import (
     flag_near_tied_top_candidates,
 )
 from quant_platform.optimization.verification import verify_optimization
+from quant_platform.paper_trading.clock import ReplayClock
+from quant_platform.paper_trading.eligibility import EligibilityVerificationEnvironment
+from quant_platform.paper_trading.manifests import PaperSessionManifestStore
+from quant_platform.paper_trading.model_strategy import ModelStrategyRuntime
+from quant_platform.paper_trading.models import LedgerEntryKind, OrderState, PaperSessionStage, SessionMode
+from quant_platform.paper_trading.orders import OrderStateEvent, resolve_order_state
+from quant_platform.paper_trading.persistence import PaperSessionEventStore
+from quant_platform.paper_trading.reconciliation import reconcile_session
+from quant_platform.paper_trading.replay import load_replay_events
+from quant_platform.paper_trading.reports import (
+    BacktestComparisonMetrics,
+    build_paper_session_report,
+    compare_paper_to_backtest,
+)
+from quant_platform.paper_trading.risk import KillSwitchTransitionEvent
+from quant_platform.paper_trading.runner import (
+    RunnerEnvironment,
+    pause_paper_session,
+    run_paper_trading_session,
+    run_shadow_session,
+)
+from quant_platform.paper_trading.specs import PaperTradingSpec, compute_paper_session_spec_id
+from quant_platform.paper_trading.verification import verify_paper_session
 from quant_platform.robustness.manifests import RobustnessManifest, RobustnessManifestStore
 from quant_platform.robustness.models import RobustnessStage
 from quant_platform.robustness.multiple_testing import StrategyFamily
@@ -1630,6 +1686,495 @@ def cmd_compare_strategy_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Milestone 7: deterministic paper trading / shadow execution commands
+#
+# Every command below prints "no live orders are sent" context only where
+# genuinely informative (run/resume/shadow); no command anywhere in this
+# section can transmit a real order -- `run_paper_trading_session`/`run_
+# shadow_session` structurally cannot (Section 35's safety scan proves no
+# network/broker client exists in `paper_trading` at all).
+# --------------------------------------------------------------------------
+_NO_LIVE_ORDERS_NOTICE = "NOTICE: this is a simulated paper/shadow session. No order is ever sent to any broker."
+
+_DEFAULT_INSPECTION_ROW_LIMIT = 200
+"""Release-audit finding, fixed (Section 11): `inspect-paper-orders`/
+`inspect-paper-fills`/`inspect-paper-risk-events` used to print EVERY
+matching record unconditionally, with no cap at all -- a long-running
+session's own order/fill count is unbounded, so this was a genuine
+operator-safety gap (unbounded terminal output), not merely a cosmetic
+one. `--limit` (overridable per invocation) caps how many rows print;
+the underlying ledger itself is never touched or truncated."""
+
+
+def _load_paper_trading_config(path: Path) -> PaperTradingConfig:
+    return PaperTradingConfig.model_validate_json(path.read_text())
+
+
+def _paper_trading_manifest_store(config: PaperTradingConfig) -> PaperSessionManifestStore:
+    return PaperSessionManifestStore(config.ml_artifacts_root)
+
+
+def _paper_trading_event_store(config: PaperTradingConfig) -> PaperSessionEventStore:
+    return PaperSessionEventStore(config.ml_artifacts_root)
+
+
+def _paper_trading_eligibility_environment(config: PaperTradingConfig) -> EligibilityVerificationEnvironment:
+    return EligibilityVerificationEnvironment(
+        robustness_manifest_store=RobustnessManifestStore(config.ml_artifacts_root), artifact_store=MLArtifactStore(config.ml_artifacts_root),
+        backtest_manifest_store=BacktestManifestStore(config.ml_artifacts_root), backtest_event_store=BacktestEventStore(config.ml_artifacts_root),
+        calibration_manifest_store=CalibrationManifestStore(config.ml_artifacts_root), experiment_manifest_store=ExperimentManifestStore(config.ml_artifacts_root),
+        execution_manifest_store=ExecutionManifestStore(config.ml_artifacts_root), research_manifest_store=ResearchManifestStore(config.research_storage_root),
+        research_dataset_store=ResearchDatasetStore(config.research_storage_root),
+        dataset_loader=DatasetLoader(CanonicalStore(config.historical_storage_root), ManifestStore(config.historical_storage_root)),
+    )
+
+
+def _paper_trading_runner_environment(config: PaperTradingConfig) -> RunnerEnvironment:
+    return RunnerEnvironment(
+        manifest_store=_paper_trading_manifest_store(config), event_store=_paper_trading_event_store(config),
+        eligibility_environment=_paper_trading_eligibility_environment(config),
+    )
+
+
+def _paper_session_model_pin_path(config: PaperTradingConfig, paper_session_id: str) -> Path:
+    return config.ml_artifacts_root / "paper_sessions" / paper_session_id / "resolved_model_selection.json"
+
+
+def _resolve_fitted_strategy_runtime(
+    config: PaperTradingConfig, spec: PaperTradingSpec, *, feature_names: tuple[str, ...], long_threshold: float, short_threshold: float, target_quantity: float,
+) -> ModelStrategyRuntime:
+    """Resolves a real, already-fitted model for `spec.model_artifact_
+    identity` (the source experiment's own id -- see `eligibility.py`'s
+    `resolved_model_artifact_identity`) and wraps it in `model_strategy.
+    ModelStrategyRuntime`.
+
+    WHICH FOLD'S MODEL: a walk-forward experiment fits one model PER
+    OUTER FOLD, never a single "the" model -- this resolves the model
+    from the HIGHEST-indexed (temporally last, most-training-data) outer
+    fold, a documented, deliberate simplification (Section 39's delivery
+    report classifies this choice explicitly) rather than an unstated
+    assumption. This is NEVER a test-performance-driven "best fold" pick
+    -- it is a pure index rule, independent of any fold's own metrics.
+
+    PINNED, release-audit finding, fixed: `fold_index`/the resolved
+    model's own content hash used to be re-derived from LIVE, mutable
+    `ExecutionManifestStore`/`MLArtifactStore` state on EVERY call --
+    `run-paper-session`, EVERY `resume-paper-session`, and `run-shadow-
+    session` each independently re-ran this exact resolution. Nothing
+    about which fold/model was actually used was ever part of `spec`
+    (hashed into `paper_session_spec_id`) OR recorded anywhere durable,
+    so if the underlying experiment's fold set ever changed between two
+    calls for the SAME session (e.g. an operator re-runs a fold with
+    `--force-rerun-fold`, or a later fold is added), a `resume-paper-
+    session` call could SILENTLY swap in a different fitted model mid-
+    session while `paper_session_spec_id` stayed byte-identical -- the
+    literal defect class Section 4 exists to catch ("the selected fold
+    cannot change without changing identity"). Fixed by pinning the
+    resolved `(experiment_id, fold_index, model_content_hash)` triple to
+    a durable, session-scoped file the FIRST time it is resolved, and
+    fail-closed (`PaperTradingEligibilityError`, before any event is
+    processed) if a later resolution for the SAME `paper_session_id`
+    would pick something different."""
+    experiment_id = spec.model_artifact_identity
+    experiment_manifest = ExperimentManifestStore(config.ml_artifacts_root).load(experiment_id)
+    execution_manifest = ExecutionManifestStore(config.ml_artifacts_root).load(experiment_id)
+    if not execution_manifest.fold_result_references:
+        raise ValueError(f"experiment {experiment_id!r} has no recorded fold results to load a fitted model from")
+    fold_index = max(execution_manifest.fold_result_references)
+    artifact_store = MLArtifactStore(config.ml_artifacts_root)
+    fold_result_ref = execution_manifest.fold_result_references[fold_index]
+    fold_result = FoldResult.from_json_dict(parse_json_strict(artifact_store.read_artifact(fold_result_ref.content_hash).decode("utf-8")))
+    model_ref = next((r for r in fold_result.artifact_references if r.category is ArtifactCategory.MODEL), None)
+    if model_ref is None:
+        raise ValueError(f"fold {fold_index} of experiment {experiment_id!r} has no recorded MODEL artifact")
+
+    paper_session_id = compute_paper_session_spec_id(spec).paper_session_spec_id
+    resolved_pin: dict[str, object] = {"experiment_id": experiment_id, "fold_index": fold_index, "model_content_hash": model_ref.content_hash}
+    pin_path = _paper_session_model_pin_path(config, paper_session_id)
+    if pin_path.is_file():
+        pinned = as_json_dict(read_json_file(pin_path), field_name="resolved_model_selection")
+        if pinned != resolved_pin:
+            raise PaperTradingEligibilityError(
+                f"Resolved model for paper session {paper_session_id!r} has changed since this session began "
+                f"(pinned={pinned!r}, now resolves to={resolved_pin!r}) -- refusing to swap the fitted model mid-session.",
+                context={"paper_session_id": paper_session_id},
+            )
+    else:
+        write_json_atomic(pin_path, resolved_pin)
+
+    model_registry = build_model_registry()
+    model_definition = model_registry.get(experiment_manifest.spec.model_name, experiment_manifest.spec.model_version)
+    _serializer, deserializer = mz.default_serializer_registry()[model_definition.serializer_id]
+    fitted_model = deserializer.deserialize(artifact_store.read_artifact(model_ref.content_hash))
+
+    return ModelStrategyRuntime(
+        strategy_identity=spec.strategy_candidate_identity, fitted_model=fitted_model, feature_names=feature_names,
+        long_threshold=long_threshold, short_threshold=short_threshold, target_quantity=target_quantity,
+    )
+
+
+def _resolve_paper_trading_spec(config: PaperTradingConfig) -> PaperTradingSpec:
+    return config.build()
+
+
+def cmd_create_paper_trading_spec(args: argparse.Namespace) -> int:
+    """Milestone 7: dry-run -- build/validate a `PaperTradingSpec` from
+    `--config` and print its deterministic `paper_session_spec_id`.
+    Writes nothing; does NOT verify eligibility (that happens at session
+    creation, fail-closed)."""
+    config = _load_paper_trading_config(Path(args.config))
+    spec = _resolve_paper_trading_spec(config)
+    identity = compute_paper_session_spec_id(spec)
+    print(f"paper_session_spec_id: {identity.paper_session_spec_id}")
+    print(f"session_mode: {spec.session_mode.value}")
+    print(f"instrument: {spec.instrument.symbol}")
+    print(f"starting_cash: {spec.starting_cash}")
+    print(f"seed: {spec.seed}")
+    print(_NO_LIVE_ORDERS_NOTICE)
+    return 0
+
+
+def cmd_run_paper_session(args: argparse.Namespace) -> int:
+    """Milestone 7: creates (or transparently resumes) a `REPLAY_PAPER`/
+    `FORWARD_PAPER` session and runs it against `--replay-source`'s
+    bounded, pre-validated `MarketEvent` sequence (Section 32). Fails
+    closed before a single event is processed unless the spec's declared
+    `ELIGIBLE_FOR_PAPER_TRADING` chain independently re-verifies."""
+    config = _load_paper_trading_config(Path(args.config))
+    spec = _resolve_paper_trading_spec(config)
+    environment = _paper_trading_runner_environment(config)
+    events = load_replay_events(Path(args.replay_source))
+    strategy_runtime = _resolve_fitted_strategy_runtime(
+        config, spec, feature_names=tuple(args.feature_name), long_threshold=args.long_threshold, short_threshold=args.short_threshold, target_quantity=args.target_quantity,
+    )
+    manifest = run_paper_trading_session(spec, environment=environment, strategy_runtime=strategy_runtime, clock=ReplayClock(), events=events)
+    print(f"paper_session_id: {manifest.paper_session_id}")
+    print(f"stage: {manifest.stage.value}")
+    print(_NO_LIVE_ORDERS_NOTICE)
+    return 0 if manifest.stage is PaperSessionStage.COMPLETED else 2
+
+
+def cmd_resume_paper_session(args: argparse.Namespace) -> int:
+    """Milestone 7: resumes a prior, non-terminal paper session --
+    `--paper-session-id` must already exist (fails otherwise, never
+    silently creates a new one). `--replay-source` must be the SAME
+    deterministic source the original run used for resume to reproduce
+    identical results.
+
+    IDENTITY-BOUND, release-audit finding, fixed: `--paper-session-id`
+    used to be checked ONLY for existence, then completely ignored --
+    the actual session touched below was whatever `compute_paper_
+    session_spec_id(spec)` resolves `--config` to, with no requirement
+    that the two agree. A `--config` that (by drift, typo, or a stale/
+    mismatched file) resolves to a DIFFERENT spec than the one that
+    produced `--paper-session-id` would silently resume (or, if that
+    other id happened not to exist yet, silently CREATE) a completely
+    different session while the operator believed they were resuming
+    the one they named -- the exact identity-binding gap Section 5/8
+    exist to close ("resume cannot cross-load another session's
+    artifacts"). Fixed: fail closed before anything else happens if the
+    two identities disagree."""
+    config = _load_paper_trading_config(Path(args.config))
+    manifest_store = _paper_trading_manifest_store(config)
+    manifest_store.load(args.paper_session_id)  # fails closed if the session does not already exist
+    spec = _resolve_paper_trading_spec(config)
+    resolved_paper_session_id = compute_paper_session_spec_id(spec).paper_session_spec_id
+    if resolved_paper_session_id != args.paper_session_id:
+        raise PaperTradingIdentityError(
+            f"--paper-session-id {args.paper_session_id!r} does not match the session {resolved_paper_session_id!r} that --config resolves to "
+            "-- refusing to resume a different session than the one named.",
+            context={"requested_paper_session_id": args.paper_session_id, "config_resolved_paper_session_id": resolved_paper_session_id},
+        )
+    environment = _paper_trading_runner_environment(config)
+    events = load_replay_events(Path(args.replay_source))
+    strategy_runtime = _resolve_fitted_strategy_runtime(
+        config, spec, feature_names=tuple(args.feature_name), long_threshold=args.long_threshold, short_threshold=args.short_threshold, target_quantity=args.target_quantity,
+    )
+    manifest = run_paper_trading_session(spec, environment=environment, strategy_runtime=strategy_runtime, clock=ReplayClock(), events=events)
+    print(f"paper_session_id: {manifest.paper_session_id}")
+    print(f"stage: {manifest.stage.value}")
+    return 0 if manifest.stage is PaperSessionStage.COMPLETED else 2
+
+
+def cmd_pause_paper_session(args: argparse.Namespace) -> int:
+    """Milestone 7 (Section 23): durably pauses a `RUNNING` paper
+    session -- a subsequent `resume-paper-session` continues from the
+    ledger's own last completed event."""
+    config = _load_paper_trading_config(Path(args.config))
+    environment = _paper_trading_runner_environment(config)
+    manifest = pause_paper_session(environment, args.paper_session_id)
+    print(f"paper_session_id: {manifest.paper_session_id}")
+    print(f"stage: {manifest.stage.value}")
+    return 0
+
+
+def cmd_inspect_paper_session(args: argparse.Namespace) -> int:
+    """Milestone 7: prints a human-readable (or JSON) summary of one
+    paper/shadow session's manifest."""
+    config = _load_paper_trading_config(Path(args.config))
+    manifest = _paper_trading_manifest_store(config).load(args.paper_session_id)
+
+    if args.format == "json":
+        import json
+
+        print(json.dumps(manifest.to_json_dict(), indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    print(f"paper_session_id: {manifest.paper_session_id}")
+    print(f"session_mode: {manifest.session_mode.value}")
+    print(f"stage: {manifest.stage.value}")
+    print(f"created_at: {manifest.created_at}")
+    print(f"updated_at: {manifest.updated_at}")
+    if manifest.completed_at:
+        print(f"completed_at: {manifest.completed_at}")
+    if manifest.failure_category:
+        print(f"failure_category: {manifest.failure_category}")
+        print(f"failure_stage: {manifest.failure_stage}")
+        print(f"failure_recoverable: {manifest.failure_recoverable}")
+    return 0
+
+
+def cmd_report_paper_session(args: argparse.Namespace) -> int:
+    """Milestone 7 (Section 27): prints the 15-summary durable session
+    report (decisions, orders, fills, execution quality, costs,
+    positions, account/equity, drawdown, risk events, rejections, halts,
+    reconciliation, shadow observations). Does NOT run `verify-paper-
+    session` itself (a separate, heavier command) -- `report.verification`
+    is left un-run (`was_run=False`) unless `--verify` is passed."""
+    config = _load_paper_trading_config(Path(args.config))
+    manifest_store = _paper_trading_manifest_store(config)
+    event_store = _paper_trading_event_store(config)
+    manifest = manifest_store.load(args.paper_session_id)
+    spec = _resolve_paper_trading_spec(config)
+    if manifest.session_mode is SessionMode.SHADOW_OBSERVATION:
+        # Release-audit finding, fixed (Section 11): neither report command previously checked the
+        # session's own declared mode -- calling the wrong report command against the wrong session
+        # id silently produced a misleadingly-labeled (but not incorrect) report instead of a clean
+        # error. `report-shadow-session` is the correct command for a SHADOW_OBSERVATION session.
+        # Checked against `manifest.session_mode` (the session's OWN persisted record of what it
+        # actually was created/run as), never `spec.session_mode` (merely what `--config` currently
+        # declares, which could be stale/misconfigured/unrelated to the session actually being asked about).
+        raise PaperTradingStateError(f"paper_session_id={args.paper_session_id!r} is session_mode=shadow_observation -- use 'report-shadow-session', not 'report-paper-session'")
+    ledger = event_store.read_events(args.paper_session_id)
+    reconciliation_report = reconcile_session(ledger, session_id=args.paper_session_id, instrument=spec.instrument, starting_cash=spec.starting_cash)
+    verification_report = None
+    if args.verify:
+        eligibility_environment = _paper_trading_eligibility_environment(config)
+        verification_report = verify_paper_session(spec, manifest=manifest, ledger=ledger, eligibility_environment=eligibility_environment)
+    report = build_paper_session_report(ledger, spec=spec, manifest=manifest, reconciliation_report=reconciliation_report, verification_report=verification_report)
+
+    if args.format == "json":
+        import json
+
+        print(json.dumps(report.to_json_dict(), indent=2, sort_keys=True, allow_nan=False))
+        return 0
+
+    print(f"paper_session_id: {report.session.session_id} ({report.session.session_mode})")
+    print(f"event_count={report.session.event_count} decision_count={report.decisions.decision_count} abstention_count={report.decisions.abstention_count}")
+    print(f"order_count={report.orders.order_count} rejected_count={report.orders.rejected_count} fill_count={report.fills.fill_count}")
+    print(f"starting_cash={report.account_equity.starting_cash} final_equity={report.account_equity.final_equity} net_pnl={report.account_equity.net_pnl}")
+    print(f"total_costs={report.costs.total_costs} maximum_drawdown_fraction={report.drawdown.maximum_drawdown_fraction}")
+    print(f"reconciled={report.reconciliation.is_reconciled} failed_checks={list(report.reconciliation.failed_check_identities)}")
+    if report.verification.was_run:
+        print(f"verification.is_ready={report.verification.is_ready}")
+    print(f"disclaimer: {report.disclaimer}")
+    return 0
+
+
+def cmd_verify_paper_session(args: argparse.Namespace) -> int:
+    """Milestone 7 (Section 26): independently re-verifies spec identity,
+    the full eligibility chain, ledger/manifest integrity, and
+    reconciliation -- never trusting the persisted manifest/report at
+    face value. Returns 2 (not 1) when the report contains any CRITICAL/
+    ERROR issue. See `verification.INDEPENDENCE_CLASSIFICATION` for what
+    is/is not independently re-derived."""
+    config = _load_paper_trading_config(Path(args.config))
+    manifest = _paper_trading_manifest_store(config).load(args.paper_session_id)
+    ledger = _paper_trading_event_store(config).read_events(args.paper_session_id)
+    spec = _resolve_paper_trading_spec(config)
+    eligibility_environment = _paper_trading_eligibility_environment(config)
+    report = verify_paper_session(spec, manifest=manifest, ledger=ledger, eligibility_environment=eligibility_environment)
+    for issue in report.issues:
+        print(f"[{issue.severity.value}] {issue.code}: {issue.message}")
+    print(f"is_ready: {report.is_ready}")
+    return 0 if report.is_ready else 2
+
+
+def cmd_compare_paper_to_backtest(args: argparse.Namespace) -> int:
+    """Milestone 7 (Section 28): diagnostic-only comparison between a
+    paper session and its source backtest's own aggregate metrics.
+    `decision_count`/`abstention_count`/`rejected_order_count` are not
+    concepts a vectorized backtest tracks the same way paper trading
+    does -- they are reported as `0` on the backtest side (a documented
+    simplification), so those three comparisons are EXPECTED to surface
+    as `unexpected_decision_mismatch` and should be read accordingly,
+    never as a defect."""
+    config = _load_paper_trading_config(Path(args.config))
+    manifest = _paper_trading_manifest_store(config).load(args.paper_session_id)
+    spec = _resolve_paper_trading_spec(config)
+    ledger = _paper_trading_event_store(config).read_events(args.paper_session_id)
+    reconciliation_report = reconcile_session(ledger, session_id=args.paper_session_id, instrument=spec.instrument, starting_cash=spec.starting_cash)
+    paper_report = build_paper_session_report(ledger, spec=spec, manifest=manifest, reconciliation_report=reconciliation_report)
+
+    backtest_manifest = BacktestManifestStore(config.ml_artifacts_root).load(args.backtest_id)
+    backtest_report = build_backtest_report_json(backtest_manifest)
+    aggregate_metrics = as_json_dict(backtest_report["aggregate_metrics"], field_name="aggregate_metrics")
+    fold_wise_mean = as_json_dict(aggregate_metrics["fold_wise_mean"], field_name="fold_wise_mean")
+
+    def _metric(name: str) -> float:
+        value = fold_wise_mean.get(name)
+        return float(value) if isinstance(value, (int, float)) else 0.0
+
+    backtest_metrics = BacktestComparisonMetrics(
+        decision_count=0, order_count=0, gross_return=_metric("total_gross_return"), net_return=_metric("total_net_return"),
+        total_costs=_metric("total_cost_notional"), turnover=_metric("turnover_notional_ratio"), max_drawdown_fraction=_metric("maximum_drawdown"),
+        rejected_order_count=0, abstention_count=0,
+    )
+    comparison = compare_paper_to_backtest(backtest_metrics, paper_report, source_backtest_id=args.backtest_id)
+    for metric in comparison.comparisons:
+        print(f"{metric.metric_name}: backtest={metric.backtest_value} paper={metric.paper_value} matches={metric.matches} classification={metric.classification}")
+    print(f"disclaimer: {comparison.disclaimer}")
+    return 0
+
+
+def _require_non_negative_limit(limit: int) -> int:
+    if limit < 0:
+        raise ValueError(f"--limit must be >= 0, got {limit}")
+    return limit
+
+
+def cmd_inspect_paper_orders(args: argparse.Namespace) -> int:
+    """Milestone 7: lists every order this paper session's ledger has
+    recorded, reconstructed from `ORDER_STATE_EVENT` entries alone."""
+    config = _load_paper_trading_config(Path(args.config))
+    _paper_trading_manifest_store(config).load(args.paper_session_id)  # fails closed if the session does not exist
+    ledger = _paper_trading_event_store(config).read_events(args.paper_session_id)
+    orders: dict[str, tuple[dict[str, object], list[OrderStateEvent]]] = {}
+    for entry in ledger:
+        if entry.kind is not LedgerEntryKind.ORDER_STATE_EVENT:
+            continue
+        order_json = entry.payload["order"]
+        state_event = OrderStateEvent.from_json_dict(entry.payload["order_state_event"])  # type: ignore[arg-type]
+        if state_event.order_id not in orders:
+            orders[state_event.order_id] = (order_json, [])  # type: ignore[assignment]
+        orders[state_event.order_id][1].append(state_event)
+    if not orders:
+        print(f"No orders recorded for paper_session_id={args.paper_session_id!r}")
+        return 0
+    limit = _require_non_negative_limit(args.limit)
+    for order_id, (order_json, events) in list(orders.items())[:limit]:
+        final_state: OrderState = resolve_order_state(order_id, events)
+        print(f"order_id={order_id} side={order_json['side']} type={order_json['order_type']} quantity={order_json['quantity']} final_state={final_state.value}")
+    if len(orders) > limit:
+        print(f"... {len(orders) - limit} more order(s) not shown (total={len(orders)}, --limit={limit})")
+    return 0
+
+
+def cmd_inspect_paper_fills(args: argparse.Namespace) -> int:
+    """Milestone 7: lists every `FILL` this paper session's ledger has
+    recorded."""
+    config = _load_paper_trading_config(Path(args.config))
+    _paper_trading_manifest_store(config).load(args.paper_session_id)  # fails closed if the session does not exist
+    ledger = _paper_trading_event_store(config).read_events(args.paper_session_id)
+    fills = [e.payload for e in ledger if e.kind is LedgerEntryKind.FILL]
+    if not fills:
+        print(f"No fills recorded for paper_session_id={args.paper_session_id!r}")
+        return 0
+    limit = _require_non_negative_limit(args.limit)
+    for fill in fills[:limit]:
+        print(f"fill_id={fill['fill_id']} order_id={fill['order_id']} side={fill['side']} quantity={fill['quantity']} price={fill['price']} is_final={fill['is_final']}")
+    if len(fills) > limit:
+        print(f"... {len(fills) - limit} more fill(s) not shown (total={len(fills)}, --limit={limit})")
+    return 0
+
+
+def cmd_inspect_paper_risk_events(args: argparse.Namespace) -> int:
+    """Milestone 7: lists every pre-trade/continuous `RISK_DECISION`
+    batch and every kill-switch `HALT_TRIGGERED` transition this paper
+    session's ledger has recorded."""
+    config = _load_paper_trading_config(Path(args.config))
+    _paper_trading_manifest_store(config).load(args.paper_session_id)  # fails closed if the session does not exist
+    ledger = _paper_trading_event_store(config).read_events(args.paper_session_id)
+    limit = _require_non_negative_limit(args.limit)
+    risk_decisions = [e.payload for e in ledger if e.kind is LedgerEntryKind.RISK_DECISION]
+    halts = [KillSwitchTransitionEvent.from_json_dict(e.payload) for e in ledger if e.kind is LedgerEntryKind.HALT_TRIGGERED]
+    failed_results: list[dict[str, object]] = []
+    for batch in risk_decisions:
+        for raw_result in as_json_list(batch.get("results") or [], field_name="results"):
+            result = as_json_dict(raw_result, field_name="results[]")
+            if not result.get("passed"):
+                failed_results.append(result)
+    print(f"risk_decision_batches: {len(risk_decisions)} (failed_checks={len(failed_results)})")
+    for result in failed_results[:limit]:
+        print(f"  FAILED check={result['check_identity']} measured={result['measured_value']} limit={result['limit']} action={result['action']} reason={result['reason_code']}")
+    if len(failed_results) > limit:
+        print(f"  ... {len(failed_results) - limit} more failed check(s) not shown (--limit={limit})")
+    print(f"kill_switch_transitions: {len(halts)}")
+    for halt in halts[:limit]:
+        print(f"  {halt.from_state.value} -> {halt.to_state.value} trigger={halt.trigger.value} detail={halt.detail!r}")
+    if len(halts) > limit:
+        print(f"  ... {len(halts) - limit} more transition(s) not shown (--limit={limit})")
+    return 0
+
+
+def cmd_inspect_paper_reconciliation(args: argparse.Namespace) -> int:
+    """Milestone 7 (Section 25): runs the 11 independent reconciliation
+    checks against this paper session's ledger and prints every check's
+    pass/fail status."""
+    config = _load_paper_trading_config(Path(args.config))
+    _paper_trading_manifest_store(config).load(args.paper_session_id)  # fails closed if the session does not exist
+    spec = _resolve_paper_trading_spec(config)
+    ledger = _paper_trading_event_store(config).read_events(args.paper_session_id)
+    report = reconcile_session(ledger, session_id=args.paper_session_id, instrument=spec.instrument, starting_cash=spec.starting_cash)
+    for check in report.checks:
+        status = "PASS" if check.passed else "FAIL"
+        print(f"[{status}] {check.check_identity}: expected={check.expected_value!r} observed={check.observed_value!r}")
+    print(f"is_reconciled: {report.is_reconciled}")
+    return 0 if report.is_reconciled else 2
+
+
+def cmd_run_shadow_session(args: argparse.Namespace) -> int:
+    """Milestone 7 (Section 19): creates (or transparently resumes --
+    resume is NOT supported for shadow sessions, see `runner.run_shadow_
+    session`'s own module docstring) a `SHADOW_OBSERVATION` session.
+    Hypothetical orders/fills are recorded; the real simulated account
+    (if this config even has one) is never touched."""
+    config = _load_paper_trading_config(Path(args.config))
+    spec = _resolve_paper_trading_spec(config)
+    environment = _paper_trading_runner_environment(config)
+    events = load_replay_events(Path(args.replay_source))
+    strategy_runtime = _resolve_fitted_strategy_runtime(
+        config, spec, feature_names=tuple(args.feature_name), long_threshold=args.long_threshold, short_threshold=args.short_threshold, target_quantity=args.target_quantity,
+    )
+    manifest = run_shadow_session(spec, environment=environment, strategy_runtime=strategy_runtime, clock=ReplayClock(), events=events)
+    print(f"paper_session_id: {manifest.paper_session_id}")
+    print(f"stage: {manifest.stage.value}")
+    print(_NO_LIVE_ORDERS_NOTICE)
+    return 0 if manifest.stage is PaperSessionStage.COMPLETED else 2
+
+
+def cmd_report_shadow_session(args: argparse.Namespace) -> int:
+    """Milestone 7 (Section 19): prints the SHADOW-labeled observation
+    summary only (hypothetical order/fill counts, counterfactual realized
+    P&L) -- never folded into any real-account figure, exactly matching
+    `reports.ShadowObservationSummary`'s own field-naming discipline."""
+    config = _load_paper_trading_config(Path(args.config))
+    manifest = _paper_trading_manifest_store(config).load(args.paper_session_id)
+    spec = _resolve_paper_trading_spec(config)
+    if manifest.session_mode is not SessionMode.SHADOW_OBSERVATION:
+        # Same release-audit fix as `cmd_report_paper_session`'s own -- see that function's comment.
+        raise PaperTradingStateError(f"paper_session_id={args.paper_session_id!r} is session_mode={manifest.session_mode.value!r}, not shadow_observation -- use 'report-paper-session', not 'report-shadow-session'")
+    ledger = _paper_trading_event_store(config).read_events(args.paper_session_id)
+    reconciliation_report = reconcile_session(ledger, session_id=args.paper_session_id, instrument=spec.instrument, starting_cash=spec.starting_cash)
+    report = build_paper_session_report(ledger, spec=spec, manifest=manifest, reconciliation_report=reconciliation_report)
+    print(f"paper_session_id: {report.session.session_id} (SHADOW_OBSERVATION)")
+    print(f"observation_count={report.shadow.observation_count} observations_with_hypothetical_fill_count={report.shadow.observations_with_hypothetical_fill_count}")
+    print(f"total_counterfactual_realized_pnl={report.shadow.total_counterfactual_realized_pnl}")
+    print(f"disclaimer: {report.disclaimer}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m quant_platform.ml_cli",
@@ -2032,6 +2577,118 @@ def build_parser() -> argparse.ArgumentParser:
     compare_strategy_candidates_parser.add_argument("--config", required=True)
     compare_strategy_candidates_parser.add_argument("--robustness-id", required=True, action="append", help="May be passed more than once, one per candidate to compare.")
     compare_strategy_candidates_parser.set_defaults(handler=cmd_compare_strategy_candidates)
+
+    def _add_strategy_runtime_arguments(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--replay-source", required=True, help="Path to a bounded, deterministic JSONL replay source (Section 32).")
+        p.add_argument("--feature-name", required=True, action="append", help="One supported feature name (repeatable); must cover the fitted model's own declared feature schema.")
+        p.add_argument("--long-threshold", type=float, default=0.6, help="p_positive >= this fires a LONG decision. Must be in (0.5, 1.0].")
+        p.add_argument("--short-threshold", type=float, default=0.4, help="p_positive <= this fires a SHORT decision. Must be in [0.0, 0.5).")
+        p.add_argument("--target-quantity", type=float, default=1.0, help="Fixed order quantity for every non-abstain decision.")
+
+    create_paper_spec_parser = subparsers.add_parser(
+        "create-paper-trading-spec", help="Milestone 7: dry-run -- build/validate a PaperTradingSpec from --config and print its paper_session_spec_id. Writes nothing.",
+    )
+    create_paper_spec_parser.add_argument("--config", required=True)
+    create_paper_spec_parser.set_defaults(handler=cmd_create_paper_trading_spec)
+
+    run_paper_session_parser = subparsers.add_parser(
+        "run-paper-session", help="Milestone 7: create (or transparently resume) and run a REPLAY_PAPER/FORWARD_PAPER session against a bounded replay source. No live order is ever sent.",
+    )
+    run_paper_session_parser.add_argument("--config", required=True)
+    _add_strategy_runtime_arguments(run_paper_session_parser)
+    run_paper_session_parser.set_defaults(handler=cmd_run_paper_session)
+
+    resume_paper_session_parser = subparsers.add_parser(
+        "resume-paper-session", help="Milestone 7: resume a prior, non-terminal paper session -- fails if --paper-session-id does not already exist.",
+    )
+    resume_paper_session_parser.add_argument("--config", required=True)
+    resume_paper_session_parser.add_argument("--paper-session-id", required=True)
+    _add_strategy_runtime_arguments(resume_paper_session_parser)
+    resume_paper_session_parser.set_defaults(handler=cmd_resume_paper_session)
+
+    pause_paper_session_parser = subparsers.add_parser(
+        "pause-paper-session", help="Milestone 7: durably pause a RUNNING paper session.",
+    )
+    pause_paper_session_parser.add_argument("--config", required=True)
+    pause_paper_session_parser.add_argument("--paper-session-id", required=True)
+    pause_paper_session_parser.set_defaults(handler=cmd_pause_paper_session)
+
+    inspect_paper_session_parser = subparsers.add_parser(
+        "inspect-paper-session", help="Milestone 7: print a human-readable (or JSON) paper/shadow session manifest summary.",
+    )
+    inspect_paper_session_parser.add_argument("--config", required=True)
+    inspect_paper_session_parser.add_argument("--paper-session-id", required=True)
+    inspect_paper_session_parser.add_argument("--format", choices=["text", "json"], default="text")
+    inspect_paper_session_parser.set_defaults(handler=cmd_inspect_paper_session)
+
+    report_paper_session_parser = subparsers.add_parser(
+        "report-paper-session", help="Milestone 7: print the 15-summary durable session report (Section 27).",
+    )
+    report_paper_session_parser.add_argument("--config", required=True)
+    report_paper_session_parser.add_argument("--paper-session-id", required=True)
+    report_paper_session_parser.add_argument("--format", choices=["text", "json"], default="text")
+    report_paper_session_parser.add_argument("--verify", action="store_true", help="Also run verify-paper-session and include its outcome in the report.")
+    report_paper_session_parser.set_defaults(handler=cmd_report_paper_session)
+
+    verify_paper_session_parser = subparsers.add_parser(
+        "verify-paper-session", help="Milestone 7: independently re-verify spec identity, eligibility chain, ledger/manifest integrity, and reconciliation (Section 26).",
+    )
+    verify_paper_session_parser.add_argument("--config", required=True)
+    verify_paper_session_parser.add_argument("--paper-session-id", required=True)
+    verify_paper_session_parser.set_defaults(handler=cmd_verify_paper_session)
+
+    compare_paper_to_backtest_parser = subparsers.add_parser(
+        "compare-paper-to-backtest", help="Milestone 7: diagnostic-only comparison between a paper session and its source backtest's aggregate metrics (Section 28).",
+    )
+    compare_paper_to_backtest_parser.add_argument("--config", required=True)
+    compare_paper_to_backtest_parser.add_argument("--paper-session-id", required=True)
+    compare_paper_to_backtest_parser.add_argument("--backtest-id", required=True)
+    compare_paper_to_backtest_parser.set_defaults(handler=cmd_compare_paper_to_backtest)
+
+    inspect_paper_orders_parser = subparsers.add_parser(
+        "inspect-paper-orders", help="Milestone 7: list every order a paper session's ledger has recorded.",
+    )
+    inspect_paper_orders_parser.add_argument("--config", required=True)
+    inspect_paper_orders_parser.add_argument("--paper-session-id", required=True)
+    inspect_paper_orders_parser.add_argument("--limit", type=int, default=_DEFAULT_INSPECTION_ROW_LIMIT, help=f"Maximum rows to print (default {_DEFAULT_INSPECTION_ROW_LIMIT}); a long-running session's own order count is unbounded, this is a terminal/operator-safety cap, never a data-loss risk (the full ledger is untouched).")
+    inspect_paper_orders_parser.set_defaults(handler=cmd_inspect_paper_orders)
+
+    inspect_paper_fills_parser = subparsers.add_parser(
+        "inspect-paper-fills", help="Milestone 7: list every fill a paper session's ledger has recorded.",
+    )
+    inspect_paper_fills_parser.add_argument("--config", required=True)
+    inspect_paper_fills_parser.add_argument("--paper-session-id", required=True)
+    inspect_paper_fills_parser.add_argument("--limit", type=int, default=_DEFAULT_INSPECTION_ROW_LIMIT, help=f"Maximum rows to print (default {_DEFAULT_INSPECTION_ROW_LIMIT}).")
+    inspect_paper_fills_parser.set_defaults(handler=cmd_inspect_paper_fills)
+
+    inspect_paper_risk_events_parser = subparsers.add_parser(
+        "inspect-paper-risk-events", help="Milestone 7: list every risk-check failure and kill-switch transition a paper session's ledger has recorded.",
+    )
+    inspect_paper_risk_events_parser.add_argument("--config", required=True)
+    inspect_paper_risk_events_parser.add_argument("--paper-session-id", required=True)
+    inspect_paper_risk_events_parser.add_argument("--limit", type=int, default=_DEFAULT_INSPECTION_ROW_LIMIT, help=f"Maximum rows to print per section (default {_DEFAULT_INSPECTION_ROW_LIMIT}).")
+    inspect_paper_risk_events_parser.set_defaults(handler=cmd_inspect_paper_risk_events)
+
+    inspect_paper_reconciliation_parser = subparsers.add_parser(
+        "inspect-paper-reconciliation", help="Milestone 7: run the 11 independent reconciliation checks against a paper session's ledger (Section 25).",
+    )
+    inspect_paper_reconciliation_parser.add_argument("--config", required=True)
+    inspect_paper_reconciliation_parser.add_argument("--paper-session-id", required=True)
+    inspect_paper_reconciliation_parser.set_defaults(handler=cmd_inspect_paper_reconciliation)
+
+    run_shadow_session_parser = subparsers.add_parser(
+        "run-shadow-session", help="Milestone 7: create and run a SHADOW_OBSERVATION session. Hypothetical only -- never touches a real simulated account.",
+    )
+    run_shadow_session_parser.add_argument("--config", required=True)
+    _add_strategy_runtime_arguments(run_shadow_session_parser)
+    run_shadow_session_parser.set_defaults(handler=cmd_run_shadow_session)
+
+    report_shadow_session_parser = subparsers.add_parser(
+        "report-shadow-session", help="Milestone 7: print the SHADOW-labeled observation summary only -- never folded into any real-account figure.",
+    )
+    report_shadow_session_parser.add_argument("--config", required=True)
+    report_shadow_session_parser.add_argument("--paper-session-id", required=True)
+    report_shadow_session_parser.set_defaults(handler=cmd_report_shadow_session)
 
     return parser
 
