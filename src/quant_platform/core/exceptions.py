@@ -1045,3 +1045,139 @@ class ExecutionSessionLockError(ExecutionGatewayError):
     """Raised when a second writer attempts to run/resume the same
     `execution_session_id` concurrently, or two workers race to dispatch
     the same pending command."""
+
+
+# --------------------------------------------------------------------------
+# Portfolio risk and capital management engine (Milestone 9)
+# --------------------------------------------------------------------------
+class PortfolioRiskError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.portfolio_risk`.
+    This package is TEST-ONLY: it never opens a network connection, never
+    imports a broker SDK, never defines a credential field, and never
+    claims profitability, broker readiness, or live-trading readiness.
+    Every risk authorization it produces gates deterministic, in-process
+    dispatch decisions only -- it never itself transmits an order. Unknown
+    or incomplete risk state always fails CLOSED (denied/halted), never
+    silently approved."""
+
+
+class PortfolioRiskPolicyError(PortfolioRiskError):
+    """Raised when a `PortfolioRiskPolicy` or `PortfolioRiskSpec` is
+    structurally invalid: a non-finite/non-positive limit, a fraction
+    outside its legal range, or a malformed low-level Decimal/identity
+    primitive shared across this package's models."""
+
+
+class PortfolioRiskSpecIdentityError(PortfolioRiskError):
+    """Raised when a `portfolio_risk_spec_id` cannot be computed, or a
+    provided spec does not reproduce the identity it is being verified
+    against."""
+
+
+class PortfolioSnapshotValidationError(PortfolioRiskError):
+    """Raised when a `PortfolioSnapshot` (or an embedded `PositionSnapshot`)
+    is structurally invalid or internally incoherent: a duplicate
+    instrument/strategy position identity, a negative gross exposure, an
+    equity figure that does not reconcile with cash and position
+    valuation under the documented accounting model, or a non-Decimal/
+    non-finite monetary or quantity field."""
+
+
+class StalePortfolioSnapshotError(PortfolioRiskError):
+    """Raised when a `PortfolioSnapshot` is older, relative to a caller-
+    supplied reference time, than `PortfolioRiskPolicy.
+    maximum_portfolio_snapshot_age` permits. Staleness is always judged
+    against an explicit caller-supplied reference time -- never an
+    internal wall-clock read."""
+
+
+class StalePriceError(PortfolioRiskError):
+    """Raised when a `PriceSnapshot` is older, relative to a caller-
+    supplied reference time, than `PortfolioRiskPolicy.maximum_price_age`
+    permits, or when a `PriceSnapshot` is structurally invalid (bid > ask,
+    a non-positive price)."""
+
+
+class ExposureCalculationError(PortfolioRiskError):
+    """Raised when instrument/strategy/portfolio gross or net exposure
+    cannot be derived safely from a `PortfolioSnapshot` -- e.g. a position
+    referencing a price/contract multiplier that is missing or
+    non-finite. Exposure is always DERIVED, never independently trusted
+    from a stored figure."""
+
+
+class PositionSizingError(PortfolioRiskError):
+    """Raised when a `PositionSizeProposal` or `CapitalAllocation` is
+    structurally invalid: a non-positive proposed quantity/reference
+    price, or utilized capital exceeding allocated capital."""
+
+
+class RiskEvaluationError(PortfolioRiskError):
+    """Raised when a `RiskEvaluationRequest` cannot be safely evaluated at
+    all -- as opposed to an ordinary `RiskDecision` with kind=DENIED,
+    which is ALWAYS a valid, structurally sound outcome, never this
+    exception. Incomplete or contradictory evaluation inputs fail closed
+    via this exception, never a silent APPROVED."""
+
+
+class RiskDenialError(PortfolioRiskError):
+    """Raised by a caller that asked a DENIED/HALTED `RiskDecision` to
+    raise rather than merely be returned/reported -- the decision object
+    itself never raises on construction; denial is always a normal,
+    valid, structurally complete outcome."""
+
+
+class RiskAuthorizationIdentityError(PortfolioRiskError):
+    """Raised when a `risk_authorization_id` cannot be computed, or a
+    provided `RiskAuthorization` does not reproduce the identity it is
+    being verified against."""
+
+
+class RiskAuthorizationMismatchError(PortfolioRiskError):
+    """Raised when a `RiskAuthorization` is checked against an execution
+    intent, session, portfolio snapshot, price snapshot, policy, quantity,
+    or price it was not actually issued for. A `RiskAuthorization` binds
+    to the EXACT tuple of fields captured in its own content identity --
+    it is never valid for a different one, even one that differs in only
+    a single field."""
+
+
+class RiskAuthorizationReuseError(PortfolioRiskError):
+    """Raised when a `RiskAuthorization` already consumed (per a future
+    phase's durable single-use ledger) is presented again to gate a
+    second dispatch. `RiskAuthorizationStatus`'s legal-transition table
+    (ISSUED -> CONSUMED, terminal) exists specifically so this can be
+    enforced safely once that ledger is added -- Phase 1 defines the
+    vocabulary and transition rules only; no consumption ledger exists
+    yet."""
+
+
+class PortfolioHaltError(PortfolioRiskError):
+    """Raised to signal a portfolio-level halt -- the risk engine's own
+    typed escalation for a `RiskDecisionKind.HALTED` outcome, never a
+    silent no-op."""
+
+
+class PortfolioRiskReconciliationError(PortfolioRiskError):
+    """Raised when portfolio-risk-side reconciliation (a future phase)
+    cannot complete structurally, as opposed to an ordinary reconciliation
+    finding, which is a normal, expected, non-raising outcome."""
+
+
+class PortfolioRiskVerificationError(PortfolioRiskError):
+    """Raised by a future phase's independent verification pass (or a
+    caller consuming its report) when a FATAL cross-consistency check
+    fails and the caller has asked for that to raise rather than merely
+    be reported as an issue."""
+
+
+class PortfolioRiskPersistenceError(PortfolioRiskError):
+    """Raised when a durable portfolio-risk artifact (a future phase's
+    ledger record, snapshot, or report) cannot be read, decoded, or
+    reconstructed safely."""
+
+
+class PortfolioRiskRecoveryError(PortfolioRiskError):
+    """Raised when a future phase's crash recovery cannot safely
+    reconstruct portfolio-risk state from durable evidence -- surfaced
+    rather than guessed."""
