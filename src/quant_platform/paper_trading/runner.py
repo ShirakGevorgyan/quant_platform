@@ -73,6 +73,8 @@ from datetime import datetime
 
 from quant_platform.backtesting.models import PositionDirection
 from quant_platform.core.exceptions import PaperTradingStateError
+from quant_platform.core.json import canonical_json_bytes
+from quant_platform.ml.models import ArtifactCategory
 from quant_platform.ml.persistence import format_utc_timestamp, utc_now
 from quant_platform.paper_trading.accounting import apply_mark_to_position, flat_position
 from quant_platform.paper_trading.clock import Clock, decision_time_for
@@ -243,14 +245,23 @@ def create_paper_session(spec: PaperTradingSpec, *, environment: RunnerEnvironme
     -- raises if not eligible), acquire the session lock and initialize
     the manifest at `CREATED` -> `ELIGIBILITY_VERIFIED`. Idempotent: if a
     manifest already exists for this spec's identity, returns it
-    unchanged rather than re-verifying eligibility."""
+    unchanged rather than re-verifying eligibility.
+
+    Persists `spec` itself as a durable, content-addressed
+    `PAPER_TRADING_SPEC` artifact and records the resulting reference on
+    the manifest -- this is what lets a downstream consumer (Milestone
+    8's execution gateway paper bridge) recover the full spec from just a
+    `paper_session_id` later, and lets it cross-check the reference's own
+    `content_hash` against an independently-declared identity, rather
+    than needing the caller to already have the spec object in hand."""
     paper_session_id = compute_paper_session_spec_id(spec).paper_session_spec_id
     existing = environment.manifest_store.load_if_exists(paper_session_id)
     if existing is not None:
         return existing
 
     require_paper_trading_eligibility(spec, environment=environment.eligibility_environment)
-    environment.manifest_store.create(paper_session_id=paper_session_id, session_mode=spec.session_mode, spec_reference=None)
+    spec_reference = environment.eligibility_environment.artifact_store.write_artifact(canonical_json_bytes(spec.to_json_dict()), category=ArtifactCategory.PAPER_TRADING_SPEC)
+    environment.manifest_store.create(paper_session_id=paper_session_id, session_mode=spec.session_mode, spec_reference=spec_reference)
     return _transition_with_ledger_entry(
         environment, paper_session_id, from_stage=PaperSessionStage.CREATED, target_stage=PaperSessionStage.ELIGIBILITY_VERIFIED, event_time=utc_now().to_pydatetime(),
     )

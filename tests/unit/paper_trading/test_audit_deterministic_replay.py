@@ -30,6 +30,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,6 +43,7 @@ from quant_platform.backtesting.models import (
 )
 from quant_platform.backtesting.specs import CommissionSpec, FinancingSpec, SlippageSpec, SpreadSpec
 from quant_platform.core.types import Timeframe
+from quant_platform.ml.artifacts import MLArtifactStore
 from quant_platform.paper_trading.clock import ReplayClock
 from quant_platform.paper_trading.events import create_bar_event
 from quant_platform.paper_trading.manifests import PaperSessionManifestStore
@@ -147,9 +149,17 @@ class _FixedDirectionStrategy:
 
 
 def _environment(tmp_path) -> RunnerEnvironment:
+    """`eligibility_environment` is a minimal stub exposing only
+    `.artifact_store` -- see this file's own autouse eligibility-bypass
+    fixture; `create_paper_session` persists the spec via `environment.
+    eligibility_environment.artifact_store` directly (a real defect
+    found and fixed during Milestone 8 acceptance testing), so a genuine
+    `MLArtifactStore` must be reachable here even though eligibility
+    itself is mocked out."""
     manifest_store = PaperSessionManifestStore(tmp_path)
     event_store = PaperSessionEventStore(tmp_path)
-    return RunnerEnvironment(manifest_store=manifest_store, event_store=event_store, eligibility_environment=None)  # type: ignore[arg-type]
+    eligibility_environment = SimpleNamespace(artifact_store=MLArtifactStore(tmp_path))
+    return RunnerEnvironment(manifest_store=manifest_store, event_store=event_store, eligibility_environment=eligibility_environment)  # type: ignore[arg-type]
 
 
 def _run(tmp_path) -> tuple[str, list]:
@@ -274,11 +284,13 @@ class TestSeparateProcessDifferentHashSeedDeterminism:
         script.write_text(
             "import sys\n"
             "from datetime import datetime, timedelta, timezone\n"
+            "from types import SimpleNamespace\n"
             "from quant_platform.backtesting.models import CommissionModelKind, FinancingModelKind, PositionDirection, SlippageModelKind, SpreadModelKind\n"
             "from quant_platform.backtesting.specs import CommissionSpec, FinancingSpec, SlippageSpec, SpreadSpec\n"
             "from quant_platform.core.types import Timeframe\n"
             "from quant_platform.paper_trading.clock import ReplayClock\n"
             "from quant_platform.paper_trading.events import create_bar_event\n"
+            "from quant_platform.ml.artifacts import MLArtifactStore\n"
             "from quant_platform.paper_trading.manifests import PaperSessionManifestStore\n"
             "from quant_platform.paper_trading.models import ClockMode, MarketEventMode, PartialFillPolicyKind, SessionMode\n"
             "from quant_platform.paper_trading.persistence import PaperSessionEventStore, compute_ledger_semantic_digest\n"
@@ -303,7 +315,8 @@ class TestSeparateProcessDifferentHashSeedDeterminism:
             "out_dir = sys.argv[1]\n"
             "manifest_store = PaperSessionManifestStore(out_dir)\n"
             "event_store = PaperSessionEventStore(out_dir)\n"
-            "environment = RunnerEnvironment(manifest_store=manifest_store, event_store=event_store, eligibility_environment=None)\n"
+            "eligibility_environment = SimpleNamespace(artifact_store=MLArtifactStore(out_dir))\n"
+            "environment = RunnerEnvironment(manifest_store=manifest_store, event_store=event_store, eligibility_environment=eligibility_environment)\n"
             "run_paper_trading_session(spec, environment=environment, strategy_runtime=_Strategy(), clock=ReplayClock(), events=events)\n"
             "paper_session_id = compute_paper_session_spec_id(spec).paper_session_spec_id\n"
             "digest = compute_ledger_semantic_digest(event_store.read_events(paper_session_id))\n"

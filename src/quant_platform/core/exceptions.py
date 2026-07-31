@@ -888,3 +888,160 @@ class ResumeError(PaperTradingError):
     exists, the manifest already reached a terminal, non-recoverable
     stage, or a provided `PaperTradingSpec` does not reproduce the
     `paper_session_spec_id` being resumed."""
+
+
+# --------------------------------------------------------------------------
+# Broker-neutral deterministic execution gateway (Milestone 8)
+# --------------------------------------------------------------------------
+class ExecutionGatewayError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.execution_gateway`.
+    This package is TEST-ONLY: it never transmits an order to a broker,
+    exchange, MT5 terminal, or any live-trading API. Every execution in
+    this package is dispatched to a deterministic, in-process dummy
+    broker adapter only -- there is no network client, no broker
+    credential field, no MT5/FxPro/real-broker adapter, and no `LIVE`
+    execution mode anywhere in this package."""
+
+
+class ExecutionGatewaySpecError(ExecutionGatewayError):
+    """Raised when an `ExecutionGatewaySpec` (or an embedded policy) is
+    structurally invalid: a non-finite/non-positive numeric field, an
+    unsupported enum value, a live/non-dummy adapter value, or a
+    cross-artifact identity mismatch. Never silently repaired."""
+
+
+class ExecutionGatewayIdentityError(ExecutionGatewayError):
+    """Raised when an `execution_gateway_spec_id`/`execution_session_id`
+    cannot be computed, or a provided spec does not reproduce the
+    identity being resumed/verified against."""
+
+
+class ExecutionGatewayEligibilityError(ExecutionGatewayError):
+    """Raised when the source Milestone 7 paper session's eligibility
+    chain, verified session report, or execution authorization cannot be
+    established. An execution session must NEVER start or resume without
+    this check passing."""
+
+
+class ExecutionGatewayStateError(ExecutionGatewayError):
+    """Raised for an illegal `ExecutionSessionStage` transition, or an
+    attempt to mutate an already-terminal execution session manifest."""
+
+
+class ExecutionGatewayManifestError(ExecutionGatewayError):
+    """Raised when an `ExecutionSessionManifest` is structurally invalid
+    or references an artifact kind this package does not recognize."""
+
+
+class ExecutionGatewayArtifactError(ExecutionGatewayError):
+    """Raised when a durable execution-gateway artifact (ledger record,
+    snapshot, report) cannot be read, decoded, or reconstructed safely."""
+
+
+class ExecutionGatewayVerificationError(ExecutionGatewayError):
+    """Raised by `execution_gateway.verification.verify_execution_session`
+    (or a caller consuming its report) when a FATAL cross-consistency
+    check fails and the caller has asked for that to raise rather than
+    merely be reported as an issue."""
+
+
+class ExecutionIntentError(ExecutionGatewayError):
+    """Raised when an `ExecutionIntent` is structurally invalid, or when
+    the paper-session bridge cannot establish that an intent's economic
+    fields genuinely match its declared source paper order."""
+
+
+class ExecutionCommandError(ExecutionGatewayError):
+    """Base class for command-model failures."""
+
+
+class ExecutionCommandValidationError(ExecutionCommandError):
+    """Raised when a command is structurally invalid or violates a
+    pre-dispatch policy: a missing required price, an unsupported
+    order/time-in-force combination, or an inconsistent close/reduce-only
+    combination."""
+
+
+class ExecutionCommandDispatchError(ExecutionCommandError):
+    """Raised when a command definitely could not be dispatched (a
+    capability check failed closed before any adapter call, or the
+    adapter synchronously and unambiguously refused the call)."""
+
+
+class ExecutionCommandAmbiguousError(ExecutionCommandError):
+    """Raised to signal that whether a command was accepted by the broker
+    is genuinely UNKNOWN -- callers must resolve via query/reconciliation,
+    never by blindly retrying a non-idempotent operation."""
+
+
+class ExecutionOrderStateError(ExecutionGatewayError):
+    """Raised for an illegal `ExecutionOrderState` transition, or an
+    attempt to reconstruct an aggregate from a durable event history that
+    does not chain legally."""
+
+
+class ExecutionFillError(ExecutionGatewayError):
+    """Raised when an `ExecutionFill` is structurally invalid: non-positive
+    quantity/price/contract multiplier, a gross-notional mismatch, or an
+    attempt to double-count an already-recorded broker fill."""
+
+
+class BrokerEventError(ExecutionGatewayError):
+    """Raised when a normalized broker event is structurally invalid or
+    cannot be classified against the order/command it claims to belong
+    to."""
+
+
+class BrokerEventSequenceError(BrokerEventError):
+    """Raised for a broker-sequence violation this package's active
+    `SequencingPolicy` classifies as CRITICAL rather than an ordinary,
+    recoverable gap/out-of-order condition: a conflicting event reusing
+    an already-used sequence number, or a same-ID event with a changed
+    payload."""
+
+
+class BrokerCapabilityError(ExecutionGatewayError):
+    """Raised when a command would require an `AdapterCapabilities` flag
+    the active adapter does not declare -- capability checks fail closed
+    before dispatch, never silently downgrading requested semantics."""
+
+
+class BrokerSnapshotError(ExecutionGatewayError):
+    """Raised when a broker order/position/account snapshot is
+    structurally invalid or cannot be attributed to the requesting
+    execution session."""
+
+
+class ExecutionIdempotencyError(ExecutionGatewayError):
+    """Raised when the same `command_id`/`client_order_id`/
+    `broker_event_id` is presented with a payload that differs from the
+    durable evidence already on record -- never silently overwritten or
+    merged."""
+
+
+class ExecutionRecoveryError(ExecutionGatewayError):
+    """Raised when deterministic crash recovery cannot safely reconstruct
+    execution-session state from the spec, manifest, ledger, and broker
+    snapshots -- surfaced rather than guessed."""
+
+
+class ExecutionReconciliationError(ExecutionGatewayError):
+    """Raised when internal/broker/ledger reconciliation cannot complete
+    structurally (as opposed to an ordinary `ReconciliationIssue`, which
+    is a normal, expected outcome even for corrupted state)."""
+
+
+class ExecutionHealthError(ExecutionGatewayError):
+    """Raised when adapter health cannot be evaluated safely, or a
+    command is attempted while health policy forbids it."""
+
+
+class ExecutionHaltError(ExecutionGatewayError):
+    """Raised to signal a kill-switch-driven dispatch refusal -- the
+    execution gateway's own typed escalation, never a silent no-op."""
+
+
+class ExecutionSessionLockError(ExecutionGatewayError):
+    """Raised when a second writer attempts to run/resume the same
+    `execution_session_id` concurrently, or two workers race to dispatch
+    the same pending command."""

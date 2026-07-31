@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,6 +60,7 @@ from quant_platform.backtesting.models import (
 )
 from quant_platform.backtesting.specs import CommissionSpec, FinancingSpec, SlippageSpec, SpreadSpec
 from quant_platform.core.types import Timeframe
+from quant_platform.ml.artifacts import MLArtifactStore
 from quant_platform.paper_trading.clock import ReplayClock
 from quant_platform.paper_trading.events import create_bar_event
 from quant_platform.paper_trading.manifests import PaperSessionManifestStore
@@ -187,9 +189,18 @@ class _FixedDirectionStrategy:
 
 
 def _environment(tmp_path) -> RunnerEnvironment:
+    """`eligibility_environment` is a minimal stub exposing only
+    `.artifact_store` -- `require_paper_trading_eligibility` itself is
+    monkeypatched to a no-op by this file's own autouse fixture, but
+    `create_paper_session` also persists the spec via `environment.
+    eligibility_environment.artifact_store` directly (Milestone 8's own
+    paper-bridge read-back needs a real, durable `spec_reference` --
+    a real defect found and fixed during Milestone 8 acceptance
+    testing), so a genuine `MLArtifactStore` must be reachable here too."""
     manifest_store = PaperSessionManifestStore(tmp_path)
     event_store = PaperSessionEventStore(tmp_path)
-    return RunnerEnvironment(manifest_store=manifest_store, event_store=event_store, eligibility_environment=None)  # type: ignore[arg-type]
+    eligibility_environment = SimpleNamespace(artifact_store=MLArtifactStore(tmp_path))
+    return RunnerEnvironment(manifest_store=manifest_store, event_store=event_store, eligibility_environment=eligibility_environment)  # type: ignore[arg-type]
 
 
 def _seed_working_limit_order_prefix(environment: RunnerEnvironment, spec: PaperTradingSpec, *, side: OrderSide, limit_price: float, quantity: float, first_bar) -> str:

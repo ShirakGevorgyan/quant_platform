@@ -91,16 +91,18 @@ def ml_config_walk_forward(tmp_path: Path) -> Path:
 
 
 class TestBuildParser:
-    def test_all_seventy_commands_registered(self) -> None:
+    def test_all_eighty_six_commands_registered(self) -> None:
         """19 Milestone 4A-4C commands, 9 Milestone 4D optimization
         commands, 8 Milestone 4E calibration commands, 8 Milestone 5
         backtest commands, 2 Milestone 5.2 Section 6 lock-recovery
-        commands, 10 Milestone 6 robustness/promotion commands, and 14
-        Milestone 7 paper-trading/shadow-execution commands, all
-        registered on the one shared `ml_cli.py` parser. No command name
-        anywhere in this set resembles live order transmission -- see
-        `test_safety_scan.py::TestCliHasNoLiveCommands` for the explicit
-        negative check (`run-live`/`submit-live-order`/`connect-broker`/
+        commands, 10 Milestone 6 robustness/promotion commands, 14
+        Milestone 7 paper-trading/shadow-execution commands, and 16
+        Milestone 8 execution-gateway commands, all registered on the one
+        shared `ml_cli.py` parser. No command name anywhere in this set
+        resembles live order transmission -- see
+        `test_safety_scan.py::TestCliHasNoLiveCommands` and
+        `test_execution_gateway_safety_scan.py` for the explicit negative
+        checks (`run-live`/`submit-live-order`/`connect-broker`/
         `execute-mt5`/`deploy-live`)."""
         parser = build_parser()
         subparsers_action = next(a for a in parser._actions if a.dest == "command")
@@ -123,6 +125,12 @@ class TestBuildParser:
             "inspect-paper-session", "report-paper-session", "verify-paper-session", "compare-paper-to-backtest",
             "inspect-paper-orders", "inspect-paper-fills", "inspect-paper-risk-events", "inspect-paper-reconciliation",
             "run-shadow-session", "report-shadow-session",
+            "create-execution-gateway-spec", "run-dummy-execution-session", "resume-execution-session",
+            "pause-execution-session", "inspect-execution-session", "report-execution-session",
+            "verify-execution-session", "replay-execution-session", "compare-execution-to-paper",
+            "inspect-execution-orders", "inspect-execution-commands", "inspect-execution-fills",
+            "inspect-execution-intents", "inspect-broker-events", "inspect-execution-health",
+            "inspect-execution-reconciliation",
         }
 
 

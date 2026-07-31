@@ -168,11 +168,13 @@ from quant_platform.calibration.specs import CalibrationSpec, compute_calibratio
 from quant_platform.calibration.verification import verify_calibration
 from quant_platform.config.backtesting_schemas import BacktestConfig
 from quant_platform.config.calibration_schemas import CalibrationConfig
+from quant_platform.config.execution_gateway_schemas import ExecutionGatewayConfigSchema
 from quant_platform.config.ml_schemas import MLExperimentConfig
 from quant_platform.config.optimization_schemas import OptimizationConfig
 from quant_platform.config.paper_trading_schemas import PaperTradingConfig
 from quant_platform.config.robustness_schemas import RobustnessConfig
 from quant_platform.core.exceptions import (
+    ExecutionGatewayIdentityError,
     PaperTradingEligibilityError,
     PaperTradingIdentityError,
     PaperTradingStateError,
@@ -188,6 +190,30 @@ from quant_platform.execution.splitters import reconstruct_dataset_timeline
 from quant_platform.execution.state_machine import ExecutionStage
 from quant_platform.execution.timeline import Timeline
 from quant_platform.execution.verification import verify_execution
+from quant_platform.execution_gateway.dummy_broker import DeterministicDummyBrokerAdapter
+from quant_platform.execution_gateway.events import BrokerEvent
+from quant_platform.execution_gateway.manifests import ExecutionSessionManifestStore
+from quant_platform.execution_gateway.models import ExecutionLedgerEntryKind, ExecutionSessionStage
+from quant_platform.execution_gateway.paper_bridge import PaperBridgeEnvironment
+from quant_platform.execution_gateway.persistence import ExecutionLedgerEntry, ExecutionSessionEventStore
+from quant_platform.execution_gateway.reconciliation import reconcile_execution_session
+from quant_platform.execution_gateway.reports import generate_execution_session_report
+from quant_platform.execution_gateway.runner import (
+    RunnerEnvironment as ExecutionGatewayRunnerEnvironment,
+)
+from quant_platform.execution_gateway.runner import (
+    current_kill_switch_state,
+    pause_execution_session,
+    run_execution_session,
+)
+from quant_platform.execution_gateway.specs import compute_execution_gateway_spec_id
+from quant_platform.execution_gateway.state_machine import ExecutionOrderStateEvent
+from quant_platform.execution_gateway.states import (
+    ExecutionFill,
+    compute_execution_order_id,
+    reconstruct_execution_order,
+)
+from quant_platform.execution_gateway.verification import verify_execution_session
 from quant_platform.features.manifests import (
     ResearchDatasetManifest,
     ResearchDatasetStore,
@@ -216,7 +242,13 @@ from quant_platform.ml.models import (
     PreprocessingBinding,
     ValidationReport,
 )
-from quant_platform.ml.persistence import as_json_dict, as_json_list, parse_json_strict, read_json_file
+from quant_platform.ml.persistence import (
+    as_json_dict,
+    as_json_list,
+    parse_json_strict,
+    read_json_file,
+    utc_now,
+)
 from quant_platform.ml.registry import ModelDefinition, ModelRegistry
 from quant_platform.ml.reporting import build_report_json, render_report_markdown
 from quant_platform.ml.testing import TEST_MODEL_NAME, TEST_MODEL_VERSION, ConstantTestModelFactory
@@ -250,7 +282,7 @@ from quant_platform.paper_trading.eligibility import EligibilityVerificationEnvi
 from quant_platform.paper_trading.manifests import PaperSessionManifestStore
 from quant_platform.paper_trading.model_strategy import ModelStrategyRuntime
 from quant_platform.paper_trading.models import LedgerEntryKind, OrderState, PaperSessionStage, SessionMode
-from quant_platform.paper_trading.orders import OrderStateEvent, resolve_order_state
+from quant_platform.paper_trading.orders import OrderRequest, OrderStateEvent, resolve_order_state
 from quant_platform.paper_trading.persistence import PaperSessionEventStore
 from quant_platform.paper_trading.reconciliation import reconcile_session
 from quant_platform.paper_trading.replay import load_replay_events
@@ -2175,6 +2207,359 @@ def cmd_report_shadow_session(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# Milestone 8: broker-neutral deterministic execution gateway commands
+#
+# TEST-ONLY. Every command below dispatches exclusively to
+# `execution_gateway.dummy_broker.DeterministicDummyBrokerAdapter` -- an
+# in-process, seeded, deterministic simulator. No command in this section
+# can transmit a real order: `execution_mode`/`adapter_kind` are each
+# single-member enums (`TEST_ONLY`/`DETERMINISTIC_DUMMY`), and Section 35's
+# safety scan proves no network/broker-client/MT5 import exists anywhere
+# in `execution_gateway` at all.
+# --------------------------------------------------------------------------
+_NO_LIVE_EXECUTION_NOTICE = "NOTICE: this is a TEST-ONLY deterministic dummy-broker execution session. No order is ever sent to any real broker."
+
+
+def _load_execution_gateway_config(path: Path) -> ExecutionGatewayConfigSchema:
+    return ExecutionGatewayConfigSchema.model_validate_json(path.read_text())
+
+
+def _execution_gateway_manifest_store(config: ExecutionGatewayConfigSchema) -> ExecutionSessionManifestStore:
+    return ExecutionSessionManifestStore(config.ml_artifacts_root)
+
+
+def _execution_gateway_event_store(config: ExecutionGatewayConfigSchema) -> ExecutionSessionEventStore:
+    return ExecutionSessionEventStore(config.ml_artifacts_root)
+
+
+def _execution_gateway_eligibility_environment(config: ExecutionGatewayConfigSchema) -> EligibilityVerificationEnvironment:
+    return EligibilityVerificationEnvironment(
+        robustness_manifest_store=RobustnessManifestStore(config.ml_artifacts_root), artifact_store=MLArtifactStore(config.ml_artifacts_root),
+        backtest_manifest_store=BacktestManifestStore(config.ml_artifacts_root), backtest_event_store=BacktestEventStore(config.ml_artifacts_root),
+        calibration_manifest_store=CalibrationManifestStore(config.ml_artifacts_root), experiment_manifest_store=ExperimentManifestStore(config.ml_artifacts_root),
+        execution_manifest_store=ExecutionManifestStore(config.ml_artifacts_root), research_manifest_store=ResearchManifestStore(config.research_storage_root),
+        research_dataset_store=ResearchDatasetStore(config.research_storage_root),
+        dataset_loader=DatasetLoader(CanonicalStore(config.historical_storage_root), ManifestStore(config.historical_storage_root)),
+    )
+
+
+def _execution_gateway_paper_bridge_environment(config: ExecutionGatewayConfigSchema) -> PaperBridgeEnvironment:
+    return PaperBridgeEnvironment(
+        manifest_store=PaperSessionManifestStore(config.ml_artifacts_root), event_store=PaperSessionEventStore(config.ml_artifacts_root),
+        artifact_store=MLArtifactStore(config.ml_artifacts_root), eligibility_environment=_execution_gateway_eligibility_environment(config),
+    )
+
+
+def _execution_gateway_runner_environment(config: ExecutionGatewayConfigSchema) -> ExecutionGatewayRunnerEnvironment:
+    return ExecutionGatewayRunnerEnvironment(
+        manifest_store=_execution_gateway_manifest_store(config), event_store=_execution_gateway_event_store(config),
+        paper_bridge_environment=_execution_gateway_paper_bridge_environment(config),
+    )
+
+
+def _load_paper_orders_for_session(config: ExecutionGatewayConfigSchema, paper_session_id: str) -> list[OrderRequest]:
+    """Extracts every distinct source `OrderRequest` a paper session's own
+    ledger recorded, in first-seen order -- every `ORDER_STATE_EVENT`
+    ledger entry embeds the order's full economic detail alongside its
+    own transition, so any single entry per order is enough to recover
+    it (see `paper_trading.runner._order_state_payload`)."""
+    event_store = PaperSessionEventStore(config.ml_artifacts_root)
+    ledger = event_store.read_events(paper_session_id)
+    seen: dict[str, OrderRequest] = {}
+    for entry in ledger:
+        if entry.kind is LedgerEntryKind.ORDER_STATE_EVENT:
+            order_raw = entry.payload.get("order")
+            if order_raw is None:
+                continue
+            order = OrderRequest.from_json_dict(as_json_dict(order_raw, field_name="order"))
+            seen.setdefault(order.order_id, order)
+    return list(seen.values())
+
+
+def cmd_create_execution_gateway_spec(args: argparse.Namespace) -> int:
+    """Milestone 8: dry-run -- build/validate an `ExecutionGatewaySpec`
+    from `--config` and print its deterministic `execution_gateway_spec_id`.
+    Writes nothing; does NOT verify source eligibility (that happens at
+    session start, fail-closed)."""
+    config = _load_execution_gateway_config(Path(args.config))
+    spec = config.build()
+    identity = compute_execution_gateway_spec_id(spec)
+    print(f"execution_gateway_spec_id: {identity.execution_gateway_spec_id}")
+    print(f"execution_mode: {spec.execution_mode.value}")
+    print(f"adapter_kind: {spec.adapter_kind.value}")
+    print(f"paper_session_id: {spec.paper_session_id}")
+    print(_NO_LIVE_EXECUTION_NOTICE)
+    return 0
+
+
+def _run_or_resume_dummy_execution_session(args: argparse.Namespace) -> int:
+    config = _load_execution_gateway_config(Path(args.config))
+    spec = config.build()
+    environment = _execution_gateway_runner_environment(config)
+    paper_orders = _load_paper_orders_for_session(config, spec.paper_session_id)
+    market_events = load_replay_events(Path(args.replay_source))
+    adapter = DeterministicDummyBrokerAdapter(adapter_id=args.adapter_id, scenario=spec.dummy_broker_scenario)
+    manifest = run_execution_session(spec, environment=environment, adapter=adapter, paper_orders=paper_orders, market_events=market_events, event_time=utc_now().to_pydatetime())
+    print(f"execution_session_id: {manifest.execution_session_id}")
+    print(f"current_stage: {manifest.current_stage.value}")
+    print(_NO_LIVE_EXECUTION_NOTICE)
+    return 0 if manifest.current_stage is ExecutionSessionStage.COMPLETED else 2
+
+
+def cmd_run_dummy_execution_session(args: argparse.Namespace) -> int:
+    """Milestone 8: creates (or transparently resumes) a TEST_ONLY
+    execution session against the DETERMINISTIC_DUMMY adapter, bridging
+    `--paper-session-id`'s own orders and running them against
+    `--replay-source`'s bounded, pre-validated market-event sequence.
+    Fails closed before a single command is dispatched unless the source
+    paper session's full eligibility chain independently re-verifies."""
+    return _run_or_resume_dummy_execution_session(args)
+
+
+def cmd_resume_execution_session(args: argparse.Namespace) -> int:
+    """Milestone 8: resumes a prior, non-terminal execution session --
+    `--execution-session-id` must already exist and match what `--config`
+    resolves to (fails otherwise, never silently creates or cross-loads a
+    different session), mirroring the Milestone 7 release-audit's own
+    identity-binding fix for `resume-paper-session`."""
+    config = _load_execution_gateway_config(Path(args.config))
+    _execution_gateway_manifest_store(config).load(args.execution_session_id)  # fails closed if the session does not already exist
+    spec = config.build()
+    resolved_execution_session_id = compute_execution_gateway_spec_id(spec).execution_gateway_spec_id
+    if resolved_execution_session_id != args.execution_session_id:
+        raise ExecutionGatewayIdentityError(
+            f"--execution-session-id {args.execution_session_id!r} does not match the session {resolved_execution_session_id!r} that --config resolves to "
+            "-- refusing to resume a different session than the one named.",
+            context={"requested_execution_session_id": args.execution_session_id, "config_resolved_execution_session_id": resolved_execution_session_id},
+        )
+    return _run_or_resume_dummy_execution_session(args)
+
+
+def cmd_pause_execution_session(args: argparse.Namespace) -> int:
+    """Milestone 8: durably pauses a `RUNNING` execution session -- a
+    subsequent `resume-execution-session` continues from the ledger's own
+    last completed step."""
+    config = _load_execution_gateway_config(Path(args.config))
+    environment = _execution_gateway_runner_environment(config)
+    manifest = pause_execution_session(execution_session_id=args.execution_session_id, environment=environment, event_time=utc_now().to_pydatetime())
+    print(f"execution_session_id: {manifest.execution_session_id}")
+    print(f"current_stage: {manifest.current_stage.value}")
+    return 0
+
+
+def cmd_inspect_execution_session(args: argparse.Namespace) -> int:
+    """Milestone 8: prints a human-readable (or JSON) summary of one
+    execution session's manifest."""
+    config = _load_execution_gateway_config(Path(args.config))
+    manifest = _execution_gateway_manifest_store(config).load(args.execution_session_id)
+    if args.format == "json":
+        import json
+
+        print(json.dumps(manifest.to_json_dict(), indent=2, sort_keys=True, allow_nan=False))
+        return 0
+    print(f"execution_session_id: {manifest.execution_session_id}")
+    print(f"paper_session_id: {manifest.paper_session_id}")
+    print(f"adapter_id: {manifest.adapter_id}")
+    print(f"execution_mode: {manifest.execution_mode.value}")
+    print(f"current_stage: {manifest.current_stage.value}")
+    print(f"created_event_time: {manifest.created_event_time}")
+    print(f"last_transition_event_time: {manifest.last_transition_event_time}")
+    if manifest.semantic_digest:
+        print(f"semantic_digest: {manifest.semantic_digest}")
+    if manifest.failure_category:
+        print(f"failure_category: {manifest.failure_category}")
+        print(f"failure_stage: {manifest.failure_stage}")
+        print(f"recoverable: {manifest.recoverable}")
+    return 0
+
+
+def _load_execution_session_ledger(args: argparse.Namespace) -> tuple[ExecutionGatewayConfigSchema, list[ExecutionLedgerEntry]]:
+    config = _load_execution_gateway_config(Path(args.config))
+    _execution_gateway_manifest_store(config).load(args.execution_session_id)  # fails closed if the session does not exist
+    ledger = _execution_gateway_event_store(config).read_events(args.execution_session_id)
+    return config, ledger
+
+
+def cmd_inspect_execution_intents(args: argparse.Namespace) -> int:
+    """Milestone 8: lists every execution intent an execution session's
+    ledger has recorded (accepted and rejected)."""
+    _config, ledger = _load_execution_session_ledger(args)
+    limit = _require_non_negative_limit(args.limit)
+    intents = [e for e in ledger if e.entry_kind in (ExecutionLedgerEntryKind.EXECUTION_INTENT_ACCEPTED, ExecutionLedgerEntryKind.EXECUTION_INTENT_REJECTED)]
+    for entry in intents[:limit]:
+        print(f"{entry.entry_kind.value}: execution_intent_id={entry.payload.get('execution_intent_id')} instrument_id={entry.payload.get('instrument_id')} side={entry.payload.get('side')} quantity={entry.payload.get('quantity')}")
+    if len(intents) > limit:
+        print(f"... truncated: {len(intents) - limit} additional intent(s) not shown (--limit={limit})")
+    return 0
+
+
+def cmd_inspect_execution_commands(args: argparse.Namespace) -> int:
+    """Milestone 8: lists every command an execution session's ledger has
+    recorded, along with its dispatch outcome."""
+    _config, ledger = _load_execution_session_ledger(args)
+    limit = _require_non_negative_limit(args.limit)
+    commands = [e for e in ledger if e.entry_kind is ExecutionLedgerEntryKind.COMMAND_CREATED]
+    outcome_kinds = (ExecutionLedgerEntryKind.COMMAND_DISPATCH_SUCCEEDED, ExecutionLedgerEntryKind.COMMAND_DISPATCH_REJECTED, ExecutionLedgerEntryKind.COMMAND_MARKED_UNKNOWN, ExecutionLedgerEntryKind.COMMAND_REJECTED)
+    outcomes = {e.payload.get("command_id"): e.entry_kind.value for e in ledger if e.entry_kind in outcome_kinds}
+    for entry in commands[:limit]:
+        command_id = entry.payload.get("command_id")
+        print(f"command_id={command_id} command_type={entry.payload.get('command_type')} outcome={outcomes.get(command_id, 'unresolved')}")
+    if len(commands) > limit:
+        print(f"... truncated: {len(commands) - limit} additional command(s) not shown (--limit={limit})")
+    return 0
+
+
+def cmd_inspect_execution_orders(args: argparse.Namespace) -> int:
+    """Milestone 8: reconstructs and lists every execution order an
+    execution session's ledger implies, purely from the ledger (never a
+    cached view)."""
+    _config, ledger = _load_execution_session_ledger(args)
+    limit = _require_non_negative_limit(args.limit)
+    from quant_platform.execution_gateway.commands import SubmitOrderCommand
+    from quant_platform.execution_gateway.events import BrokerEvent as _BrokerEvent
+
+    submits = {compute_execution_order_id(SubmitOrderCommand.from_json_dict(e.payload)): SubmitOrderCommand.from_json_dict(e.payload) for e in ledger if e.entry_kind is ExecutionLedgerEntryKind.COMMAND_CREATED and e.payload.get("command_type") == "submit_order"}
+    for order_id, command in list(submits.items())[:limit]:
+        state_events = [ExecutionOrderStateEvent.from_json_dict(e.payload) for e in ledger if e.entry_kind is ExecutionLedgerEntryKind.ORDER_STATE_TRANSITION and e.payload.get("execution_order_id") == order_id]
+        broker_events = [_BrokerEvent.from_json_dict(e.payload) for e in ledger if e.entry_kind is ExecutionLedgerEntryKind.BROKER_EVENT_RECEIVED and e.payload.get("client_order_id") == command.client_order_id]
+        fills = [ExecutionFill.from_json_dict(e.payload) for e in ledger if e.entry_kind is ExecutionLedgerEntryKind.EXECUTION_FILL_RECORDED and e.payload.get("execution_order_id") == order_id]
+        order = reconstruct_execution_order(submit_command=command, state_events=state_events, broker_events=broker_events, fills=fills)
+        print(f"execution_order_id={order_id} state={order.current_state.value} filled={order.filled_quantity} remaining={order.remaining_quantity}")
+    if len(submits) > limit:
+        print(f"... truncated: {len(submits) - limit} additional order(s) not shown (--limit={limit})")
+    return 0
+
+
+def cmd_inspect_execution_fills(args: argparse.Namespace) -> int:
+    """Milestone 8: lists every fill an execution session's ledger has
+    recorded."""
+    _config, ledger = _load_execution_session_ledger(args)
+    limit = _require_non_negative_limit(args.limit)
+    fills = [ExecutionFill.from_json_dict(e.payload) for e in ledger if e.entry_kind is ExecutionLedgerEntryKind.EXECUTION_FILL_RECORDED]
+    for fill in fills[:limit]:
+        print(f"execution_fill_id={fill.execution_fill_id} execution_order_id={fill.execution_order_id} quantity={fill.quantity} price={fill.price} gross_notional={fill.gross_notional}")
+    if len(fills) > limit:
+        print(f"... truncated: {len(fills) - limit} additional fill(s) not shown (--limit={limit})")
+    return 0
+
+
+def cmd_inspect_broker_events(args: argparse.Namespace) -> int:
+    """Milestone 8: lists every normalized broker event an execution
+    session's ledger has recorded (received, duplicate, out-of-order,
+    conflict)."""
+    _config, ledger = _load_execution_session_ledger(args)
+    limit = _require_non_negative_limit(args.limit)
+    kinds = (ExecutionLedgerEntryKind.BROKER_EVENT_RECEIVED, ExecutionLedgerEntryKind.BROKER_EVENT_DUPLICATE, ExecutionLedgerEntryKind.BROKER_EVENT_OUT_OF_ORDER, ExecutionLedgerEntryKind.BROKER_EVENT_CONFLICT)
+    events = [e for e in ledger if e.entry_kind in kinds]
+    for entry in events[:limit]:
+        broker_event = BrokerEvent.from_json_dict(entry.payload)
+        print(f"{entry.entry_kind.value}: broker_sequence={broker_event.broker_sequence} event_type={broker_event.event_type.value} client_order_id={broker_event.client_order_id}")
+    if len(events) > limit:
+        print(f"... truncated: {len(events) - limit} additional event(s) not shown (--limit={limit})")
+    return 0
+
+
+def cmd_inspect_execution_health(args: argparse.Namespace) -> int:
+    """Milestone 8: prints the current kill-switch state (event-sourced,
+    reconstructed from the ledger, never a cached field)."""
+    config = _load_execution_gateway_config(Path(args.config))
+    _execution_gateway_manifest_store(config).load(args.execution_session_id)
+    state = current_kill_switch_state(execution_session_id=args.execution_session_id, event_store=_execution_gateway_event_store(config))
+    print(f"execution_session_id: {args.execution_session_id}")
+    print(f"kill_switch_state: {state.value}")
+    return 0
+
+
+def cmd_inspect_execution_reconciliation(args: argparse.Namespace) -> int:
+    """Milestone 8: runs independent reconciliation between the ledger's
+    own reconstruction and the (dummy) broker's snapshots. NOTE: this
+    inspection command constructs a FRESH `DeterministicDummyBrokerAdapter`
+    with no prior state, so it can only meaningfully reconcile a session
+    whose ledger alone fully determines the expected broker state (a
+    COMPLETED session) -- a still-RUNNING session's in-memory adapter
+    state cannot be reconstructed this way; use `verify-execution-session`
+    for a ledger-only-based check instead."""
+    config, ledger = _load_execution_session_ledger(args)
+    spec = config.build()
+    adapter = DeterministicDummyBrokerAdapter(adapter_id=args.execution_session_id[:16], scenario=spec.dummy_broker_scenario)
+    adapter.initialize(execution_session_id=args.execution_session_id, event_time=utc_now().to_pydatetime())
+    report = reconcile_execution_session(execution_session_id=args.execution_session_id, ledger=ledger, adapter=adapter, event_time=utc_now().to_pydatetime(), policy=spec.reconciliation_policy)
+    print(f"is_reconciled: {report.is_reconciled}")
+    for issue in report.issues:
+        print(f"  [{issue.severity.value}] {issue.issue_code}: {issue.description} (expected={issue.expected!r} actual={issue.actual!r})")
+    return 0 if report.is_reconciled else 1
+
+
+def cmd_report_execution_session(args: argparse.Namespace) -> int:
+    """Milestone 8 (Section 27): prints the durable session report,
+    recomputed purely from the ledger."""
+    _config, ledger = _load_execution_session_ledger(args)
+    report = generate_execution_session_report(execution_session_id=args.execution_session_id, ledger=ledger)
+    if args.format == "json":
+        import json
+
+        print(json.dumps(report.to_json_dict(), indent=2, sort_keys=True, allow_nan=False))
+        return 0
+    for section_name, section in report.sections.items():
+        print(f"{section_name}: {section}")
+    print(_NO_LIVE_EXECUTION_NOTICE)
+    return 0
+
+
+def cmd_verify_execution_session(args: argparse.Namespace) -> int:
+    """Milestone 8 (Section 28): independently re-verifies spec identity,
+    ledger integrity, order-state legality, fill identity, and FOK/IOC
+    semantics -- never trusting the persisted manifest."""
+    config, ledger = _load_execution_session_ledger(args)
+    spec = config.build()
+    report = verify_execution_session(spec, execution_session_id=args.execution_session_id, ledger=ledger)
+    print(f"is_ready: {report.is_ready}")
+    for issue in report.issues:
+        print(f"  [{issue.severity.value}] {issue.code}: {issue.message}")
+    return 0 if report.is_ready else 1
+
+
+def cmd_replay_execution_session(args: argparse.Namespace) -> int:
+    """Milestone 8 (Section 30): runs `--config`'s spec end-to-end
+    against a FRESH, isolated store rooted at `--replay-storage-root`,
+    printing the resulting semantic digest -- used to independently
+    confirm two separate runs of the same immutable inputs produce the
+    same deterministic outcome."""
+    from quant_platform.execution_gateway.replay import replay_execution_session
+
+    config = _load_execution_gateway_config(Path(args.config))
+    spec = config.build()
+    paper_orders = _load_paper_orders_for_session(config, spec.paper_session_id)
+    market_events = load_replay_events(Path(args.replay_source))
+    result = replay_execution_session(
+        spec, storage_root=Path(args.replay_storage_root), paper_bridge_environment=_execution_gateway_paper_bridge_environment(config), paper_orders=paper_orders,
+        market_events=market_events, adapter_id=args.adapter_id, event_time=utc_now().to_pydatetime(),
+    )
+    print(f"execution_session_id: {result.execution_session_id}")
+    print(f"current_stage: {result.manifest.current_stage.value}")
+    print(f"semantic_digest: {result.semantic_digest}")
+    print(f"is_reconciled: {result.reconciliation_report.is_reconciled}")
+    print(f"verification_is_ready: {result.verification_report.is_ready}")
+    return 0 if result.manifest.current_stage is ExecutionSessionStage.COMPLETED else 2
+
+
+def cmd_compare_execution_to_paper(args: argparse.Namespace) -> int:
+    """Milestone 8: diagnostic-only comparison between an execution
+    session's own fill/order counts and its source paper session's --
+    genuine decision/order-count mismatches (not merely cost/latency
+    differences) warrant investigation, exactly like Milestone 7's own
+    `compare-paper-to-backtest`."""
+    config, ledger = _load_execution_session_ledger(args)
+    execution_report = generate_execution_session_report(execution_session_id=args.execution_session_id, ledger=ledger)
+    paper_orders = _load_paper_orders_for_session(config, args.paper_session_id)
+    print(f"paper_order_count={len(paper_orders)}")
+    print(f"execution_order_count={execution_report.sections['OrderSummary']['total_orders']}")  # type: ignore[index]
+    print(f"execution_fill_count={execution_report.sections['FillSummary']['fill_count']}")  # type: ignore[index]
+    print("NOTE: this comparison is diagnostic only, never a promotion or completion decision.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m quant_platform.ml_cli",
@@ -2689,6 +3074,107 @@ def build_parser() -> argparse.ArgumentParser:
     report_shadow_session_parser.add_argument("--config", required=True)
     report_shadow_session_parser.add_argument("--paper-session-id", required=True)
     report_shadow_session_parser.set_defaults(handler=cmd_report_shadow_session)
+
+    # ----------------------------------------------------------------
+    # Milestone 8: broker-neutral deterministic execution gateway (TEST-ONLY)
+    # ----------------------------------------------------------------
+    create_execution_gateway_spec_parser = subparsers.add_parser(
+        "create-execution-gateway-spec", help="Milestone 8: dry-run -- build/validate an ExecutionGatewaySpec from --config and print its execution_gateway_spec_id. Writes nothing.",
+    )
+    create_execution_gateway_spec_parser.add_argument("--config", required=True)
+    create_execution_gateway_spec_parser.set_defaults(handler=cmd_create_execution_gateway_spec)
+
+    def _add_execution_replay_arguments(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--replay-source", required=True, help="Path to a bounded, deterministic JSONL replay source (Milestone 7 Section 32, reused directly).")
+        p.add_argument("--adapter-id", default="dummy-broker-1", help="Identifier for this run's DeterministicDummyBrokerAdapter instance.")
+
+    run_dummy_execution_session_parser = subparsers.add_parser(
+        "run-dummy-execution-session", help="Milestone 8: create (or transparently resume) and run a TEST_ONLY execution session against the deterministic dummy broker. No live order is ever sent.",
+    )
+    run_dummy_execution_session_parser.add_argument("--config", required=True)
+    _add_execution_replay_arguments(run_dummy_execution_session_parser)
+    run_dummy_execution_session_parser.set_defaults(handler=cmd_run_dummy_execution_session)
+
+    resume_execution_session_parser = subparsers.add_parser(
+        "resume-execution-session", help="Milestone 8: resume a prior, non-terminal execution session -- fails if --execution-session-id does not already exist or does not match --config.",
+    )
+    resume_execution_session_parser.add_argument("--config", required=True)
+    resume_execution_session_parser.add_argument("--execution-session-id", required=True)
+    _add_execution_replay_arguments(resume_execution_session_parser)
+    resume_execution_session_parser.set_defaults(handler=cmd_resume_execution_session)
+
+    pause_execution_session_parser = subparsers.add_parser(
+        "pause-execution-session", help="Milestone 8: durably pause a RUNNING execution session.",
+    )
+    pause_execution_session_parser.add_argument("--config", required=True)
+    pause_execution_session_parser.add_argument("--execution-session-id", required=True)
+    pause_execution_session_parser.set_defaults(handler=cmd_pause_execution_session)
+
+    inspect_execution_session_parser = subparsers.add_parser(
+        "inspect-execution-session", help="Milestone 8: print a human-readable (or JSON) execution session manifest summary.",
+    )
+    inspect_execution_session_parser.add_argument("--config", required=True)
+    inspect_execution_session_parser.add_argument("--execution-session-id", required=True)
+    inspect_execution_session_parser.add_argument("--format", choices=["text", "json"], default="text")
+    inspect_execution_session_parser.set_defaults(handler=cmd_inspect_execution_session)
+
+    def _add_execution_session_and_limit_arguments(p: argparse.ArgumentParser, *, help_suffix: str = "") -> None:
+        p.add_argument("--config", required=True)
+        p.add_argument("--execution-session-id", required=True)
+        p.add_argument("--limit", type=int, default=_DEFAULT_INSPECTION_ROW_LIMIT, help=f"Maximum rows to print (default {_DEFAULT_INSPECTION_ROW_LIMIT}).{help_suffix}")
+
+    inspect_execution_intents_parser = subparsers.add_parser("inspect-execution-intents", help="Milestone 8: list every execution intent an execution session's ledger has recorded.")
+    _add_execution_session_and_limit_arguments(inspect_execution_intents_parser)
+    inspect_execution_intents_parser.set_defaults(handler=cmd_inspect_execution_intents)
+
+    inspect_execution_commands_parser = subparsers.add_parser("inspect-execution-commands", help="Milestone 8: list every command an execution session's ledger has recorded, with its dispatch outcome.")
+    _add_execution_session_and_limit_arguments(inspect_execution_commands_parser)
+    inspect_execution_commands_parser.set_defaults(handler=cmd_inspect_execution_commands)
+
+    inspect_execution_orders_parser = subparsers.add_parser("inspect-execution-orders", help="Milestone 8: reconstruct and list every execution order an execution session's ledger implies.")
+    _add_execution_session_and_limit_arguments(inspect_execution_orders_parser)
+    inspect_execution_orders_parser.set_defaults(handler=cmd_inspect_execution_orders)
+
+    inspect_execution_fills_parser = subparsers.add_parser("inspect-execution-fills", help="Milestone 8: list every fill an execution session's ledger has recorded.")
+    _add_execution_session_and_limit_arguments(inspect_execution_fills_parser)
+    inspect_execution_fills_parser.set_defaults(handler=cmd_inspect_execution_fills)
+
+    inspect_broker_events_parser = subparsers.add_parser("inspect-broker-events", help="Milestone 8: list every normalized broker event an execution session's ledger has recorded.")
+    _add_execution_session_and_limit_arguments(inspect_broker_events_parser)
+    inspect_broker_events_parser.set_defaults(handler=cmd_inspect_broker_events)
+
+    inspect_execution_health_parser = subparsers.add_parser("inspect-execution-health", help="Milestone 8: print the current kill-switch state, reconstructed from the ledger.")
+    inspect_execution_health_parser.add_argument("--config", required=True)
+    inspect_execution_health_parser.add_argument("--execution-session-id", required=True)
+    inspect_execution_health_parser.set_defaults(handler=cmd_inspect_execution_health)
+
+    inspect_execution_reconciliation_parser = subparsers.add_parser("inspect-execution-reconciliation", help="Milestone 8: run independent reconciliation between the ledger's own reconstruction and a fresh dummy-broker snapshot.")
+    inspect_execution_reconciliation_parser.add_argument("--config", required=True)
+    inspect_execution_reconciliation_parser.add_argument("--execution-session-id", required=True)
+    inspect_execution_reconciliation_parser.set_defaults(handler=cmd_inspect_execution_reconciliation)
+
+    report_execution_session_parser = subparsers.add_parser("report-execution-session", help="Milestone 8: print the durable execution session report, recomputed purely from the ledger.")
+    report_execution_session_parser.add_argument("--config", required=True)
+    report_execution_session_parser.add_argument("--execution-session-id", required=True)
+    report_execution_session_parser.add_argument("--format", choices=["text", "json"], default="text")
+    report_execution_session_parser.set_defaults(handler=cmd_report_execution_session)
+
+    verify_execution_session_parser = subparsers.add_parser("verify-execution-session", help="Milestone 8: independently re-verify spec identity, ledger integrity, order-state legality, fill identity, and FOK/IOC semantics.")
+    verify_execution_session_parser.add_argument("--config", required=True)
+    verify_execution_session_parser.add_argument("--execution-session-id", required=True)
+    verify_execution_session_parser.set_defaults(handler=cmd_verify_execution_session)
+
+    replay_execution_session_parser = subparsers.add_parser("replay-execution-session", help="Milestone 8: run --config's spec end-to-end against a fresh, isolated store and print the resulting semantic digest.")
+    replay_execution_session_parser.add_argument("--config", required=True)
+    _add_execution_replay_arguments(replay_execution_session_parser)
+    replay_execution_session_parser.add_argument("--replay-storage-root", required=True, help="Fresh, isolated storage root for this replay run.")
+    replay_execution_session_parser.set_defaults(handler=cmd_replay_execution_session)
+
+    compare_execution_to_paper_parser = subparsers.add_parser("compare-execution-to-paper", help="Milestone 8: diagnostic-only comparison between an execution session and its source paper session's order/fill counts.")
+    compare_execution_to_paper_parser.add_argument("--config", required=True)
+    compare_execution_to_paper_parser.add_argument("--execution-session-id", required=True)
+    compare_execution_to_paper_parser.add_argument("--paper-session-id", required=True)
+    compare_execution_to_paper_parser.set_defaults(handler=cmd_compare_execution_to_paper)
 
     return parser
 
