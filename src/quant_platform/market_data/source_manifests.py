@@ -58,6 +58,15 @@ class SourceKind(Enum):
     CSV_CANDLES = "csv_candles"
     JSONL_MARKET_EVENTS = "jsonl_market_events"
     IN_MEMORY = "in_memory"
+    FRED_API = "fred_api"
+    """Milestone 10, Phase 4A: source rows produced from an ALREADY-
+    DOWNLOADED, ALREADY-CACHED FRED response (`collectors.fred.
+    FredSourceAdapter`) -- the adapter itself still performs zero
+    network I/O (it reads persisted raw bytes via `collectors.cache.
+    RawResponseCache`, exactly like `CsvCandleAdapter` reads a local
+    file); only `collectors.fred.execute_fred_request` (an entirely
+    separate function, never called by the adapter) touches the
+    network."""
 
 
 class RecordKind(Enum):
@@ -65,6 +74,12 @@ class RecordKind(Enum):
     TICK = "tick"
     QUOTE = "quote"
     TRADE = "trade"
+    MACRO_OBSERVATION = "macro_observation"
+    """Milestone 10, Phase 4A: one published value of an economic/macro
+    series (e.g. one FRED observation) -- deliberately NOT one of the
+    four `MarketDataEvent` kinds above (a macro observation has no OHLC/
+    bid-ask/price-size shape, and maps to `macro.MacroEvent`, a
+    completely separate Phase 1 model, never `events.MarketDataEvent`)."""
 
 
 def compute_content_digest(data: bytes) -> str:

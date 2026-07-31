@@ -79,6 +79,20 @@ DATASET_MANIFEST_KIND = "dataset_manifest"
 class DatasetKind(Enum):
     RAW_MARKET_EVENTS = "raw_market_events"
     DERIVED_FEATURES = "derived_features"
+    MACRO_OBSERVATIONS = "macro_observations"
+    """Milestone 10, Phase 4A: a `DatasetKey` SCOPING identity only, for
+    stores that need one purely to compute a storage path/durable-record
+    field (`checkpoints.OperationStore`-shaped ledgers, `provenance.
+    ProvenanceStore`, `quarantine.QuarantineStore` -- none of which care
+    what kind of economic record the operation ultimately produces).
+    Macro observations do NOT participate in `DatasetManifest`/
+    `PartitionStore` dataset-versioning (that machinery is shaped
+    specifically for `MarketEventStore`-backed candle/tick/quote/trade
+    data); the durable economic record store remains Phase 1's own
+    `macro.MacroEventStore`, keyed by `(provider, series_id)` directly.
+    `instrument_id` is repurposed to mean `series_id` for this kind --
+    same field, since a macro series id (e.g. `"DGS10"`) is exactly as
+    path-safe as an instrument id already must be."""
 
 
 class PartitionGranularity(Enum):
@@ -124,11 +138,11 @@ class DatasetKey:
 
     def __post_init__(self) -> None:
         require_non_empty(self.instrument_id, field_name="DatasetKey.instrument_id")
-        if self.dataset_kind is DatasetKind.RAW_MARKET_EVENTS:
+        if self.dataset_kind in (DatasetKind.RAW_MARKET_EVENTS, DatasetKind.MACRO_OBSERVATIONS):
             if not self.provider:
-                raise DatasetManifestError("DatasetKey.provider is required for RAW_MARKET_EVENTS")
+                raise DatasetManifestError(f"DatasetKey.provider is required for {self.dataset_kind.value}")
             if self.feature_name is not None or self.feature_version is not None:
-                raise DatasetManifestError("DatasetKey.feature_name/feature_version must be None for RAW_MARKET_EVENTS")
+                raise DatasetManifestError(f"DatasetKey.feature_name/feature_version must be None for {self.dataset_kind.value}")
         else:
             if self.provider is not None:
                 raise DatasetManifestError("DatasetKey.provider must be None for DERIVED_FEATURES")
@@ -160,6 +174,9 @@ class DatasetKey:
         if self.dataset_kind is DatasetKind.RAW_MARKET_EVENTS:
             assert self.provider is not None
             return ("raw_market_events", self.provider, self.instrument_id)
+        if self.dataset_kind is DatasetKind.MACRO_OBSERVATIONS:
+            assert self.provider is not None
+            return ("macro_observations", self.provider, self.instrument_id)
         assert self.feature_name is not None and self.feature_version is not None
         return ("derived_features", self.feature_name, f"v{self.feature_version}", self.instrument_id)
 

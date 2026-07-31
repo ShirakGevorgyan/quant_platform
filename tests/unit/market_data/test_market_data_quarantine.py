@@ -90,7 +90,7 @@ class TestQuarantineRecordIdentity:
         assert QuarantineRecord.from_json_dict(record.to_json_dict()) == record
 
     def test_all_seventeen_codes_present(self) -> None:
-        assert len(VALIDATION_ISSUE_CODES) == 17
+        assert len(VALIDATION_ISSUE_CODES) == 18
 
 
 class TestQuarantineStore:

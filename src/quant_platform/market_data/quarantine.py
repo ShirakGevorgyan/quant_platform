@@ -61,6 +61,7 @@ __all__ = [
     "INVALID_DECIMAL",
     "INVALID_OHLC",
     "MALFORMED_TIMESTAMP",
+    "MISSING_OBSERVATION_VALUE",
     "MISSING_REQUIRED_COLUMN",
     "NAIVE_TIMESTAMP_WITHOUT_POLICY",
     "NEGATIVE_VOLUME",
@@ -103,12 +104,22 @@ DUPLICATE_SOURCE_RECORD_DIGEST = "duplicate_source_record_digest"
 CONFLICTING_SOURCE_SEQUENCE = "conflicting_source_sequence"
 FUTURE_TIMESTAMP = "future_timestamp"
 TIMESTAMP_OUTSIDE_DECLARED_RANGE = "timestamp_outside_declared_range"
+MISSING_OBSERVATION_VALUE = "missing_observation_value"
+"""Milestone 10, Phase 4A: the source EXPLICITLY declared "no value
+published for this coordinate" (e.g. FRED's own `"."` convention for a
+macro observation) -- a distinct concept from `INVALID_DECIMAL` (the
+value was PRESENT but malformed): the source is not malfunctioning here,
+it is faithfully reporting an absence. `macro.MacroEvent`'s own schema
+(Phase 1) has no representation for "a committed observation with no
+value," so this is quarantine's own STRUCTURED representation of a
+missing observation, per the specification's own instruction never to
+silently coerce a missing value to zero."""
 
 VALIDATION_ISSUE_CODES: tuple[str, ...] = (
     MISSING_REQUIRED_COLUMN, EXTRA_FORBIDDEN_COLUMN, EMPTY_TIMESTAMP, MALFORMED_TIMESTAMP, NAIVE_TIMESTAMP_WITHOUT_POLICY,
     AMBIGUOUS_OR_NONEXISTENT_LOCAL_TIME, INVALID_DECIMAL, NON_FINITE_DECIMAL, NEGATIVE_VOLUME, INVALID_OHLC, UNKNOWN_SYMBOL,
     UNKNOWN_TIMEFRAME, DUPLICATE_SOURCE_ROW_COORDINATE, DUPLICATE_SOURCE_RECORD_DIGEST, CONFLICTING_SOURCE_SEQUENCE,
-    FUTURE_TIMESTAMP, TIMESTAMP_OUTSIDE_DECLARED_RANGE,
+    FUTURE_TIMESTAMP, TIMESTAMP_OUTSIDE_DECLARED_RANGE, MISSING_OBSERVATION_VALUE,
 )
 
 # Issues fixable by supplying CORRECTED SOURCE CONTENT under the same
@@ -117,7 +128,7 @@ VALIDATION_ISSUE_CODES: tuple[str, ...] = (
 # these. A caller may always override this default via
 # `create_quarantine_record`'s explicit `retry_eligibility` parameter.
 _PERMANENT_ISSUE_CODES = frozenset({
-    NAIVE_TIMESTAMP_WITHOUT_POLICY, AMBIGUOUS_OR_NONEXISTENT_LOCAL_TIME, UNKNOWN_SYMBOL, UNKNOWN_TIMEFRAME,
+    NAIVE_TIMESTAMP_WITHOUT_POLICY, AMBIGUOUS_OR_NONEXISTENT_LOCAL_TIME, UNKNOWN_SYMBOL, UNKNOWN_TIMEFRAME, MISSING_OBSERVATION_VALUE,
 })
 
 

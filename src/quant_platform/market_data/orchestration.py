@@ -497,9 +497,9 @@ def _process_row(
     # `ticks.py`/`events.py`) would otherwise raise `MarketDataEventError`
     # for -- pre-checked here so a bad row is quarantined, never an
     # unhandled exception. `NEGATIVE_VOLUME`/`INVALID_OHLC` are reused
-    # for TICK/QUOTE/TRADE's own positivity/ordering rules; the
-    # specification's 17-code vocabulary has no dedicated code for these,
-    # and both are the closest existing semantic match.
+    # for TICK/QUOTE/TRADE's own positivity/ordering rules; the Phase 3
+    # code vocabulary has no dedicated code for these, and both are the
+    # closest existing semantic match.
     if record_kind is RecordKind.CANDLE:
         volume = decimals.get("volume")
         if volume is not None and volume < 0:

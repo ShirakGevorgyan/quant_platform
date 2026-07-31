@@ -1,23 +1,41 @@
-"""Safety scan (Milestone 10, Phases 2 and 3): confirms the shipped
-`market_data` source (EVERY `*.py` file in the package, including every
-Phase 3 historical-ingestion module -- `_all_source_files()` globs the
-whole directory, so nothing needs re-pointing when a new module is
-added) contains no network clients, no broker code, no credentials, no
-live-trading code, no `float`-typed financial dataclass fields, no
-`uuid4`/`random`-derived economic identity, no internal wall-clock
-economic input, no overwrite/bypass flags, no silent broad exception
-handling, no unsafe `pickle` usage, no cloud-service SDK imports, no
-`eval`/`exec`, and no shell command execution -- plus dedicated
-path-traversal-rejection tests.
+"""Safety scan (Milestone 10, Phases 2, 3, and 4A): confirms the shipped
+`market_data` source (EVERY `*.py` file in the package, RECURSIVELY --
+`_all_source_files()` uses `rglob`, so this reaches the `collectors/`
+subpackage too, and nothing needs re-pointing when a new module is
+added anywhere in the tree) contains no network clients, no broker
+code, no credentials, no live-trading code, no `float`-typed financial
+dataclass fields, no `uuid4`/`random`-derived economic identity, no
+internal wall-clock economic input, no overwrite/bypass flags, no
+silent broad exception handling, no unsafe `pickle` usage, no
+cloud-service SDK imports, no `eval`/`exec`, and no shell command
+execution -- plus dedicated path-traversal-rejection tests.
+
+PHASE 4A CARVE-OUT, EXPLAINED: `collectors/` is the one, deliberately
+isolated, network-CAPABLE subpackage (Milestone 10, Phase 4A) -- it
+legitimately needs `socket` (in `transport.py` ONLY, for pinned-IP
+SSRF-safe connections) and legitimately has function PARAMETERS named
+`api_key` (never a stored field -- see `request_manifest.py`'s own
+structural `SecretExposureError` guard). Two checks below --
+`_FORBIDDEN_NETWORK_IMPORTS` and `_CREDENTIAL_FIELD` -- are therefore
+scanned over `_non_collector_source_files()` (everything this repo has
+always run them over) rather than the full tree, and
+`TestCollectorSpecificSafety` below applies NARROWER, MORE PRECISE
+replacements scoped to `collectors/` specifically: an AST-based check
+that no `@dataclass` field (as opposed to a function parameter) is ever
+credential-shaped, confirmation that `socket` is imported nowhere in
+`collectors/` EXCEPT `transport.py`, and that no third-party HTTP/
+WebSocket library is imported even there.
 
 THE SCANNER IS PROVEN NON-VACUOUS: `TestScannerCatchesDeliberatelyBadCode`
-runs every check against a small, deliberately BAD snippet engineered to
-violate exactly that one rule, asserting the scanner DOES flag it -- a
-scanner that always reports "clean" would pass the real-source checks
-for a trivial (wrong) reason; this class rules that out."""
+(plus `TestCollectorSpecificSafety`'s own non-vacuity checks) runs every
+check against a small, deliberately BAD snippet engineered to violate
+exactly that one rule, asserting the scanner DOES flag it -- a scanner
+that always reports "clean" would pass the real-source checks for a
+trivial (wrong) reason; this class rules that out."""
 
 from __future__ import annotations
 
+import ast
 import re
 import tempfile
 from pathlib import Path
@@ -32,8 +50,11 @@ from quant_platform.market_data.manifests import (
 from quant_platform.market_data.partitions import PartitionStore
 
 _SRC_ROOT = Path(__file__).resolve().parents[3] / "src" / "quant_platform" / "market_data"
+_COLLECTORS_ROOT = _SRC_ROOT / "collectors"
 
 _FORBIDDEN_NETWORK_IMPORTS = re.compile(r"^\s*(import|from)\s+(socket|requests|httpx|aiohttp|urllib\.request|websocket|websockets|ftplib|telnetlib)\b", re.MULTILINE)
+_FORBIDDEN_THIRD_PARTY_NETWORK_IMPORTS = re.compile(r"^\s*(import|from)\s+(requests|httpx|aiohttp|urllib\.request|websocket|websockets|ftplib|telnetlib)\b", re.MULTILINE)
+_RAW_SOCKET_IMPORT = re.compile(r"^\s*(import|from)\s+socket\b", re.MULTILINE)
 _FORBIDDEN_BROKER_IMPORTS = re.compile(r"^\s*(import|from)\s+(MetaTrader5|mt5(?!__)|fxpro)\b", re.MULTILINE)
 _CREDENTIAL_FIELD = re.compile(r"^\s*(password|api_key|api_secret|secret_key|access_token|client_secret)\s*[:=]", re.MULTILINE | re.IGNORECASE)
 _LIVE_TRADING = re.compile(r"\bLIVE_TRADING\b|\bplace_live_order\b|\bsubmit_to_broker\b")
@@ -48,14 +69,31 @@ _CLOUD_SDK_IMPORTS = re.compile(r"^\s*(import|from)\s+(boto3|botocore|azure|goog
 _EVAL_OR_EXEC = re.compile(r"\beval\(|\bexec\(")
 _SHELL_EXECUTION = re.compile(r"\bsubprocess\.\w+\(|\bos\.system\(|\bos\.popen\(")
 _FLOAT_CALL = re.compile(r"\bfloat\(")
+_CREDENTIAL_SHAPED_NAMES = frozenset({"password", "api_key", "apikey", "api_secret", "secret_key", "access_token", "client_secret", "token", "authorization", "secret"})
+_LONG_LITERAL_API_KEY = re.compile(r"api_key\s*=\s*[\"'][A-Za-z0-9_\-]{20,}[\"']", re.IGNORECASE)
 
 
 def _all_source_files() -> list[Path]:
-    return sorted(_SRC_ROOT.glob("*.py"))
+    return sorted(_SRC_ROOT.rglob("*.py"))
+
+
+def _non_collector_source_files() -> list[Path]:
+    return sorted(p for p in _all_source_files() if _COLLECTORS_ROOT not in p.parents)
+
+
+def _collector_source_files() -> list[Path]:
+    return sorted(_COLLECTORS_ROOT.rglob("*.py"))
 
 
 def _combined_source() -> str:
+    """The full tree (`rglob`), used by every check EXCEPT the two with a
+    deliberate, documented `collectors/` carve-out (see module
+    docstring)."""
     return "\n".join(p.read_text(encoding="utf-8") for p in _all_source_files())
+
+
+def _combined_source_non_collector() -> str:
+    return "\n".join(p.read_text(encoding="utf-8") for p in _non_collector_source_files())
 
 
 def _float_call_lines_outside_prose(text: str) -> list[str]:
@@ -89,7 +127,11 @@ def _uuid4_lines_outside_temp_naming(text: str) -> list[str]:
 
 class TestNoNetworkOrBrokerCode:
     def test_no_network_client_imports(self) -> None:
-        source = _combined_source()
+        """Scoped to `_combined_source_non_collector()`: `collectors/`
+        is the one deliberately network-capable subpackage (Milestone
+        10, Phase 4A); `TestCollectorSpecificSafety` applies a narrower,
+        more precise replacement to it (below)."""
+        source = _combined_source_non_collector()
         assert not _FORBIDDEN_NETWORK_IMPORTS.search(source)
 
     def test_no_broker_sdk_imports(self) -> None:
@@ -99,7 +141,15 @@ class TestNoNetworkOrBrokerCode:
 
 class TestNoCredentials:
     def test_no_credential_field_declarations(self) -> None:
-        source = _combined_source()
+        """Scoped to `_combined_source_non_collector()`: `collectors/`
+        legitimately has function PARAMETERS named `api_key` (FRED
+        credential support, supplied by the caller at call time, never
+        stored -- see `request_manifest.py`'s own structural
+        `SecretExposureError` guard). `TestCollectorSpecificSafety`
+        applies a narrower, AST-based replacement scoped to actual
+        dataclass FIELDS (below), which correctly does not confuse a
+        parameter with a stored field."""
+        source = _combined_source_non_collector()
         assert not _CREDENTIAL_FIELD.search(source)
 
 
@@ -109,9 +159,29 @@ class TestNoLiveTrading:
         assert not _LIVE_TRADING.search(source)
 
 
+_DURATION_SHAPED_FLOAT_FIELD_NAMES = frozenset({"connect_timeout", "read_timeout", "wait_seconds_before_next", "retry_after_seconds"})
+
+
+def _is_duration_shaped_float_field_line(line: str) -> bool:
+    """A `float`-typed field/parameter is legitimate ONLY for HTTP
+    transport timeouts and retry/backoff DURATIONS in seconds (never an
+    economic value) -- `collectors/` has several of these
+    (`connect_timeout`, `read_timeout`, `wait_seconds_before_next`,
+    `retry_after_seconds`). This narrowly exempts exactly those
+    duration-shaped names (by exact name, or a `*_timeout`/`*_seconds`
+    suffix) while still catching any OTHER float-typed field, including
+    a genuine financial one that might later appear in `collectors/`."""
+    name = line.strip().split(":", 1)[0].strip()
+    return name in _DURATION_SHAPED_FLOAT_FIELD_NAMES or name.endswith("_timeout") or name.endswith("_seconds")
+
+
 class TestNoFloatFinancialFields:
     def test_no_dataclass_field_annotated_float(self) -> None:
-        for path in _all_source_files():
+        """Scoped to `_non_collector_source_files()`; `collectors/`'s own
+        (narrowly duration-shaped) float fields are separately verified
+        by `TestCollectorSpecificSafety.test_float_fields_are_duration_
+        shaped_only` below."""
+        for path in _non_collector_source_files():
             text = path.read_text(encoding="utf-8")
             matches = _FLOAT_FIELD.findall(text)
             assert matches == [], f"{path.name} declares a float-typed field: {matches}"
@@ -178,7 +248,11 @@ class TestNoFloatFinancialParsing:
     never a float intermediate."""
 
     def test_no_float_call_outside_prose(self) -> None:
-        for path in _all_source_files():
+        """Scoped to `_non_collector_source_files()`; `collectors/retry.py`'s
+        own (narrowly duration-parsing-only) `float(...)` calls are
+        separately verified by `TestCollectorSpecificSafety.
+        test_float_calls_in_collectors_are_duration_parsing_only` below."""
+        for path in _non_collector_source_files():
             flagged = _float_call_lines_outside_prose(path.read_text(encoding="utf-8"))
             assert flagged == [], f"{path.name} calls float(...) outside prose: {flagged}"
 
@@ -269,3 +343,190 @@ class TestSafetyScanIsActuallyExercisedAgainstRealSource:
         assert len(files) >= 13
         combined = _combined_source()
         assert len(combined) > 10_000
+
+    def test_scanner_reaches_the_collectors_subpackage(self) -> None:
+        # Guards against `_all_source_files()` silently reverting to a
+        # non-recursive glob (which would make every check above pass
+        # for `collectors/*.py` vacuously, by never reading it at all).
+        collector_files = _collector_source_files()
+        assert len(collector_files) >= 10
+        assert any(p.name == "transport.py" for p in collector_files)
+        assert any(p in _all_source_files() for p in collector_files)
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 4A: checks specific to the `collectors/` subpackage
+# -- the one deliberately network-capable part of `market_data` (see
+# module docstring's PHASE 4A CARVE-OUT discussion for why the two
+# checks above are scoped away from it, and what replaces them here).
+# --------------------------------------------------------------------------
+def _collector_combined_source() -> str:
+    return "\n".join(p.read_text(encoding="utf-8") for p in _collector_source_files())
+
+
+def _dataclass_fields_with_credential_shaped_names(tree: ast.Module, *, filename: str) -> list[str]:
+    """AST-based (not regex): walks every `@dataclass`-decorated class,
+    inspects only its own direct body statements (`AnnAssign`/`Assign`
+    class-level field declarations) -- structurally CANNOT confuse this
+    with a function parameter (which lives in `FunctionDef.args`, a
+    completely different AST location), unlike the whole-tree regex
+    `_CREDENTIAL_FIELD` this replaces for `collectors/`."""
+    flagged: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        is_dataclass = any(
+            (isinstance(dec, ast.Name) and dec.id == "dataclass")
+            or (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name) and dec.func.id == "dataclass")
+            for dec in node.decorator_list
+        )
+        if not is_dataclass:
+            continue
+        for stmt in node.body:
+            name = None
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                name = stmt.target.id
+            elif isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                name = stmt.targets[0].id
+            if name is not None and name.lower() in _CREDENTIAL_SHAPED_NAMES:
+                flagged.append(f"{filename}:{node.name}.{name} (line {stmt.lineno})")
+    return flagged
+
+
+class TestCollectorSpecificSafety:
+    def test_no_credential_shaped_dataclass_fields(self) -> None:
+        """Replaces `_CREDENTIAL_FIELD` for `collectors/`: no `@dataclass`
+        anywhere in the subpackage stores a raw secret as a FIELD --
+        `CollectorRequestManifest`/`CollectorResponseManifest`/etc. only
+        ever carry `credential_mode: CredentialMode` (a bare label), per
+        `request_manifest.py`'s own structural guard."""
+        for path in _collector_source_files():
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            flagged = _dataclass_fields_with_credential_shaped_names(tree, filename=path.name)
+            assert flagged == [], f"credential-shaped dataclass field(s) found: {flagged}"
+
+    def test_ast_check_is_non_vacuous(self) -> None:
+        bad_source = "from dataclasses import dataclass\n\n@dataclass\nclass Bad:\n    api_key: str\n"
+        tree = ast.parse(bad_source, filename="<bad>")
+        flagged = _dataclass_fields_with_credential_shaped_names(tree, filename="<bad>")
+        assert flagged, "AST-based credential-field check failed to catch a deliberately bad dataclass field"
+
+    def test_ast_check_does_not_flag_a_function_parameter(self) -> None:
+        # The exact shape `fred.py`'s `execute_fred_request` legitimately
+        # uses -- must NOT be flagged, since it is a parameter, not a
+        # stored field.
+        ok_source = "def f(*, api_key: str | None) -> None:\n    pass\n"
+        tree = ast.parse(ok_source, filename="<ok>")
+        flagged = _dataclass_fields_with_credential_shaped_names(tree, filename="<ok>")
+        assert flagged == []
+
+    def test_no_third_party_network_library_even_in_transport(self) -> None:
+        """`collectors/transport.py` may use the stdlib `socket`/`ssl`/
+        `http.client` trio (it is the ONE sanctioned transport
+        implementation) but must never import `requests`/`httpx`/
+        `aiohttp`/a websocket library/`ftplib`/`telnetlib` -- this
+        applies to EVERY file in `collectors/`, transport.py included."""
+        source = _collector_combined_source()
+        assert not _FORBIDDEN_THIRD_PARTY_NETWORK_IMPORTS.search(source)
+
+    def test_raw_socket_import_appears_only_in_transport_py(self) -> None:
+        offenders = [p.name for p in _collector_source_files() if p.name != "transport.py" and _RAW_SOCKET_IMPORT.search(p.read_text(encoding="utf-8"))]
+        assert offenders == [], f"raw `socket` import found outside transport.py: {offenders}"
+        transport_source = (_COLLECTORS_ROOT / "transport.py").read_text(encoding="utf-8")
+        assert _RAW_SOCKET_IMPORT.search(transport_source), "transport.py is expected to import socket (sanity check that the exemption is even exercised)"
+
+    def test_no_websocket_broker_mt5_fxpro_or_live_streaming_code(self) -> None:
+        """Checks actual CODE markers (import statements, the existing
+        `_FORBIDDEN_BROKER_IMPORTS`/`_FORBIDDEN_THIRD_PARTY_NETWORK_
+        IMPORTS` patterns, plus a live-trading-marker regex applied
+        per-file) rather than a bare-word scan -- `collectors/__init__.py`'s
+        own docstring legitimately SAYS "no broker/MT5/FxPro code" in
+        prose while containing none of it."""
+        for path in _collector_source_files():
+            text = path.read_text(encoding="utf-8")
+            assert not _FORBIDDEN_BROKER_IMPORTS.search(text), f"{path.name} imports a broker SDK"
+            assert not re.search(r"^\s*(import|from)\s+websockets?\b", text, re.MULTILINE), f"{path.name} imports a websocket library"
+            assert not _LIVE_TRADING.search(text), f"{path.name} contains a live-trading marker"
+
+    def test_https_only_scheme_enforced(self) -> None:
+        transport_source = (_COLLECTORS_ROOT / "transport.py").read_text(encoding="utf-8")
+        assert '"https"' in transport_source or "'https'" in transport_source
+
+    def test_fred_host_allowlist_is_a_single_exact_hostname(self) -> None:
+        from quant_platform.market_data.collectors.fred import FRED_ALLOWED_HOSTS, FRED_ENDPOINT_HOST
+
+        assert frozenset({"api.stlouisfed.org"}) == FRED_ALLOWED_HOSTS
+        assert FRED_ENDPOINT_HOST == "api.stlouisfed.org"
+
+    def test_transport_request_rejects_empty_allowed_hosts(self) -> None:
+        from datetime import datetime, timezone
+
+        from quant_platform.core.exceptions import CollectorError
+        from quant_platform.market_data.collectors.protocols import TransportRequest
+
+        with pytest.raises(CollectorError):
+            TransportRequest(url="https://api.stlouisfed.org/x", headers={}, allowed_hosts=frozenset(), request_time=datetime(2024, 1, 1, tzinfo=timezone.utc))
+
+    def test_http_url_is_rejected(self) -> None:
+        from quant_platform.core.exceptions import DisallowedUrlError
+        from quant_platform.market_data.collectors.transport import _validate_url_static
+
+        with pytest.raises(DisallowedUrlError):
+            _validate_url_static("http://api.stlouisfed.org/fred/series/observations", allowed_hosts=frozenset({"api.stlouisfed.org"}))
+
+    def test_localhost_url_is_rejected(self) -> None:
+        """Uses the REAL FRED allowlist (never a self-referential one) --
+        the realistic threat model is an attacker-controlled or
+        misconfigured URL pointing at localhost/loopback while the
+        collector's only legitimate intent is ever `api.stlouisfed.org`."""
+        from quant_platform.core.exceptions import DisallowedUrlError
+        from quant_platform.market_data.collectors.fred import FRED_ALLOWED_HOSTS
+        from quant_platform.market_data.collectors.transport import _validate_url_static
+
+        for host in ("localhost", "127.0.0.1", "[::1]"):
+            with pytest.raises(DisallowedUrlError):
+                _validate_url_static(f"https://{host}/x", allowed_hosts=FRED_ALLOWED_HOSTS)
+
+    def test_no_committed_long_literal_api_key(self) -> None:
+        """Distinguishes a short test placeholder (`"SECRET_KEY_VALUE"`,
+        `"test"`, ...) from something that LOOKS like a real, long,
+        opaque committed credential. Scans both the `collectors/` source
+        AND this test file's own sibling `test_collectors_*.py` fixtures
+        (which legitimately construct manifests with `api_key=...`
+        arguments), catching the literal mistake this repo must never
+        make in either place."""
+        source = _collector_combined_source()
+        assert not _LONG_LITERAL_API_KEY.search(source)
+        tests_dir = Path(__file__).resolve().parent
+        for path in sorted(tests_dir.glob("test_collectors_*.py")):
+            assert not _LONG_LITERAL_API_KEY.search(path.read_text(encoding="utf-8")), f"{path.name} contains a long literal api_key= value"
+
+    def test_float_fields_are_duration_shaped_only(self) -> None:
+        """Replaces `_FLOAT_FIELD` for `collectors/`: every float-typed
+        field/parameter here is an HTTP timeout or retry/backoff
+        DURATION in seconds -- never an economic value (see
+        `_is_duration_shaped_float_field_line`'s own docstring)."""
+        for path in _collector_source_files():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if _FLOAT_FIELD.match(line) and not _is_duration_shaped_float_field_line(line):
+                    raise AssertionError(f"{path.name} declares a non-duration-shaped float field: {line.strip()!r}")
+
+    def test_duration_shaped_float_field_check_is_non_vacuous(self) -> None:
+        assert not _is_duration_shaped_float_field_line("    price: float")
+        assert _is_duration_shaped_float_field_line("    connect_timeout: float")
+        assert _is_duration_shaped_float_field_line("    wait_seconds_before_next: float")
+
+    def test_float_calls_in_collectors_are_duration_parsing_only(self) -> None:
+        """Replaces `_float_call_lines_outside_prose` for `collectors/`:
+        the only `float(...)` call sites in the whole subpackage live in
+        `retry.py`, parsing a configured backoff DURATION or an
+        HTTP `Retry-After` header's seconds value -- never a financial
+        quantity (which, throughout `collectors/`, is always parsed via
+        `source_normalization.parse_source_decimal`, never `float`)."""
+        for path in _collector_source_files():
+            flagged = _float_call_lines_outside_prose(path.read_text(encoding="utf-8"))
+            if not flagged:
+                continue
+            assert path.name == "retry.py", f"{path.name} calls float(...) outside retry.py's own duration parsing: {flagged}"
+            for line in flagged:
+                assert "seconds" in line or "stripped" in line, f"unexpected float(...) call shape in retry.py: {line!r}"

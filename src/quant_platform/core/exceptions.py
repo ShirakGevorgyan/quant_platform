@@ -1528,3 +1528,151 @@ class HistoricalVerificationError(HistoricalIngestionError):
     consuming its report) when a FATAL cross-consistency check fails and
     the caller has asked for that to raise rather than merely be
     reported as an issue."""
+
+
+# --------------------------------------------------------------------------
+# Secure external historical collector infrastructure and FRED integration
+# (Milestone 10, Phase 4A). `CollectorError` is a SIBLING of
+# `HistoricalIngestionError` (both `MarketDataError` directly), not a
+# subclass of it -- the collector layer is network-capable (for HISTORICAL
+# data only, never live), a materially different trust boundary than
+# Phase 3's purely offline ingestion layer, and callers must be able to
+# catch "something about talking to an external collector went wrong"
+# separately from "something about the purely offline ingestion pipeline
+# went wrong."
+# --------------------------------------------------------------------------
+class CollectorError(MarketDataError):
+    """Base class for every failure in
+    `quant_platform.market_data.collectors`. This layer fetches HISTORICAL
+    data only, over HTTPS, from an explicit host allowlist -- it never
+    opens a live/streaming connection, never imports a broker SDK, and
+    never executes an order."""
+
+
+class DisallowedUrlError(CollectorError):
+    """Raised when a URL fails STATIC security validation before any
+    connection is attempted: a non-HTTPS scheme, userinfo in the URL, an
+    IP-literal host, a host not on the caller-supplied allowlist, or any
+    other structural rule a URL must satisfy before a transport is even
+    permitted to resolve it."""
+
+
+class SsrfTargetError(CollectorError):
+    """Raised when a hostname RESOLVES (via DNS) to a loopback, private,
+    link-local, multicast, unspecified, or otherwise non-global address --
+    including when this is discovered only at connect time (the
+    DNS-rebinding case: a hostname that legitimately resolved to a public
+    address during allowlist validation resolves to a private address by
+    the time of actual connection). Distinct from `DisallowedUrlError`,
+    which is a purely static, pre-DNS check on the URL string itself."""
+
+
+class RedirectViolationError(CollectorError):
+    """Raised when a redirect cannot be safely followed: the maximum
+    redirect count was exceeded, a redirect target fails the SAME full
+    security validation the original URL underwent, or a redirect
+    attempts a scheme downgrade (HTTPS -> HTTP)."""
+
+
+class TransportTimeoutError(CollectorError):
+    """Raised when a connect or read timeout elapses. Never conflated
+    with a data-quality failure -- a timeout is purely a transport-layer,
+    infrastructure-level fact, and the retry layer classifies it as
+    retryable."""
+
+
+class ResponseTooLargeError(CollectorError):
+    """Raised when a response body would exceed the caller-configured
+    maximum size -- checked incrementally while reading, so an
+    oversized response is rejected before its full body is ever held in
+    memory."""
+
+
+class RetryExhaustedError(CollectorError):
+    """Raised when a request has been retried per its `RetryPolicy` up
+    to `max_attempts` and every attempt still failed."""
+
+
+class RateLimitUnavailableError(CollectorError):
+    """Raised when a caller requests a rate-limit token be acquired in a
+    mode that fails closed rather than waits, and no token is currently
+    available."""
+
+
+class MalformedFredResponseError(CollectorError):
+    """Raised when a FRED response cannot be parsed as valid JSON/CSV
+    matching FRED's own documented schema shape at all -- a structural
+    parse failure, distinct from a single malformed OBSERVATION within an
+    otherwise well-formed response (which is `fred_schemas.py`'s own
+    per-row quarantine concern, not this)."""
+
+
+class UnsupportedFredSchemaError(CollectorError):
+    """Raised when a FRED response's own declared/inferred schema
+    version, file type, or top-level shape is not one this collector
+    knows how to parse."""
+
+
+class ResponseIntegrityError(CollectorError):
+    """Raised when raw response bytes do not match their own recorded
+    `raw_content_digest` (on re-hash), or a response manifest's declared
+    `byte_length`/`content_type` disagrees with the actual persisted
+    bytes -- a tamper/corruption signal, never silently repaired."""
+
+
+class CacheCorruptionError(CollectorError):
+    """Raised when the raw-response cache's own on-disk state cannot be
+    trusted: bytes missing for a manifest that claims to exist, bytes
+    present but re-hashing does not reproduce the recorded digest, or a
+    conflicting write is attempted under an identity the cache already
+    durably holds different content for."""
+
+
+class SecretExposureError(CollectorError):
+    """Raised when a caller-supplied credential (an API key) is detected
+    somewhere it must never appear -- a request manifest, a response
+    manifest, a report, a durable artifact, or an exception message.
+    Exists primarily so the safety-scan/redaction tests have a specific,
+    unambiguous failure mode to assert against."""
+
+
+class CollectorRequestManifestError(CollectorError):
+    """Raised when a `CollectorRequestManifest` is structurally invalid,
+    or its own identity cannot be reproduced from its recorded fields."""
+
+
+class CollectorResponseManifestError(CollectorError):
+    """Raised when a `CollectorResponseManifest` is structurally invalid
+    (e.g. a partial/incomplete response marked complete), or its own
+    identity cannot be reproduced from its recorded fields."""
+
+
+class CollectorOrchestrationError(CollectorError):
+    """Base class for collector-operation stage-machine failures --
+    the collector-side analogue of `OrchestrationError`."""
+
+
+class CollectorOrchestrationStateError(CollectorOrchestrationError):
+    """Raised for an illegal collector-operation stage transition, or an
+    attempt to advance past a stage its own durable evidence does not
+    yet support."""
+
+
+class CollectorOrchestrationConflictError(CollectorOrchestrationError):
+    """Raised when a collector operation is resubmitted under the same
+    operation identity with DIFFERENT inputs. An exact retry is
+    idempotently absorbed instead and never raises this."""
+
+
+class CollectorReconciliationError(CollectorError):
+    """Raised when collector reconciliation cannot complete structurally
+    (a referenced store/artifact cannot even be read), as opposed to an
+    ordinary structured reconciliation issue, which is a normal,
+    expected, non-raising finding."""
+
+
+class CollectorVerificationError(CollectorError):
+    """Raised by collector verification (or a caller consuming its
+    report) when a FATAL cross-consistency check fails and the caller
+    has asked for that to raise rather than merely be reported as an
+    issue."""

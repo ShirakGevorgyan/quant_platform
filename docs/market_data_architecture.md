@@ -1,6 +1,6 @@
 # Deterministic Market Data Platform and Feature Store (Milestone 10) -- Architecture
 
-## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) delivered
+## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) + Phase 4A (secure external historical collector infrastructure and FRED integration) delivered
 
 ## Primary goal
 
@@ -679,7 +679,9 @@ matters for conflict detection.
 
 **Quarantine** (`quarantine.py`). `QuarantineRecord` stores the SAFE,
 already-text-only `raw_fields` (never a blob) plus stable, machine-
-readable issue codes (17 total) and a `RetryEligibility` classification
+readable issue codes (18 total as of Phase 4A -- `missing_observation_value`
+added for FRED's `"."` missing-value convention, see Phase 4A section
+below) and a `RetryEligibility` classification
 (RETRYABLE if corrected source content alone could fix it; PERMANENT if
 it needs a config/mapping change). Keyed by the PHYSICAL
 `(source_manifest_id, row_index)` coordinate; `ingestion_batch_id` is
@@ -727,6 +729,324 @@ repository; none re-reads the original source bytes (the caller's own
 check). `reconciliation.py` gained `reconcile_historical_ingestion_operation`,
 spanning the operation ledger, quarantine store, provenance store,
 checkpoint store, and manifest history for one operation.
+
+## Secure external historical collector infrastructure and FRED integration (Phase 4A)
+
+Phase 4A answers "how does the first REAL external network source get
+in, without weakening anything Phases 1-3 already guarantee." It adds a
+strictly isolated, network-CAPABLE subpackage, `market_data.collectors`,
+that never bypasses Phase 3's own ingestion pipeline: every byte a
+collector downloads is persisted, verified, and normalized through the
+identical source-manifest / provenance / quarantine machinery Phase 3
+already shipped, entered through one new bridge (`DatasetKind.
+MACRO_OBSERVATIONS`) rather than a parallel path. No other package in
+this repository imports `collectors`; nothing outside it ever opens a
+socket.
+
+**Required flow** (never short-circuited): remote request -> immutable
+request manifest -> raw response bytes -> immutable response manifest
+-> Phase 3-compatible source manifest -> strict FRED adapter ->
+normalization/validation/quarantine -> durable repository (`macro.
+MacroEventStore`). The collector layer never writes a `MarketEvent`/
+`MacroEvent` directly; `orchestration.run_fred_macro_ingestion_operation`
+is the only path.
+
+**Transport protocol** (`protocols.py`). `HistoricalHttpTransport` is a
+`Protocol` (structural typing, mirroring `adapters.
+HistoricalSourceAdapter`'s own convention) -- every collector depends on
+this shape, never a concrete HTTP library, so collector-level logic is
+tested with a deterministic `FakeTransport` double, never a real
+connection. `TransportRequest` mandates a non-empty `allowed_hosts`,
+positive timeouts, and a non-negative `max_redirects`; `request_time` is
+caller-supplied only -- the transport itself never reads the wall clock.
+
+**`StdlibHttpsTransport`** (`transport.py`). No third-party HTTP library
+is an existing repository dependency (`pyproject.toml` was checked;
+there is none), so this uses only `http.client`/`ssl`/`socket`/
+`ipaddress` from the standard library. TWO-PHASE SSRF defense:
+1. `_validate_url_static` -- a pure, pre-DNS check: scheme must be
+   `https`, no userinfo, host present, host on the caller's EXPLICIT
+   allowlist (case-insensitive), host is NOT an IP literal (rejected
+   outright, regardless of allowlist -- blocks `127.0.0.1`, private
+   ranges, and metadata-service addresses like `169.254.169.254` even if
+   a caller ever mistakenly allowlisted one).
+2. `_resolve_and_validate_address` -- resolves the (already-allowlisted)
+   HOSTNAME via `socket.getaddrinfo` and validates the ACTUAL RESOLVED
+   IP is globally routable (`not (is_private or is_loopback or
+   is_link_local or is_multicast or is_reserved or is_unspecified)`),
+   defending against DNS rebinding (a hostname legitimately public at
+   allowlist-check time resolving to a private address by connect time).
+   Resolves ONCE, validates every candidate, connects DIRECTLY to a
+   validated IP (never re-resolving the hostname internally) -- closing
+   the classic time-of-check/time-of-use gap. `_PinnedHTTPSConnection`
+   still sends the ORIGINAL hostname via SNI/`Host` for correct TLS
+   certificate validation against the pinned IP.
+
+   RESIDUAL, HONESTLY-DISCLOSED LIMITATION: a compromised, ALREADY-
+   VALIDATED IP's own routing at the OS/network level is out of this
+   layer's control -- no application-layer SSRF defense can fully close
+   that gap; `test_collectors_adversarial.py` asserts this limitation
+   stays documented, not silently assumed away.
+
+Redirects are NEVER followed unless `allow_redirects=True`; every
+redirect hop re-runs the FULL static+DNS validation against its own
+target (never trusts the original URL's validation), a scheme downgrade
+(https->http) fails closed, and `max_redirects` is enforced. Responses
+are read incrementally and bounded by `max_response_bytes` (never
+buffered unbounded first); a non-identity `Content-Encoding` is rejected
+outright (a decompression-bomb defense -- the decompressed size cannot
+be bounded, so compressed responses are refused rather than decoded).
+`ForbiddenTransport` raises immediately on `.get()`, proving a code path
+(offline replay) makes zero network calls, structurally rather than by
+inspection.
+
+**Credential handling.** An API key is supplied by the CALLER, at call
+time, as a plain function parameter (`execute_fred_request(..., api_key:
+str | None, ...)`) -- never a stored field on any dataclass anywhere in
+`collectors/` (enforced two ways: `request_manifest.py`'s structural
+`_reject_secret_shaped_keys` blocklist on canonical query params/headers,
+raising `SecretExposureError`; and an AST-based safety-scan check that
+walks every `@dataclass` in the subpackage and confirms none declares a
+credential-shaped field -- see "Safety scan" below). A manifest records
+only `credential_mode: "anonymous" | "api_key"`, never a secret value or
+a secret-derived digest. The real key reaches exactly one place: the
+in-flight `TransportRequest.url` built by `fred._build_transport_request`,
+never logged, printed, or persisted as a whole object.
+
+**Request/response manifests** (`request_manifest.py`/
+`response_manifest.py`). Both immutable and content-addressed, mirroring
+`source_manifests.py`'s own `to_identity_payload()` pattern exactly.
+`CollectorRequestManifest` excludes `request_time` from identity (the
+same semantic request resubmitted later is still "the same request");
+`CollectorResponseManifest` excludes `received_time`/
+`transport_attempt_count` (operational). Response headers are
+CANONICALIZED VIA AN ALLOWLIST (`content-type`, `content-length`,
+`date`, `last-modified`, `etag`) rather than a blocklist -- deliberately
+safer, since an unanticipated future header (a vendor session token, a
+new auth scheme) is excluded by default rather than requiring the
+blocklist to have already known about it; a second, independent
+blocklist check (`authorization`, `set-cookie`, `x-api-key`, ...) still
+defends the allowlist itself.
+
+**Raw response cache** (`cache.py`). Content-addressed
+(`{response_manifest_id}/manifest.json` + `body.bin`), atomic write, and
+idempotent for an exact retry (byte-identical body already on disk);
+raises `CacheCorruptionError` for a conflicting write under the same
+identity, never silently overwrites. Re-hashes on every read by default
+(`verify=True` is the NORMAL path, not an opt-in). A response/request
+manifest id is validated as exactly 64 lowercase hex characters before
+touching the filesystem -- path traversal is structurally unreachable, not
+merely discouraged (reuses `MarketDataPathSecurityError`). A separate,
+append-only per-request index (`request_index/{request_manifest_id}/
+responses.jsonl`) explicitly models the spec's own required distinction:
+`response_manifest_id` is the ACTUAL response's identity (changes if the
+bytes differ); `request_manifest_id` is the SEMANTIC request's identity
+(stable even when the server legitimately returns new content at a later
+`request_time`, e.g. FRED publishing a fresh observation).
+
+**Retry policy** (`retry.py`). `classify_failure`/`plan_next_wait_seconds`/
+`parse_retry_after` are PURE (no sleep, no wall-clock read) -- every
+retry-DECISION test runs in microseconds. A permanent client error
+(400/401/403) is structurally never retryable (`RetryPolicy.__post_init__`
+refuses to construct a policy that tries to make one retryable, so this
+cannot even be misconfigured). The actual attempt LOOP -- which does call
+a transport and does, in real use, sleep between attempts -- lives in
+`fred.execute_fred_request`, the one place transport, retry, and
+rate-limiting genuinely need to coordinate together; `sleep_fn` is fully
+injectable (default `time.sleep`), so tests assert the exact deterministic
+attempt sequence without ever waiting.
+
+**Rate limiting** (`rate_limit.py`). A pure, immutable token-bucket model
+-- every function returns a NEW `TokenBucketState`, never mutates in
+place; the caller supplies `now` explicitly. No global mutable singleton;
+rate-limit state never participates in any semantic identity (a
+`TokenBucketState` has no `to_identity_payload` at all).
+
+**FRED collector** (`fred.py`, `fred_schemas.py`, `macro_normalization.py`).
+`FRED_ALLOWED_HOSTS = frozenset({"api.stlouisfed.org"})` -- the ONLY host
+this collector will ever contact. `FRED_EXAMPLE_SERIES` (`DFII10`,
+`DGS10`, `CPIAUCSL`, `DFF`) is explicitly documented as examples, never
+enforced as an allowlist; `build_fred_request_manifest` accepts any
+`series_id`. `parse_fred_json_response`/`parse_fred_csv_response` are
+STRICT and TEXT-ONLY: a JSON `value`/`date` must be a JSON string (a JSON
+NUMBER is rejected outright -- the single most important rule, since a
+number would silently round-trip through float on the way in), required
+keys are enforced, undeclared keys are rejected under strict mode.
+`is_missing_value` checks FRED's own `"."` convention explicitly --
+`macro_normalization.normalize_macro_row` never silently coerces a
+missing observation to `0`; it quarantines under the new
+`MISSING_OBSERVATION_VALUE` issue code (see below), keeping it distinct
+from `INVALID_DECIMAL` (a genuinely malformed, PRESENT value) -- two
+different failure modes that call for different remediation.
+
+POINT-IN-TIME SAFETY, the single most important design decision in this
+phase: `MacroEvent.event_time` is derived from FRED's `realtime_start`
+field (the vintage/publication-date proxy FRED's own schema provides),
+NEVER from FRED's `date` field (the OBSERVATION PERIOD a value
+describes -- e.g. `"2024-01-01"` for January CPI, published only in
+mid-February). Using `date` as `event_time` would be exactly the
+look-ahead bias `core.exceptions.PointInTimeViolationError` exists to
+catch. Both are parsed as UTC MIDNIGHT (`observation_date_to_event_time`
+-- a bare calendar date carries no intraday precision and needs no DST
+disambiguation, so this bypasses `source_normalization.
+parse_source_timestamp`'s DST machinery entirely). The true observation
+period is never lost -- it is preserved in `source_event_id`
+(`f"fred:{series_id}:date={date}"`), so a monthly CPI observation's own
+monthly meaning survives even though `event_time` reflects the
+(potentially much later) vintage date. A response format lacking
+per-row vintage information (this module's own CSV parsing path) cannot
+honestly derive `event_time` this way; `normalize_macro_row` accepts an
+explicit `default_realtime_start` for exactly that case and quarantines
+(`EMPTY_TIMESTAMP`) a row with neither.
+
+`FredSourceAdapter` implements Phase 3's `HistoricalSourceAdapter`
+Protocol structurally and performs ZERO network I/O itself (mirrors
+`CsvCandleAdapter` reading a local file); `load_fred_adapter_from_cache`
+is the ONLY construction path, reading exclusively from `RawResponseCache`
+-- "persist raw downloaded bytes before parsing" is enforced
+structurally, not by convention, since there is no constructor that
+accepts raw bytes directly from a live transport call.
+
+**Unit mapping** (`macro_normalization.py`). `UnitMappingSpec` mirrors
+`mappings.py`'s own versioned, content-addressed pattern exactly.
+`scale_factor` defaults to `1` (store exactly as FRED reports it, only
+labeled with the correct `MacroUnit`); a genuine conversion (e.g. percent
+-> basis points) is an explicit, non-default `scale_factor`, applied via
+Decimal multiplication, never float. An unmapped series fails closed
+(`UNKNOWN_SYMBOL`).
+
+**Narrow, additive extensions to already-shipped Phase 1-3 infrastructure**
+(the same "reuse where reuse is cheap, extend narrowly where it is not"
+discipline Phase 3 itself established): `DatasetKind.MACRO_OBSERVATIONS`
+(scoping-only identity for `ProvenanceStore`/`QuarantineStore`/the new
+`CollectorOperationStore` storage paths -- does NOT participate in
+`DatasetManifest`/`PartitionStore` versioning, which stays
+candle/tick/quote/trade-shaped only; the durable economic record store
+for macro data remains Phase 1's own `macro.MacroEventStore`, constructed
+directly since `MarketDataRepository` has no `macro_event_store` field);
+`RecordKind.MACRO_OBSERVATION` and `SourceKind.FRED_API`
+(`source_manifests.py`); `MISSING_OBSERVATION_VALUE`, the 18th quarantine
+issue code, classified `PERMANENT` (a missing observation is not fixed by
+resubmitting the identical request).
+
+**Orchestration** (`collectors/orchestration.py`). A SEPARATE,
+self-contained `CollectorOperationStage`/`CollectorOperationStore` --
+deliberately NOT a reuse of Phase 3's own `OperationStore`/
+`IngestionStage` (which are typed specifically to committing
+`MarketDataEvent`s via `ingest_raw_events`, a materially different commit
+target than a `MacroEvent`; genericizing them would have touched
+`reconciliation.py`'s multiple `is IngestionStage.X` comparisons and
+existing Phase 3 tests -- too wide a blast radius for this phase). The
+11-stage machine duplicates the SAME proven idempotent/conflict/
+monotonic-progression algorithm `OperationStore.advance` already
+established, applied to a new but structurally identical problem:
+`REQUEST_PLANNED -> REQUEST_MANIFEST_COMMITTED -> RESPONSE_DOWNLOADED ->
+RAW_RESPONSE_COMMITTED -> RESPONSE_VERIFIED -> SOURCE_MANIFEST_CREATED ->
+SOURCE_PARSED -> NORMALIZED_RECORDS_PRODUCED ->
+REPOSITORY_INGESTION_COMMITTED -> PROVENANCE_COMMITTED ->
+VERIFICATION_COMPLETED`.
+
+`FetchMode.FRESH` calls `execute_fred_request` for real (via an injected
+transport); `FetchMode.CACHED_REPLAY` reads an already-cached response by
+`request_manifest_id` (or a caller-pinned `reference_response_manifest_id`)
+and NEVER touches a transport -- a caller wanting a structural guarantee
+of this passes `transport=None` (the default; untouched in
+`CACHED_REPLAY` mode) or a `ForbiddenTransport`. `fetch_mode` and
+`reference_response_manifest_id` are deliberately EXCLUDED from the
+operation's own content-digest identity: they describe HOW an operation
+is executed THIS particular time, not WHAT it semantically is -- this is
+what lets an exact retry of the same `operation_id` switch fetch modes
+and still be recognized as the same operation, while a FRESH retry that
+happens to pull genuinely DIFFERENT response bytes is still caught, one
+level down, as a per-stage evidence conflict at `RESPONSE_DOWNLOADED`
+(modeling the spec's own "a fresh-network policy may produce a new
+response version" case explicitly, without conflating it with an exact
+retry).
+
+The raw-response CACHE WRITE itself is unconditional, even under
+`dry_run=True` -- "persist raw response bytes before parsing" is a
+structural invariant Stage 7 depends on (`load_fred_adapter_from_cache`
+reads exclusively from the cache), not a business-record commit; writing
+to a content-addressed, idempotent store carries no semantic weight of
+"this operation happened" the way appending to the operation ledger/
+quarantine/provenance/macro-event stores does. `dry_run=True` therefore
+still exercises the full parse/normalize computation (an honest preview)
+while writing NOTHING to any of those four business-record stores.
+
+A PRE-FLIGHT provenance-conflict check runs before Stage 9's repository
+write (mirroring the exact defect-preventing pattern Phase 3's own
+`orchestration.py` already established): if the row this operation would
+produce resolves to a DIFFERENT `event_id` than an already-bound
+`(source_manifest_id, row_index)` coordinate, the operation aborts before
+touching `macro.MacroEventStore` at all -- preventing an orphaned event
+with no matching provenance record. `ProvenanceStore.append` itself
+independently refuses a conflicting write too (defense in depth). One
+consequence, deliberately not softened: a genuinely NEW `operation_id`
+over ALREADY-INGESTED source data is correctly REJECTED, not silently
+re-ingested under a new sequence number -- exact retry of already-
+committed rows must reuse the SAME `operation_id`, identical to Phase 3's
+own documented limitation for historical ingestion.
+
+**Verification** (`collectors/verification.py`). Reuses `market_data.
+verification`'s own `ValidationIssue`/`ValidationReport`/
+`ValidationSeverity` vocabulary directly. Unlike reconciliation (below),
+`verify_fred_macro_operation` REDERIVES every artifact fresh from
+caller-declared collector construction parameters -- rebuilding the
+request manifest via `fred.build_fred_request_manifest`, re-reading raw
+bytes via the cache, reparsing them via `fred_schemas.parse_fred_*_response`
+directly (never `load_fred_adapter_from_cache`, which exists to serve
+orchestration, not verification), and re-normalizing every row via
+`macro_normalization.normalize_macro_row` -- the same PURE functions
+orchestration used, invoked completely independently against durable
+artifacts only. Never trusts a cached parsed result.
+
+**Reconciliation** (`collectors/reconciliation.py`). Complementary to
+verification: needs no original construction parameters, only a
+`provider`/`series_id`, scanning ALREADY-STORED evidence purely against
+ITSELF -- the shape of check an ops/recovery tool runs without knowing
+how an operation was originally built. Detects: missing raw response,
+digest mismatch, truncated payload, unexpected content type, wrong
+request/response linkage, missing/duplicate observation, a repository
+record with no matching provenance, provenance for an event absent from
+the repository, a series ingested under two DIFFERENT unit mappings, and
+conflicting vintages (the same observation date and the same vintage
+recording two DIFFERENT values). "STALE CHECKPOINT," SCOPE NOTE: Phase
+4A deliberately did not add a separate `CollectorCheckpoint`/
+`CollectorCheckpointStore` -- Phase 3's own `checkpoints.py` is shaped for
+partitioned, multi-batch raw-ingestion backfills, a materially different
+resumability concern than a single per-`operation_id` FRED fetch, which
+`CollectorOperationStore` already makes fully resumable on its own; the
+honest analogue reported here is an operation ledger entry that never
+reached `VERIFICATION_COMPLETED` (`stalled_operation`).
+
+**Reports** (`collectors/reports.py`). Mirrors `market_data.reports`'s
+own convention: every function wraps an object this package already
+produces into a stable, deterministic dict, never re-deriving new facts.
+`generate_quarantine_summary_report`/`generate_provenance_summary_report`/
+`generate_reconciliation_report`/`generate_verification_report` are
+RE-EXPORTED UNCHANGED from `market_data.reports` (all four are already
+`DatasetKey`-generic, so Phase 3's own implementations serve macro
+datasets exactly as they are). Every report here is secret-free BY
+CONSTRUCTION -- assembled purely from objects that are themselves
+structurally secret-free; no function in this module ever even accepts a
+raw credential as an argument.
+
+**Safety scan** (`test_market_data_safety_scan.py`). `_all_source_files()`
+now uses `rglob`, reaching `collectors/*.py`; two of the pre-existing
+checks (`_FORBIDDEN_NETWORK_IMPORTS`, `_CREDENTIAL_FIELD`) are scoped
+away from `collectors/` (which legitimately needs `socket` in
+`transport.py` and has function parameters named `api_key`) and replaced
+by narrower, more precise `TestCollectorSpecificSafety` checks: an
+AST-based scan confirming no `@dataclass` field (as opposed to a function
+parameter -- structurally impossible to confuse, since a parameter lives
+in `FunctionDef.args`, never a class body) is ever credential-shaped;
+confirmation that `socket` is imported nowhere in `collectors/` except
+`transport.py`, and that no third-party HTTP/WebSocket library is
+imported even there; HTTPS-only-scheme and single-exact-hostname
+allowlist assertions; direct SSRF non-vacuity proofs (HTTP URL rejected,
+localhost rejected); and a scan for an accidentally-committed long
+opaque literal following `api_key=`, applied to BOTH the `collectors/`
+source and this test suite's own `test_collectors_*.py` fixtures.
 
 ## Known limitations (honestly disclosed)
 
@@ -786,6 +1106,33 @@ Phase 3:
   record list in tests.
 - No CLI surface: library only, matching Phases 1 and 2.
 
+Phase 4A:
+- `StdlibHttpsTransport`'s own wire-level pinned-IP connection and HTTP
+  response construction (including the `Content-Encoding` rejection
+  path) is exercised indirectly, not by a dedicated offline unit-test
+  harness -- that would require deep mocking of stdlib `http.client`'s
+  internals. The collector layer above it is fully protocol-abstracted
+  (`HistoricalHttpTransport`) and thoroughly tested via `FakeTransport`;
+  `StdlibHttpsTransport`'s own SECURITY-CRITICAL logic (URL/host/IP
+  validation, redirect rejection, size-bounded reading) IS directly
+  unit-tested (`test_collectors_transport_security.py`) without this gap.
+- CSV support in `fred_schemas.parse_fred_csv_response` targets FRED's
+  documented two-column `DATE,<SERIES_ID>` downloadable-series export
+  shape, an explicit, disclosed assumption -- this phase performs zero
+  live FRED requests, so it is never verified against a live response.
+- No separate `CollectorCheckpoint`/`CollectorCheckpointStore` (see the
+  Reconciliation subsection above for the reasoning); a single
+  per-`operation_id` fetch is fully resumable through
+  `CollectorOperationStore` alone, which is this phase's actual scope.
+- No pagination support: FRED's `/fred/series/observations` endpoint is
+  called with an explicit `observation_start`/`observation_end` window
+  per request; a caller needing more than one page issues more than one
+  operation. The request/response manifest schemas both carry pagination
+  fields (`pagination_page_index`/`pagination_next_token`) for a future
+  phase to use without a breaking schema change, but nothing in this
+  phase populates or consumes them.
+- No CLI surface: library only, matching Phases 1-3.
+
 ## Future phases (not started)
 
 Session-reset VWAP; Wilder-smoothed ATR/RSI variants; macro-derived
@@ -795,6 +1142,8 @@ granularity-changing (daily-to-monthly) compaction; windowed/bounded
 store reads for large-scale partition rebuild; integration with
 `portfolio_risk`/`execution_gateway` as their own authoritative
 market-data source (this milestone explicitly forbade touching either
-package); real external collectors (Yahoo Finance, FRED, MT5, broker/
-news APIs), live streaming, and CLI expansion (explicitly out of scope
-through Phase 3, reserved for a future milestone).
+package); FRED pagination and additional collector endpoints beyond
+`/fred/series/observations`; further external collectors (Yahoo
+Finance, MT5, broker/news APIs -- Phase 4A delivered FRED only), live
+streaming, and CLI expansion (explicitly out of scope through Phase 4A,
+reserved for a future milestone).
