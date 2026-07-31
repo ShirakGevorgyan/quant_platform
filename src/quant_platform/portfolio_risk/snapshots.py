@@ -164,6 +164,23 @@ def create_price_snapshot(
     )
 
 
+def verify_price_snapshot_identity(price: PriceSnapshot, expected_id: str) -> bool:
+    """Pure recomputation-and-compare -- never trusts `price.
+    price_snapshot_id` (or a caller-supplied `expected_id`) without
+    recomputing it fresh from `price`'s own content. Mirrors `specs.
+    verify_portfolio_risk_spec_identity`'s identical shape (Phase 1,
+    Milestone 9); added in Phase 2 to detect a forged/tampered snapshot
+    presented to `evaluator.evaluate_risk` -- e.g. one round-tripped
+    through `from_json_dict` with a hand-edited payload whose `price_
+    snapshot_id` field was never recomputed."""
+    provisional = PriceSnapshot(
+        price_snapshot_id="0" * 64, instrument_id=price.instrument_id, bid=price.bid, ask=price.ask, reference_price=price.reference_price,
+        event_time=price.event_time, source_event_id=price.source_event_id,
+    )
+    recomputed_id = compute_content_id(PRICE_SNAPSHOT_KIND, provisional.to_identity_payload())
+    return recomputed_id == price.price_snapshot_id == expected_id
+
+
 def is_price_stale(price: PriceSnapshot, *, reference_time: datetime, maximum_age_seconds: int | None) -> bool:
     """`maximum_age_seconds=None` means "not configured" -- never
     considered stale by this check (mirrors `PortfolioRiskPolicy`'s own
@@ -375,6 +392,20 @@ def create_portfolio_snapshot(
     )
 
 
+def verify_portfolio_snapshot_identity(portfolio: PortfolioSnapshot, expected_id: str) -> bool:
+    """Pure recomputation-and-compare -- see `verify_price_snapshot_
+    identity`'s identical rationale (Phase 2 addition, forged/tampered
+    snapshot detection for `evaluator.evaluate_risk`)."""
+    provisional = PortfolioSnapshot(
+        portfolio_id=portfolio.portfolio_id, snapshot_id="0" * 64, event_time=portfolio.event_time, cash=portfolio.cash, equity=portfolio.equity,
+        realized_pnl=portfolio.realized_pnl, unrealized_pnl=portfolio.unrealized_pnl, peak_equity=portfolio.peak_equity,
+        daily_start_equity=portfolio.daily_start_equity, positions=portfolio.positions,
+        source_execution_session_id=portfolio.source_execution_session_id,
+    )
+    recomputed_id = compute_content_id(PORTFOLIO_SNAPSHOT_KIND, provisional.to_identity_payload())
+    return recomputed_id == portfolio.snapshot_id == expected_id
+
+
 def is_portfolio_snapshot_stale(snapshot: PortfolioSnapshot, *, reference_time: datetime, maximum_age_seconds: int | None) -> bool:
     if maximum_age_seconds is None:
         return False
@@ -472,4 +503,6 @@ __all__ = [
     "create_price_snapshot",
     "is_portfolio_snapshot_stale",
     "is_price_stale",
+    "verify_portfolio_snapshot_identity",
+    "verify_price_snapshot_identity",
 ]
