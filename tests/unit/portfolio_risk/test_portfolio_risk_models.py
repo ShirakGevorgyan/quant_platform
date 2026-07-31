@@ -42,12 +42,30 @@ class TestRiskCheckSeverityOrdering:
 
 
 class TestRiskAuthorizationStatusTransitions:
-    def test_issued_can_transition_to_every_terminal_status(self) -> None:
-        for target in (RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.REVOKED):
+    def test_issued_can_transition_to_reserved_or_directly_to_a_terminal_status(self) -> None:
+        for target in (
+            RiskAuthorizationStatus.RESERVED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.INVALIDATED,
+            RiskAuthorizationStatus.REVOKED,
+        ):
             assert is_legal_risk_authorization_status_transition(RiskAuthorizationStatus.ISSUED, target)
 
+    def test_issued_cannot_transition_directly_to_consumed(self) -> None:
+        # A reservation must be recorded before consumption -- see Phase 3's
+        # "RESERVE AND CONSUME SEMANTICS".
+        assert not is_legal_risk_authorization_status_transition(RiskAuthorizationStatus.ISSUED, RiskAuthorizationStatus.CONSUMED)
+
+    def test_reserved_can_transition_to_consumed_or_a_terminal_status(self) -> None:
+        for target in (
+            RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.INVALIDATED,
+            RiskAuthorizationStatus.REVOKED,
+        ):
+            assert is_legal_risk_authorization_status_transition(RiskAuthorizationStatus.RESERVED, target)
+
     def test_no_terminal_status_transitions_anywhere(self) -> None:
-        for terminal in (RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.REVOKED):
+        for terminal in (
+            RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.INVALIDATED,
+            RiskAuthorizationStatus.REVOKED,
+        ):
             for target in RiskAuthorizationStatus:
                 assert not is_legal_risk_authorization_status_transition(terminal, target)
 
@@ -55,7 +73,17 @@ class TestRiskAuthorizationStatusTransitions:
         for current in RiskAuthorizationStatus:
             assert not is_legal_risk_authorization_status_transition(current, RiskAuthorizationStatus.ISSUED)
 
+    def test_nothing_transitions_back_to_reserved(self) -> None:
+        for current in RiskAuthorizationStatus:
+            if current is RiskAuthorizationStatus.ISSUED:
+                continue
+            assert not is_legal_risk_authorization_status_transition(current, RiskAuthorizationStatus.RESERVED)
+
     def test_terminal_classification(self) -> None:
         assert not is_terminal_risk_authorization_status(RiskAuthorizationStatus.ISSUED)
-        for terminal in (RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.REVOKED):
+        assert not is_terminal_risk_authorization_status(RiskAuthorizationStatus.RESERVED)
+        for terminal in (
+            RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.INVALIDATED,
+            RiskAuthorizationStatus.REVOKED,
+        ):
             assert is_terminal_risk_authorization_status(terminal)

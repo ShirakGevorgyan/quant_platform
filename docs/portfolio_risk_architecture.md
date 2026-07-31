@@ -1,18 +1,26 @@
 # Portfolio Risk and Capital Management Engine (Milestone 9) -- Architecture
 
-## Status: Phase 1 (domain foundation) + Phase 2 (deterministic exposure calculation and pre-trade risk evaluation) delivered
+## Status: Phase 1 (domain foundation) + Phase 2 (deterministic exposure calculation and pre-trade risk evaluation) + Phase 3 (immutable authorization lifecycle, append-only ledger, persistence, replay, verification) delivered
 
-This document covers everything Phase 1 AND Phase 2 actually deliver --
-exceptions, config schemas, enums, content-addressed policy/spec
-identity, portfolio/price snapshot models, risk-decision/risk-
-authorization models (Phase 1), and the pure exposure/projection/policy-
+This document covers everything Phase 1, Phase 2, AND Phase 3 actually
+deliver -- exceptions, config schemas, enums, content-addressed policy/
+spec identity, portfolio/price snapshot models, risk-decision/risk-
+authorization models (Phase 1); the pure exposure/projection/policy-
 check/sizing/evaluation layer that turns those models into a real
-`RiskDecision` (Phase 2). It explicitly marks every later-phase concept
-(durable ledger, crash recovery, CLI, execution-gateway enforcement,
-acceptance workflow) as NOT YET IMPLEMENTED rather than silently omitting
-it. Sections for those later phases are present as headings with a
-one-line status note, so this document's own structure does not need to
-be reshuffled as each phase lands -- only expanded.
+`RiskDecision` (Phase 2); and the durable, append-only, hash-chained risk
+ledger, `RiskAuthorization` issuance/reservation/consumption lifecycle,
+recovery, reconciliation, independent verification, deterministic replay,
+and reporting that turn a `RiskDecision` into an auditable, single-use
+authorization (Phase 3). It explicitly marks every later-phase concept
+(CLI, execution-gateway enforcement, acceptance workflow) as NOT YET
+IMPLEMENTED rather than silently omitting it. Sections for those later
+phases are present as headings with a one-line status note, so this
+document's own structure does not need to be reshuffled as each phase
+lands -- only expanded.
+
+**Phase 3 baseline**: Phase 2 was committed at
+`4aac98c` ("Add deterministic portfolio risk evaluation engine"). Every
+Phase 3 module described below was built on top of that exact commit.
 
 ## Scope and explicit safety boundary (verbatim safety statements)
 
@@ -63,44 +71,62 @@ phase and every phase after it:
   "force-approve".
 - Milestone 10 has not been started.
 
-## PHASE 2 EXPLICITLY DOES NOT YET IMPLEMENT
+## PHASE 3 EXPLICITLY DOES NOT YET IMPLEMENT
 
-Stated plainly, so no later reader mistakes Phase 2's evaluator for a
-deployed, enforcing risk gate:
+Stated plainly, so no later reader mistakes Phase 3's ledger/lifecycle
+for a deployed, enforcing risk gate:
 
-- **No durable ledger.** There is still no append-only, hash-chained
-  event store for this package's own objects (unlike `execution_gateway.
-  persistence`). `RiskAuthorizationStatus`'s event-sourced legal-
-  transition table (Phase 1) exists specifically so a later phase can add
-  one safely, but no such store exists yet -- `evaluate_risk` never
-  persists a `RiskDecision`/`RiskAuthorization` anywhere; it only returns
-  one in memory.
-- **No `RiskAuthorization` is constructed by Phase 2.** `evaluate_risk`
-  returns a `RiskDecision` (and, when approved, a `PositionSizeProposal`/
-  `CapitalAllocation`) -- it does NOT construct a `RiskAuthorization`
-  (Phase 1's model for that). A later phase's persistence layer is
-  expected to do that once a decision is durably recorded.
-- **No crash recovery, no reconciliation, no independent verification
-  pass.** The corresponding exception classes exist in `core.exceptions`
-  (mirroring `execution_gateway`'s identical exception shape) so a later
-  phase's functions have a home to raise into, but no such functions
-  exist yet.
-- **No CLI.** No `ml_cli.py` command exists for this package yet.
 - **No execution-gateway enforcement.** `execution_gateway.paper_bridge.
-  ExecutionIntent.risk_authorization_id` is NOT checked against a real
-  `portfolio_risk.authorization.RiskAuthorization` anywhere yet, and
-  `evaluate_risk` is not called from anywhere in `execution_gateway` --
-  see "Relationship to `execution_gateway`" below and "SEMANTIC COLLISION
-  DECISION" for the precise current state of that field and the required
-  future migration.
+  ExecutionIntent.risk_authorization_id` is still NOT checked against a
+  real `portfolio_risk.authorization.RiskAuthorization` anywhere, and
+  nothing in `portfolio_risk` is called from `execution_gateway`, nor
+  does `portfolio_risk` import anything from `execution_gateway` --
+  verified by grepping both directions (see "Relationship to
+  `execution_gateway`" below and "SEMANTIC COLLISION DECISION" for the
+  precise current state and required future migration, unchanged and
+  still deferred by Phase 3).
+- **No broker calls, no dummy-broker changes, no live trading, no
+  network access, no credentials.** Phase 3 stays entirely within
+  `portfolio_risk`'s own durable ledger and lifecycle logic; a "reserved"
+  or "consumed" authorization never contacts any broker -- the CALLER
+  (a future execution-gateway integration) is responsible for actually
+  dispatching, and for recording that dispatch's outcome back via
+  `reserve_authorization`/`consume_authorization`.
+- **No CLI.** No `ml_cli.py` command exists for this package yet.
+- **No session manifest / explicit stage machine.** Phase 3 deliberately
+  does NOT introduce a `PortfolioRiskSessionManifest` -- see "Why no
+  session manifest" below for the explicit architectural rationale.
 - **No pre-existing halt state or losing-streak count is derived by this
-  package.** `evaluate_risk`'s `portfolio_halted`/`consecutive_losses`
-  parameters are explicit, mandatory, CALLER-supplied inputs -- Phase 2
-  has no ledger to derive them from real history yet (see "Evaluator
-  orchestration" below).
+  package for `evaluate_risk`.** Phase 3's ledger durably records
+  `RiskEvaluationRequest`/`RiskDecision`/lifecycle events, but nothing in
+  Phase 3 wires that history back into `evaluate_risk`'s own
+  `portfolio_halted`/`consecutive_losses` parameters -- those remain
+  explicit, caller-supplied inputs, unchanged from Phase 2. A later phase
+  could derive them from the Phase 3 ledger, but Phase 3 itself does not.
 - **No acceptance workflow.** No end-to-end test chains a real paper
-  session through this package's own risk evaluation; only isolated
-  domain-model unit tests exist through Phase 2.
+  session through this package's own risk evaluation and authorization
+  lifecycle; only isolated unit/integration tests exist through Phase 3.
+
+## PHASE 2 EXPLICITLY DOES NOT YET IMPLEMENT (superseded in part by Phase 3)
+
+Stated plainly for historical context; items resolved by Phase 3 are
+marked so a reader does not need to cross-reference forward:
+
+- **No durable ledger.** *(Resolved by Phase 3 -- see "Append-only risk
+  ledger design" below.)* There was no append-only, hash-chained event
+  store for this package's own objects through Phase 2.
+- **No `RiskAuthorization` is constructed by Phase 2.** *(Still true of
+  `evaluate_risk` itself -- Phase 3's `issuance.issue_risk_authorization`
+  is a SEPARATE, later step a caller invokes with an `APPROVED`
+  `RiskDecision`, not something `evaluate_risk` does internally.)*
+  `evaluate_risk` returns a `RiskDecision` (and, when approved, a
+  `PositionSizeProposal`/`CapitalAllocation`) -- it does NOT construct a
+  `RiskAuthorization`.
+- **No crash recovery, no reconciliation, no independent verification
+  pass.** *(Resolved by Phase 3 -- see "Recovery", "Reconciliation", and
+  "Independent verification" below.)*
+- **No execution-gateway enforcement.** *(Still true -- see "PHASE 3
+  EXPLICITLY DOES NOT YET IMPLEMENT" above.)*
 
 ## Package architecture and dependency direction
 
@@ -221,6 +247,53 @@ not fixed now.
 - `evaluator.py` (Phase 2) -- `evaluate_risk`/`EvaluationOutcome`, the one
   orchestration function tying every module above together into a final
   `RiskDecision`.
+- `ledger.py` (Phase 3) -- `RiskLedgerEntry` (+ `create_risk_ledger_entry`),
+  `RiskLedgerEntryKind` (12-member enum), `verify_risk_ledger_chain_
+  integrity`, `compute_risk_ledger_physical_digest`/`compute_risk_ledger_
+  semantic_digest`, `portfolio_risk_lock`, `PortfolioRiskLedgerStore`,
+  `append_ledger_entry`. The append-only, hash-chained, portfolio-
+  partitioned durable store -- see "Append-only risk ledger design"
+  below.
+- `state_machine.py` (Phase 3) -- `RiskAuthorizationStatusEvent` (+
+  `create_risk_authorization_status_event`), `resolve_risk_authorization_
+  status`, `consumption_identity_for`. Pure, event-sourced status
+  reconstruction, mirroring `execution_gateway.state_machine.
+  ExecutionOrderStateEvent`/`resolve_execution_order_state` exactly.
+- `issuance.py` (Phase 3) -- `issue_risk_authorization`, the single pure
+  function turning an `APPROVED` `RiskDecision` into a `RiskAuthorization`.
+- `validation.py` (Phase 3) -- `AuthorizationRejectionReason`,
+  `AuthorizationUseValidation`, `validate_authorization_use` -- the
+  single, pure, stateless function every reserve/consume transaction
+  calls before ever appending a ledger entry.
+- `idempotency.py` (Phase 3) -- seven durable index builders (`build_
+  decision_to_authorization_index`, `build_authorization_payload_index`,
+  `build_status_events_index`, `build_authorization_status_index`,
+  `build_authorization_consumption_index`, `build_execution_intent_
+  index`, `build_consumption_identity_index`), every one reconstructed BY
+  SCANNING THE LEDGER, never an in-memory-only set.
+- `lifecycle.py` (Phase 3) -- the only module that APPENDS to a risk
+  ledger: `record_risk_evaluation_request`/`record_risk_decision`/
+  `record_authorization_issuance`, `reserve_authorization`/
+  `consume_authorization`, `expire_authorization`/`invalidate_
+  authorization`/`revoke_authorization`.
+- `recovery.py` (Phase 3) -- `RecoveryAction`, `recover_portfolio_risk_
+  session` -- reconstructs solely from durable ledger evidence and
+  classifies every authorization's own recovery disposition.
+- `reconciliation.py` (Phase 3) -- `RiskReconciliationIssue`/
+  `PortfolioRiskReconciliationReport`, `reconcile_portfolio_risk_session`
+  -- structured, non-raising issue reporting; raises only on genuine
+  structural ledger-reconstruction failure.
+- `verification.py` (Phase 3) -- `verify_portfolio_risk_session` --
+  independent re-verification against the raw ledger, never a cached
+  report/persisted status/in-memory set/caller assertion. See
+  "Independent verification honesty classification" below.
+- `replay.py` (Phase 3) -- `PortfolioRiskReplayResult`, `compute_replay_
+  result`/`assert_replay_deterministic` -- the comparison primitive tests
+  use to prove replaying the same operation sequence into a fresh,
+  independent store produces byte-identical outcomes.
+- `reports.py` (Phase 3) -- `PortfolioRiskSessionReport`, `generate_
+  portfolio_risk_session_report` -- deterministic, ledger-derived report
+  sections, recomputed fresh on every call.
 
 ## Identity and determinism
 
@@ -364,6 +437,440 @@ one field name. Renaming the existing field outright (rather than adding
 a second one) would be a breaking change to already-committed Milestone 8
 identity payloads and is NOT recommended without a dedicated migration
 plan.
+
+## Lifecycle state machine (Phase 3)
+
+`RiskAuthorizationStatus` has exactly SIX members (extended from Phase
+1's original four -- `ISSUED`, `CONSUMED`, `EXPIRED`, `REVOKED` -- by
+adding `RESERVED` and `INVALIDATED`, the smallest state set expressing
+Phase 3's own required semantics):
+
+```
+ISSUED --> RESERVED --> CONSUMED         (terminal)
+   |            |
+   |            +----> EXPIRED           (terminal)
+   |            +----> INVALIDATED       (terminal)
+   |            +----> REVOKED           (terminal)
+   +----> EXPIRED / INVALIDATED / REVOKED (terminal, directly from ISSUED)
+```
+
+`CONSUMED`, `EXPIRED`, `INVALIDATED`, `REVOKED` are all terminal -- no
+legal transition exits any of them (enforced by `models.
+is_legal_risk_authorization_status_transition` and independently
+re-checked by `state_machine.RiskAuthorizationStatusEvent.__post_init__`
+AND `resolve_risk_authorization_status`, the same defense-in-depth
+double-check `execution_gateway.state_machine.ExecutionOrderStateEvent`
+already uses). There is no ambiguous `UNKNOWN`/pending approval state
+anywhere in this enum, mirroring `RiskDecisionKind`'s identical
+three-member, no-`UNKNOWN` discipline from Phase 1.
+
+Status is ALWAYS reconstructed by replaying an authorization's own
+`RiskAuthorizationStatusEvent`s from an implicit initial state (`ISSUED`)
+via `resolve_risk_authorization_status` -- never inferred from
+in-memory-only state, never cached across calls. `resolve_risk_
+authorization_status` additionally tracks the `consumption_identity`
+bound at the authorization's own `RESERVED` transition and requires any
+subsequent `CONSUMED` transition to carry the SAME identity, raising
+`PortfolioRiskRecoveryError` otherwise -- a structural, replay-level
+defense against a coherently re-chained ledger tamper (see "Defects
+found and fixed" below, defect #5).
+
+## Authorization issuance rules (Phase 3)
+
+`issuance.issue_risk_authorization(*, request, decision, authorization_
+sequence, event_time) -> RiskAuthorization` is a pure function:
+
+- Only an `APPROVED` `RiskDecision` produces a `RiskAuthorization` --
+  `DENIED`/`HALTED` raise `RiskEvaluationError` immediately, never
+  producing a usable object.
+- Every bound identity (`execution_intent_id`, `execution_session_id`,
+  `portfolio_id`, `portfolio_snapshot_id`, `price_snapshot_id`,
+  `risk_policy_id`) is verified to match between `request` and
+  `decision` before issuance -- a mismatch raises rather than silently
+  picking one side.
+- `event_time` and `authorization_sequence` are always caller-supplied
+  (never `utc_now()`/`uuid4()`/`random`/a temp path/a process-specific
+  identity source) -- the same Phase 1 discipline `RiskAuthorization`
+  itself already enforces, continued unchanged into Phase 3's own
+  issuance function.
+- The resulting `risk_authorization_id` is Phase 1's existing content-
+  addressed id -- Phase 3 adds no second identity scheme; issuance is
+  purely "construct the object Phase 1 already defined, from a decision
+  that is durably APPROVED."
+
+## Reservation, consumption, and idempotency semantics (Phase 3)
+
+`validation.validate_authorization_use` is the single, pure, stateless
+gate every reserve/consume transaction passes through BEFORE any ledger
+entry is appended (`lifecycle._record_economic_use_transition`). Given
+`current_status`, `bound_consumption_identity` (the identity bound by an
+earlier `RESERVED` transition, or `None`), a `target_status`, and the
+attempted binding/`consumption_identity`, it resolves to exactly one of:
+
+1. **`BINDING_MISMATCH`** -- the attempted intent/session/portfolio/
+   snapshot/policy/quantity/price does not reproduce the authorization's
+   own `risk_authorization_id` (checked via `authorization.verify_risk_
+   authorization_binding`'s single recompute-and-compare, catching every
+   cross-intent/cross-session/cross-portfolio/cross-snapshot/cross-policy
+   mismatch and any quantity/price change in one check).
+2. **`EXPIRED`** -- `evaluation_time` is beyond an optional, caller-
+   supplied `expiry_time`.
+3. **An exact retry, idempotently approved** -- `current_status is
+   target_status` AND the attempted `consumption_identity` matches the
+   ALREADY-bound one: no new ledger entry is appended;
+   `lifecycle.py` returns the prior event unchanged.
+4. **`CONFLICTING_CONSUMPTION`** -- either `current_status is
+   target_status` under a DIFFERENT `consumption_identity` (a same-
+   target retry with a different identity), OR a NEW transition (e.g.
+   the primary `RESERVED -> CONSUMED` step) whose `consumption_identity`
+   does not match whatever identity was bound by an earlier `RESERVED`
+   transition -- **both are fail-closed rejections; see defect #7 in
+   "Defects found and fixed" below for why the second case required a
+   dedicated fix.**
+5. **`STATUS_DOES_NOT_PERMIT_USE`** -- the transition is not legal per
+   the state machine above (e.g. attempting to consume an `ISSUED`,
+   never-reserved authorization, or reserving an already-terminal one).
+6. **A genuinely new, approved transition** -- everything else.
+
+Every rejection is durably recorded as a `RISK_AUTHORIZATION_USE_
+REJECTED` ledger entry BEFORE the caller's exception is raised -- a
+rejected attempt is never silently invisible in the ledger's own audit
+trail (see "Concurrency behavior" below for how this guarantee is
+preserved even under a genuine race).
+
+**Exact binding, not bounded slippage** (a deliberate Phase 3 decision):
+quantity and price must match EXACTLY what was evaluated. There is no
+repository-level precedent for bounded/partial-use semantics on any
+other milestone's authorization-shaped object, and exact binding is
+simpler and more easily independently verifiable -- a later phase could
+introduce bounded semantics deliberately, but Phase 3 does not.
+
+## Append-only risk ledger design (Phase 3)
+
+`PortfolioRiskLedgerStore` persists to
+`{storage_root}/portfolio_risk_ledgers/{portfolio_id}/events.jsonl` --
+one file per portfolio (see "Ledger partitioning" below), mirroring
+`execution_gateway.persistence`'s identical `ExecutionLedgerEntry`/
+`ExecutionSessionEventStore` shape and on-disk conventions (canonical
+JSON, one entry per line, `os.fsync` after every append, a `.lock` file
+protecting the append itself).
+
+**Two distinct hashes per entry** (mirroring Milestone 8's identical
+pattern exactly): `entry_hash` is a SELF-validating hash of `payload`
+ALONE, checked in `RiskLedgerEntry.__post_init__` on every load -- a
+payload tampered directly in the JSONL file fails to even CONSTRUCT,
+regardless of whether that entry kind happens to have its own downstream
+domain check. `entry_id` is a hash of the WHOLE entry envelope, used as
+the chain link (`previous_entry_hash` is literally the PRIOR entry's own
+`entry_id`).
+
+**Physical vs. semantic integrity, verified independently:**
+
+- `verify_risk_ledger_chain_integrity`/`compute_risk_ledger_physical_
+  digest` prove PHYSICAL storage integrity alone -- contiguous
+  `entry_sequence`, correct `previous_entry_hash` linkage. They say
+  NOTHING about whether the ECONOMIC content inside each payload is
+  coherent.
+- `compute_risk_ledger_semantic_digest` hashes ECONOMIC content only:
+  `entry_sequence` + `entry_kind` + `payload`, excluding `entry_id`/
+  `entry_hash`/`previous_entry_hash`/`recorded_time`/`event_time` at the
+  ENTRY level (operational/physical bookkeeping only -- any economically
+  meaningful timestamp already lives INSIDE a domain object's own JSON,
+  nested in `payload`, and participates via that object's own already-
+  established identity rules).
+
+**Coherent-re-chaining defense**: an attacker who removes/reorders
+entries and recomputes the physical chain to still validate is NOT
+caught by `verify_risk_ledger_chain_integrity` -- it is caught by
+DOMAIN-level replay instead (`state_machine.resolve_risk_authorization_
+status` detecting a `from_state` discontinuity, or the consumption-
+identity consistency check described above). This is the primary defense
+against a sophisticated ledger tamper, and it is exercised by dedicated
+tests in `test_portfolio_risk_reconciliation.py`/`test_portfolio_risk_
+verification.py` (`TestReconstructionFailureIsCritical`/
+`TestCoherentReChainingCaughtByReplayNotChainIntegrity`).
+
+**Twelve ledger entry kinds**: `RISK_EVALUATION_REQUESTED`, `RISK_
+DECISION_RECORDED`, `RISK_AUTHORIZATION_ISSUED`, `RISK_AUTHORIZATION_
+RESERVED`, `RISK_AUTHORIZATION_CONSUMED`, `RISK_AUTHORIZATION_EXPIRED`,
+`RISK_AUTHORIZATION_INVALIDATED`, `RISK_AUTHORIZATION_REVOKED`, `RISK_
+AUTHORIZATION_USE_REJECTED`, `RECOVERY_STARTED`, `RECOVERY_COMPLETED`,
+`VERIFICATION_COMPLETED`.
+
+**Append invariants**: an identical append (same `entry_id` at the same
+`entry_sequence`) is idempotently absorbed (a no-op, not an error); a
+conflicting payload at the same `entry_sequence` is rejected
+(`RiskAuthorizationReuseError`); a sequence gap is rejected
+(`PortfolioRiskPersistenceError`); a wrong `previous_entry_hash` is
+rejected; every append is protected by `portfolio_risk_lock` (below).
+
+### Ledger partitioning
+
+Partitioned by `portfolio_id` -- NOT by `execution_session_id` like
+Milestone 8's `ExecutionLedgerEntry` -- a deliberate architectural choice:
+a single portfolio persists across many execution sessions over its
+lifetime, and this package's own domain concept is fundamentally
+per-portfolio risk management, not per-session. `lifecycle.py` always
+partitions by `authorization.portfolio_id` -- the authorization's own
+TRUE, content-addressed owner -- never by a caller-CLAIMED portfolio id,
+which may differ from the true one in a cross-portfolio attack attempt
+(a `BINDING_MISMATCH` rejection is itself recorded in the TRUE owner's
+own ledger, exactly where an attempted misuse against that portfolio
+belongs).
+
+## Durable idempotency indexes (Phase 3)
+
+`idempotency.py`'s seven index builders are ALWAYS reconstructed by
+scanning the ledger's own raw entries -- never an in-memory-only set.
+`build_authorization_status_index`/`build_authorization_consumption_
+index` seed their key universe from `build_authorization_payload_index`
+(every `RISK_AUTHORIZATION_ISSUED` entry), NOT from the status-events
+index alone -- an authorization issued but never subsequently touched has
+an EMPTY event list, which correctly resolves to the implicit `ISSUED`
+state; seeding from events alone would silently omit such an
+authorization from the index entirely (see defect #1 below).
+
+## Recovery (Phase 3)
+
+`recovery.recover_portfolio_risk_session(*, portfolio_id, store,
+recovery_time) -> list[RecoveryAction]` reconstructs SOLELY from durable
+ledger evidence and classifies every authorization into a closed
+vocabulary:
+
+- `issued_only` -- never reserved; safe to reserve fresh.
+- `reserved_unresolved_blocked` -- reserved with no terminal outcome
+  recorded; recovery NEVER authorizes blind reuse of this authorization
+  -- it remains blocked until a caller either records the exact same
+  `consumption_identity` (idempotently accepted) or explicitly
+  expires/invalidates/revokes it. Recovery itself never appends a
+  lifecycle-transition entry -- only `RECOVERY_STARTED`/`RECOVERY_
+  COMPLETED` bookkeeping.
+- `terminal_consumed`/`terminal_expired`/`terminal_invalidated`/
+  `terminal_revoked` -- already resolved, no action possible or needed.
+
+Recovery does NOT pretend to resolve external execution ambiguity --
+there is no execution integration in this milestone, so "was the order
+actually placed with the broker" is not a question recovery can or does
+answer. It answers only "what does the ledger's own durable evidence
+say about this authorization's lifecycle state," which a future
+execution-gateway integration would combine with its OWN broker-side
+recovery evidence.
+
+## Reconciliation (Phase 3)
+
+`reconciliation.reconcile_portfolio_risk_session(*, portfolio_id,
+ledger) -> PortfolioRiskReconciliationReport` NEVER raises for an
+ordinary mismatch -- it returns a structured `RiskReconciliationIssue`
+(severity `INFO`/`WARNING`/`BLOCKING`/`CRITICAL`) for each: an
+authorization bound to a non-`APPROVED` decision, an orphan lifecycle
+event (references an authorization never issued), cross-portfolio
+contamination (an authorization's own declared `portfolio_id` doesn't
+match the ledger it's recorded in), an approved decision never issued
+into an authorization (`WARNING` -- may be a legitimate caller choice),
+and an unresolved `RESERVED` authorization (`INFO` -- recovery's own job
+to classify further). Only genuine STRUCTURAL corruption -- the ledger
+cannot be reconstructed at all (a raised `PortfolioRiskPersistenceError`/
+`PortfolioRiskRecoveryError` from the underlying idempotency-index
+builders) -- surfaces as a single `internal_reconstruction_failed`
+`CRITICAL` issue, never an uncaught exception from reconciliation itself.
+
+## Independent verification honesty classification (Phase 3)
+
+`verification.verify_portfolio_risk_session` never trusts a cached
+report, a persisted final status, an in-memory idempotency set, or a
+caller assertion -- every check independently reconstructs from the
+ledger's own raw entries. Documented explicitly, per the governing
+instruction, as a 3-tier honesty classification (verbatim from
+`verification.py`'s own module docstring):
+
+- **STRUCTURALLY INDEPENDENT** (this module's entire scope): ledger
+  physical chain integrity, portfolio ownership, idempotency-index
+  reconstruction (itself replaying every authorization's lifecycle via
+  `state_machine.resolve_risk_authorization_status`, catching a
+  coherently re-chained tamper), APPROVED-only issuance, forged-identity
+  detection (recomputing each authorization's own content id from its
+  ledger-recorded payload), single-use-identity coherence, and orphan-
+  event detection. None of these require trusting a cached report, a
+  persisted status, an in-memory set, or a caller assertion -- every one
+  is a pure recomputation from the ledger's own raw entries.
+- **NOT INDEPENDENTLY RE-VERIFIED** (an honest, explicit limitation, not
+  an oversight): this module does NOT re-run Phase 2's evaluator
+  (`evaluator.evaluate_risk`) against the original `PortfolioSnapshot`/
+  `PriceSnapshot`/`PortfolioRiskPolicy` to confirm a recorded
+  `RiskDecision`'s own 18 checks were computed correctly in the first
+  place -- the ledger only durably stores the DECISION's own already-
+  serialized JSON, not the full snapshot/policy inputs it was computed
+  from. Re-deriving that would require this module to also durably store
+  (or have access to) the original snapshots/policy, which is out of
+  Phase 3's own scope (no snapshot/policy artifact store exists in this
+  milestone). This module verifies the decision's OWN INTERNAL coherence
+  (already guaranteed at construction by Phase 1/2's own `RiskDecision.
+  __post_init__`) and its BINDING into an authorization -- never whether
+  the decision's 18 checks were the economically correct ones for the
+  real portfolio state.
+
+`record: bool = True` distinguishes a durably-auditable verification
+(the default, appending a `VERIFICATION_COMPLETED` entry -- used by
+`reports.py`) from a side-effect-free measurement (`record=False` --
+used by `replay.py`'s own comparison utility, where an unconditional
+append would make repeated comparisons non-idempotent; see defect #3
+below).
+
+## Deterministic replay (Phase 3)
+
+This package has no session RUNNER to replay wholesale (unlike
+`execution_gateway.replay`, which re-runs a whole execution session end
+to end) -- Phase 3's own "session" is simply every ledger entry recorded
+for one `portfolio_id`, built by individual, discrete calls to
+`lifecycle.py`'s transaction functions. `replay.compute_replay_result`/
+`assert_replay_deterministic` provide the comparison primitive tests use
+to prove that replaying the SAME sequence of operations into a FRESH,
+independent `PortfolioRiskLedgerStore` -- a different temp directory, a
+different filesystem-root shape, a different `verification_time` label,
+a separate OS process with a different `PYTHONHASHSEED` -- produces an
+identical `PortfolioRiskReplayResult` (semantic digest, authorization id
+set, verification critical-issue count, reconciliation outcome).
+`canonical_json_bytes`'s `sort_keys=True` encoding makes hash-seed
+independence structural, not merely observed -- `set`/`frozenset`
+iteration order never reaches a digest; every digest is computed from a
+list built in a fixed, deterministic order.
+
+## Concurrency behavior (Phase 3)
+
+`PortfolioRiskLedgerStore`'s own lock (`portfolio_risk_lock`, wrapping
+`historical.locking.DatasetLock` via `ml.concurrency.experiment_lock`)
+FAILS FAST rather than blocking/retrying on contention (`historical.
+locking.DatasetLock`'s own documented design choice) -- a losing caller
+sees `PortfolioRiskLockError` and is expected to retry.
+
+`lifecycle._record_economic_use_transition`/`_record_administrative_
+transition` each wrap their own read-validate-append cycle in a bounded
+(20-attempt) internal retry loop: if two callers both read state BEFORE
+either has written (a genuine race), both can pass validation against
+the SAME stale view and then race the final `append_ledger_entry` call
+itself; the loser re-reads fresh state and re-validates, resolving to
+either an idempotent exact-retry absorption or a properly AUDITED
+`RISK_AUTHORIZATION_USE_REJECTED` rejection -- never a bare, unrecorded
+storage-layer exception (see defect #6 below).
+
+Required scenarios, all covered by dedicated real-`threading.Thread`
+tests in `test_portfolio_risk_ledger_concurrency.py`: two threads
+attempting the same exact reservation (both succeed, exactly one ledger
+entry results); two threads attempting conflicting reservation payloads
+(exactly one wins, the loser is rejected AND audited); duplicate exact
+consumption (absorbed idempotently); conflicting second consumption
+(one wins, one audited-rejected); an expiry race against a reservation
+(both orderings are individually legal -- the ledger always resolves to
+exactly one coherent final state, never corruption); a sequence-append
+race among many threads issuing distinct, non-conflicting authorizations
+concurrently (no ledger corruption, contiguous gapless sequence). In
+every case: one economic use, an exact duplicate absorbed idempotently,
+a genuine conflict rejected and durably audited, and the ledger's own
+physical chain integrity holds afterward.
+
+## Why no session manifest (Phase 3)
+
+Phase 3 deliberately does NOT introduce a `PortfolioRiskSessionManifest`
+or an explicit stage machine (`CREATED`/`EVALUATED`/`AUTHORIZED`/
+`RESERVED`/`CONSUMED`/`VERIFYING`/`COMPLETED`/`FAILED`/`TERMINATED`).
+The authorization ledger itself already IS the durable state: every
+question a manifest's "current stage" field would answer (`has this been
+evaluated? issued? reserved? consumed? verified?`) is already answerable
+-- more honestly -- by replaying the ledger via `idempotency.py`'s index
+builders and `verification.verify_portfolio_risk_session`, which
+independently reconstruct the truth rather than trusting a separately-
+persisted status field that could drift from the ledger's own evidence.
+Introducing a manifest would create exactly the two-sources-of-truth
+problem this milestone's own "ledger-derived vs persisted status" and
+"report cannot override ledger truth" requirements are designed to avoid
+(see the dedicated `TestReportCannotOverrideLedgerTruth` test in
+`test_portfolio_risk_reconciliation.py`). A future phase could still
+introduce one if a cross-portfolio, cross-authorization SESSION concept
+emerges that genuinely cannot be expressed as "the ledger for one
+portfolio_id" -- Phase 3's own domain does not need one.
+
+## Defects found and fixed during Phase 3's own development
+
+Eight real, confirmed defects were found (mostly via manual sanity
+scripts BEFORE writing the full test suite, and via the adversarial
+concurrency tests themselves) and fixed at root cause, each with a
+regression test:
+
+1. **`build_authorization_status_index`/`build_authorization_consumption_
+   index` silently omitted issued-but-never-touched authorizations** --
+   both seeded their key universe from status EVENTS alone, excluding any
+   authorization with zero subsequent transitions. Fixed by seeding from
+   `build_authorization_payload_index`'s keys instead.
+2. **`RiskLedgerEntry` had no self-validating hash distinct from its
+   chain-linking id** -- a payload tampered in the JSONL file (with
+   `entry_id` left unchanged) was only caught opportunistically by
+   whichever downstream domain check happened to exist for that entry
+   kind. Fixed by adding the `entry_hash`/`entry_id` two-hash design (see
+   "Append-only risk ledger design" above).
+3. **`verify_portfolio_risk_session`'s unconditional `VERIFICATION_
+   COMPLETED` append made `replay.compute_replay_result` non-idempotent**
+   -- two independently-built identical scenarios produced different
+   semantic digests because an earlier internal verification call had
+   mutated one store but not the other. Fixed by adding `record: bool =
+   True`; `replay.py` calls with `record=False`.
+4. **`create_risk_ledger_entry` computed `entry_hash` before payload
+   validation ran** -- a raw `Decimal` in a payload produced a bare,
+   untyped `TypeError` from `json.dumps` instead of the intended
+   `PortfolioRiskPersistenceError`. Fixed by extracting `_validate_
+   payload_shape` and calling it before any hashing.
+5. **`resolve_risk_authorization_status` did not check `consumption_
+   identity` consistency between a `RESERVED` and its later `CONSUMED`
+   transition** -- a directly-tampered ledger entry (bypassing
+   `lifecycle.py`'s own write-time gate entirely) could coherently claim
+   an authorization was consumed under a DIFFERENT economic identity than
+   it was reserved under, and replay would not catch it. Fixed by
+   tracking the bound identity through replay and raising
+   `PortfolioRiskRecoveryError` on a mismatch -- see "Coherent-re-
+   chaining defense" above.
+6. **A race-losing thread's rejection was a bare, unaudited storage-layer
+   exception** -- two callers reading state before either had written
+   could both pass validation against the same stale view, then race the
+   final append; the loser got a raw `RiskAuthorizationReuseError` from
+   `PortfolioRiskLedgerStore.append` with NO ledger entry recorded for
+   its own attempt at all, violating `lifecycle.py`'s own stated
+   "never silently invisible" audit-trail invariant. Fixed by wrapping
+   `_record_economic_use_transition`/`_record_administrative_transition`'s
+   read-validate-append cycle in a bounded retry loop that re-validates
+   against fresh state after losing an append race -- see "Concurrency
+   behavior" above.
+7. **`validate_authorization_use` never checked `consumption_identity`
+   consistency for a NEW transition** -- the most serious defect found
+   this phase. The `CONFLICTING_CONSUMPTION` check only fired when
+   `current_status is target_status` (a same-target retry); the primary
+   `RESERVED -> CONSUMED` step is a NEW transition and fell straight
+   through to unconditional approval WITHOUT ever comparing
+   `consumption_identity` against the identity bound at `RESERVED` --
+   meaning the single-economic-use invariant was not actually enforced on
+   the main consume path at all prior to this fix. Found via the
+   adversarial concurrency tests (a race between consuming under the
+   reserved identity and a different one both "succeeded"). Fixed by
+   adding an explicit check: any NEW transition into a consumption-
+   identity-carrying state must match a previously-bound identity, if one
+   exists.
+8. **A Windows-specific lock-release race raised an uncaught
+   `PermissionError`** -- `historical.locking.DatasetLock.release`'s bare
+   `Path.unlink(missing_ok=True)` (shared infrastructure, already
+   documented as having a known Windows stale-lock-reclaim limitation on
+   the ACQUIRE side) can raise a sharing-violation `PermissionError` on
+   the RELEASE side under genuine thread contention, propagating
+   uncaught out of `ml.concurrency.experiment_lock`'s `finally` block --
+   a type `portfolio_risk_lock`'s existing `except ExperimentLockError`
+   translation did not catch. Fixed LOCALLY (not by modifying the shared
+   `historical.locking` module, which is outside Phase 3's own scope) by
+   also catching `OSError` in `ledger.portfolio_risk_lock` and
+   translating it into the same, already-retryable `PortfolioRiskLockError`.
+
+Defects 1-4 were found via manual sanity scripts written between modules,
+before the corresponding test file existed. Defects 5-8 were found via
+the dedicated adversarial-audit and concurrency test files themselves
+(discovering defects 5-8 is, in fact, the entire reason those test files
+exist). No defect was ever classified as an acceptable limitation to
+avoid fixing it.
 
 ## Exposure accounting equations (Phase 2)
 
@@ -561,30 +1068,59 @@ reduce-only order during a halt -- see Known Limitations).
 
 ## Exceptions
 
-`PortfolioRiskError` (base) plus seventeen subclasses, one per required
+`PortfolioRiskError` (base) plus eighteen subclasses, one per required
 category (policy validation, spec identity, snapshot validation, stale
 snapshot, stale price, exposure calculation, position sizing, risk
 evaluation, risk denial, authorization identity, authorization mismatch,
 authorization reuse, portfolio halt, reconciliation, verification,
-persistence, recovery) -- see `core.exceptions`'s own "Portfolio risk and
-capital management engine (Milestone 9)" section for the full docstring
-of each. No common infrastructure is duplicated: `QuantPlatformError`
-remains the single root every package's exceptions ultimately derive
-from.
+persistence, recovery, and Phase 3's own `PortfolioRiskLockError` for
+ledger-lock contention/filesystem races) -- see `core.exceptions`'s own
+"Portfolio risk and capital management engine (Milestone 9)" section for
+the full docstring of each. No common infrastructure is duplicated:
+`QuantPlatformError` remains the single root every package's exceptions
+ultimately derive from. `PortfolioRiskLockError` is raised by `ledger.
+portfolio_risk_lock` both for a genuine lock-acquisition failure
+(`ExperimentLockError`, fail-fast contention) AND for a known Windows-
+specific release-side filesystem race (see defect #8 below) -- both are
+caller-retryable, so both resolve to the same exception type.
 
-## Known limitations (Phase 1 + Phase 2 scope, not defects)
+## Known limitations (Phase 1 + Phase 2 + Phase 3 scope, not defects)
 
-- No ledger, recovery, CLI, or execution-gateway enforcement exists yet
-  -- see "PHASE 2 EXPLICITLY DOES NOT YET IMPLEMENT" above.
+- No CLI or execution-gateway enforcement exists yet -- see "PHASE 3
+  EXPLICITLY DOES NOT YET IMPLEMENT" above.
 - `execution_gateway.paper_bridge.ExecutionIntent.risk_authorization_id`
   currently holds Milestone 8's own `execution_bridge_authorization_id`
   concept, not this milestone's `portfolio_risk_authorization_id` concept
   -- see "SEMANTIC COLLISION DECISION" above for the exact required
-  future migration.
-- `RiskAuthorizationStatus`'s event-sourced legal-transition table is
-  defined but nothing constructs a transition event yet -- no durable
-  authorization ledger exists yet, and `evaluate_risk` does not construct
-  a `RiskAuthorization` at all (only a `RiskDecision`).
+  future migration. Phase 3 continues to leave this unresolved, per its
+  own explicit scope boundary (no `execution_gateway` modification).
+- **`evaluate_risk` still does not construct a `RiskAuthorization`
+  itself** -- `issuance.issue_risk_authorization` is a separate function a
+  caller invokes with an `APPROVED` `RiskDecision`; Phase 3 does not wire
+  `evaluate_risk` to call it automatically. This is a deliberate
+  separation (evaluation and issuance are different economic events,
+  potentially at different times), not an oversight.
+- **Phase 3's ledger durably records `portfolio_halted`/`consecutive_
+  losses` inputs (as part of the `RiskEvaluationRequest`/`RiskDecision`
+  payloads it stores) but nothing derives `evaluate_risk`'s own
+  `portfolio_halted`/`consecutive_losses` parameters FROM that recorded
+  history** -- they remain explicit, caller-supplied inputs, unchanged
+  from Phase 2. A later phase could add this derivation on top of the
+  Phase 3 ledger; Phase 3 itself does not.
+- **No session manifest / explicit stage machine** -- a deliberate
+  architectural choice, not a gap; see "Why no session manifest" above
+  for the full rationale.
+- **Recovery does not resolve external (broker-side) execution
+  ambiguity** -- there is no execution integration in this milestone, so
+  recovery answers only what the risk ledger's own durable evidence says,
+  never whether an order was actually placed. See "Recovery" above.
+- **`verification.verify_portfolio_risk_session` does not re-run Phase
+  2's evaluator against the original snapshots/policy** -- it verifies a
+  recorded `RiskDecision`'s internal coherence and binding, never whether
+  its 18 checks were the economically correct ones for the real
+  portfolio state (no snapshot/policy artifact store exists to re-derive
+  that from). See "Independent verification honesty classification"
+  above for the full, explicit 3-tier breakdown.
 - **`max_daily_realized_loss` measures the day's TOTAL (realized +
   unrealized) equity decline, not isolated realized pnl** -- `Portfolio
   Snapshot` carries no realized-pnl-at-day-start baseline to isolate the
@@ -613,28 +1149,28 @@ from.
 
 ## Future phases (not implemented, not started)
 
-- A durable, append-only, hash-chained ledger for this package's own
-  objects, mirroring `execution_gateway.persistence` exactly -- including
-  persisting `RiskDecision`/`RiskAuthorization` and deriving
-  `portfolio_halted`/`consecutive_losses` from real recorded history
-  instead of a caller-supplied parameter.
-- `RiskAuthorization` construction (from an `APPROVED` `RiskDecision`) and
-  single-use/idempotent-use enforcement, replaying `RiskAuthorizationStatus`
-  transition events against the legal-transition table Phase 1 already
-  defines.
 - `execution_gateway` dispatch-gate integration: refusing to dispatch any
   `ExecutionIntent` without a valid, matching, unconsumed
-  `RiskAuthorization` -- and performing the `ExecutionIntent` field
-  migration described in "SEMANTIC COLLISION DECISION" above.
+  `RiskAuthorization` -- calling `reserve_authorization`/`consume_
+  authorization` around the actual dispatch, and performing the
+  `ExecutionIntent` field migration described in "SEMANTIC COLLISION
+  DECISION" above. Explicitly NOT started by Phase 3.
+- Deriving `evaluate_risk`'s `portfolio_halted`/`consecutive_losses`
+  parameters from the Phase 3 ledger's own recorded history, instead of a
+  caller-supplied parameter.
 - Wiring `checks.check_portfolio_halted` (or a successor) to consult
   `policy.allow_reduce_only_during_halt` once a real dispatch gate exists
   to act on the distinction.
-- Crash recovery, reconciliation, and independent verification passes,
-  mirroring `execution_gateway`'s identical three-part safety net.
 - A CLI surface on the shared `ml_cli.py` parser.
 - A real, end-to-end acceptance workflow chaining a genuine paper/
-  execution session through real risk evaluation.
+  execution session through real risk evaluation AND the Phase 3
+  authorization lifecycle.
 - Real cost-component modeling (spread/slippage/commission) inside
   `valuation.py`'s post-trade projection, reusing this platform's
   existing `backtesting.costs`/`paper_trading.costs` formulas rather than
   the current gross-price-only fills.
+- Re-running Phase 2's evaluator against durably-stored original
+  snapshots/policy as part of independent verification, once an
+  artifact store for those exists -- see "Independent verification
+  honesty classification" above for the precise gap this would close.
+- Milestone 10 has not been started.

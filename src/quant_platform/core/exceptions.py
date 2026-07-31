@@ -1143,13 +1143,12 @@ class RiskAuthorizationMismatchError(PortfolioRiskError):
 
 
 class RiskAuthorizationReuseError(PortfolioRiskError):
-    """Raised when a `RiskAuthorization` already consumed (per a future
-    phase's durable single-use ledger) is presented again to gate a
-    second dispatch. `RiskAuthorizationStatus`'s legal-transition table
-    (ISSUED -> CONSUMED, terminal) exists specifically so this can be
-    enforced safely once that ledger is added -- Phase 1 defines the
-    vocabulary and transition rules only; no consumption ledger exists
-    yet."""
+    """Raised when a `RiskAuthorization` already `RESERVED`/`CONSUMED` (per
+    the durable, ledger-derived single-use lifecycle) is presented again
+    to gate a conflicting second economic use -- an exact, identical
+    retry of the SAME use is idempotently absorbed instead (never raises);
+    only a genuine CONFLICT (a different `consumption_identity`, or use
+    after a terminal status) raises this."""
 
 
 class PortfolioHaltError(PortfolioRiskError):
@@ -1159,25 +1158,35 @@ class PortfolioHaltError(PortfolioRiskError):
 
 
 class PortfolioRiskReconciliationError(PortfolioRiskError):
-    """Raised when portfolio-risk-side reconciliation (a future phase)
-    cannot complete structurally, as opposed to an ordinary reconciliation
-    finding, which is a normal, expected, non-raising outcome."""
+    """Raised when portfolio-risk-side reconciliation cannot complete
+    structurally (e.g. the ledger itself cannot be reconstructed), as
+    opposed to an ordinary `ReconciliationIssue` finding, which is a
+    normal, expected, non-raising outcome."""
 
 
 class PortfolioRiskVerificationError(PortfolioRiskError):
-    """Raised by a future phase's independent verification pass (or a
+    """Raised by `verification.verify_portfolio_risk_session` (or a
     caller consuming its report) when a FATAL cross-consistency check
     fails and the caller has asked for that to raise rather than merely
     be reported as an issue."""
 
 
 class PortfolioRiskPersistenceError(PortfolioRiskError):
-    """Raised when a durable portfolio-risk artifact (a future phase's
-    ledger record, snapshot, or report) cannot be read, decoded, or
+    """Raised when a durable portfolio-risk artifact (a risk ledger
+    entry, a chain-integrity check, a report) cannot be read, decoded, or
     reconstructed safely."""
 
 
 class PortfolioRiskRecoveryError(PortfolioRiskError):
-    """Raised when a future phase's crash recovery cannot safely
-    reconstruct portfolio-risk state from durable evidence -- surfaced
-    rather than guessed."""
+    """Raised when crash recovery cannot safely reconstruct
+    portfolio-risk authorization lifecycle state from durable ledger
+    evidence -- surfaced rather than guessed. Never used to justify a
+    blind reuse of an ambiguous authorization."""
+
+
+class PortfolioRiskLockError(PortfolioRiskError):
+    """Raised when a second writer attempts to append to, or mutate the
+    lifecycle of, the same `portfolio_id`'s risk ledger concurrently --
+    mirrors `execution_gateway`'s own `ExecutionSessionLockError`
+    exactly, reusing the same underlying `ml.concurrency.experiment_lock`
+    infrastructure."""

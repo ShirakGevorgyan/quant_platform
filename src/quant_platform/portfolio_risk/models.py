@@ -119,33 +119,59 @@ def most_severe_check_severity(severities: tuple[RiskCheckSeverity, ...]) -> Ris
 # `KillSwitchState` (Milestone 8/7's identical pattern). `RiskAuthorization`
 # itself is immutable and content-addressed, so its lifecycle status is
 # NEVER a field stored on the object -- it is derived by replaying a
-# (future phase's) durable sequence of status-transition events against
-# this closed vocabulary and transition table. Phase 1 defines the
-# vocabulary and legal-transition rules only; no transition-event type or
-# durable ledger exists yet, and nothing in this phase constructs a
-# status other than the implicit initial ISSUED state.
+# durable sequence of status-transition events (Phase 3's own
+# `state_machine.RiskAuthorizationStatusEvent`, mirroring
+# `execution_gateway.state_machine.ExecutionOrderStateEvent` exactly)
+# against this closed vocabulary and transition table.
+#
+# RESERVED and INVALIDATED were added in Phase 3 (Phase 1 defined only
+# ISSUED/CONSUMED/EXPIRED/REVOKED, explicitly anticipating this
+# extension -- see Phase 1's own module docstring note that "the full
+# status state machine is deferred to a later phase"). This is a
+# purely-additive change to an already-committed enum: no existing
+# member was removed or renumbered, and every Phase 1/2 test that
+# constructs a `RiskAuthorizationStatus` value continues to pass
+# unchanged.
 # --------------------------------------------------------------------------
 class RiskAuthorizationStatus(Enum):
     ISSUED = "issued"
+    RESERVED = "reserved"
     CONSUMED = "consumed"
     EXPIRED = "expired"
+    INVALIDATED = "invalidated"
     REVOKED = "revoked"
 
 
 _TERMINAL_RISK_AUTHORIZATION_STATUSES: frozenset[RiskAuthorizationStatus] = frozenset({
-    RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.REVOKED,
+    RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.INVALIDATED,
+    RiskAuthorizationStatus.REVOKED,
 })
 
 _LEGAL_RISK_AUTHORIZATION_STATUS_TRANSITIONS: dict[RiskAuthorizationStatus, frozenset[RiskAuthorizationStatus]] = {
-    # Single-use by construction: ISSUED has exactly three legal exits,
-    # each terminal -- there is no path back to ISSUED from anywhere,
-    # exactly mirroring `KillSwitchState`'s own "never silently resume"
-    # property (no edge returns to `ACTIVE`).
+    # ISSUED: a caller may reserve it for economic use, or it may become
+    # terminal without ever being reserved (expired while sitting unused,
+    # invalidated by newer portfolio state, or explicitly revoked).
     RiskAuthorizationStatus.ISSUED: frozenset({
-        RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.REVOKED,
+        RiskAuthorizationStatus.RESERVED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.INVALIDATED,
+        RiskAuthorizationStatus.REVOKED,
     }),
+    # RESERVED: a caller has durably recorded intent to consume it before
+    # dispatch (Section "RESERVE AND CONSUME SEMANTICS") -- from here it
+    # either completes (CONSUMED) or still terminates without completing
+    # (expired/invalidated/revoked while reserved). There is NO edge back
+    # to ISSUED -- a reservation can never be silently released for reuse
+    # by a different economic submit; it must reach a terminal state.
+    RiskAuthorizationStatus.RESERVED: frozenset({
+        RiskAuthorizationStatus.CONSUMED, RiskAuthorizationStatus.EXPIRED, RiskAuthorizationStatus.INVALIDATED,
+        RiskAuthorizationStatus.REVOKED,
+    }),
+    # Single-use by construction: every non-terminal state's legal exits
+    # are exclusively terminal states -- there is no path back to ISSUED
+    # or RESERVED from anywhere, exactly mirroring `KillSwitchState`'s own
+    # "never silently resume" property (no edge returns to `ACTIVE`).
     RiskAuthorizationStatus.CONSUMED: frozenset(),
     RiskAuthorizationStatus.EXPIRED: frozenset(),
+    RiskAuthorizationStatus.INVALIDATED: frozenset(),
     RiskAuthorizationStatus.REVOKED: frozenset(),
 }
 
