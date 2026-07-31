@@ -248,6 +248,16 @@ class ExecutionLedgerEntryKind(Enum):
     EXECUTION_INTENT_ACCEPTED = "execution_intent_accepted"
     EXECUTION_INTENT_REJECTED = "execution_intent_rejected"
 
+    PORTFOLIO_RISK_AUTHORIZATION_BOUND = "portfolio_risk_authorization_bound"
+    """Milestone 9 Phase 4: recorded immediately after `execution_gateway.
+    portfolio_risk_gate.authorize_portfolio_risk_dispatch` successfully
+    issues a `RiskAuthorization` for an already-accepted `ExecutionIntent`
+    -- lets a reader of the execution ledger ALONE see which risk
+    authorization covers a given intent, without needing to cross-
+    reference the separate `portfolio_risk` ledger (which remains the
+    authoritative source -- this entry is a convenience audit trail, not
+    a second source of truth)."""
+
     COMMAND_CREATED = "command_created"
     COMMAND_VALIDATED = "command_validated"
     COMMAND_REJECTED = "command_rejected"

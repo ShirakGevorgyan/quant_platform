@@ -1047,6 +1047,23 @@ class ExecutionSessionLockError(ExecutionGatewayError):
     the same pending command."""
 
 
+class ExecutionPortfolioRiskAuthorizationError(ExecutionGatewayError):
+    """Raised to signal a Milestone-9-portfolio-risk-driven dispatch
+    refusal (Milestone 9 Phase 4) -- the execution gateway's own typed
+    escalation for this refusal reason, mirroring `ExecutionHaltError`'s
+    identical role for a kill-switch refusal. Raised by `execution_
+    gateway.portfolio_risk_gate` whenever a `RiskDecision` is not
+    `APPROVED`, a `RiskAuthorization` cannot be reserved/consumed for the
+    exact execution intent attempting to dispatch, or any other
+    portfolio-risk-side rejection occurs -- always chaining the
+    underlying `portfolio_risk` exception via `from exc` so no diagnostic
+    detail is lost, while still giving `runner.py`'s own caller ONE
+    uniform exception type to catch for every portfolio-risk dispatch
+    refusal, regardless of which specific `portfolio_risk` exception
+    produced it. Never a silent no-op -- exactly like `ExecutionHaltError`,
+    this is the fail-closed escalation, not a bypassable warning."""
+
+
 # --------------------------------------------------------------------------
 # Portfolio risk and capital management engine (Milestone 9)
 # --------------------------------------------------------------------------

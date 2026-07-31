@@ -69,6 +69,7 @@ from quant_platform.execution_gateway.models import (
 )
 from quant_platform.execution_gateway.paper_bridge import PaperBridgeEnvironment
 from quant_platform.execution_gateway.persistence import ExecutionSessionEventStore
+from quant_platform.execution_gateway.portfolio_risk_gate import PortfolioRiskGatewayContext
 from quant_platform.execution_gateway.reconciliation import (
     reconcile_execution_session,
     reconstruct_all_orders_from_ledger,
@@ -107,6 +108,9 @@ from quant_platform.paper_trading.persistence import PaperSessionEventStore
 from quant_platform.paper_trading.runner import RunnerEnvironment as PaperRunnerEnvironment
 from quant_platform.paper_trading.runner import create_paper_session, run_paper_trading_session
 from quant_platform.paper_trading.specs import compute_paper_session_spec_id
+from quant_platform.portfolio_risk.ledger import PortfolioRiskLedgerStore
+from quant_platform.portfolio_risk.snapshots import create_portfolio_snapshot, create_price_snapshot
+from quant_platform.portfolio_risk.specs import PortfolioRiskPolicy, PortfolioRiskSpec
 
 _INSTRUMENT = "XAUUSD"
 _STRATEGY_DECISION_ID = "a" * 64
@@ -238,10 +242,89 @@ def _build_spec(real_paper_session: dict, *, seed: int, scenario: DummyBrokerSce
     )
 
 
-def _runner_environment(real_paper_session: dict, execution_storage_root: Path) -> RunnerEnvironment:
+def _portfolio_risk_context(storage_root: Path, *, positions: tuple = ()) -> PortfolioRiskGatewayContext:
+    """An always-approving context (no configured limits) -- Milestone 9
+    Phase 4's own dedicated integration test file exercises portfolio-
+    risk denial/reservation/consumption behavior directly; this
+    acceptance workflow's own job is proving the FULL Milestone 7->8
+    bridge chain still works end to end with the mandatory gate now
+    wired in, not re-testing the gate's own decision logic.
+
+    `positions` -- see `_existing_positions_for_reduce_only_orders`'s own
+    docstring: a real, unpredictable strategy can produce a genuine
+    reduce-only order among the ones bridged here, and `evaluate_risk`'s
+    own `missing_or_inconsistent_valuation_data`/`reduce_only_validity`
+    checks correctly fail closed (`INCOHERENT_EVALUATION_STATE`) when no
+    existing position backs a reduce-only request -- exactly the fail-
+    closed behavior this milestone requires, not a defect in the gate.
+    The FIXTURE must therefore supply a portfolio snapshot that honestly
+    reflects a position exists wherever a reduce-only order needs one;
+    defaulting to `()` remains correct for every other test in this file,
+    which only ever bridges synthetic, always-opening orders. `cash` is
+    adjusted down by the synthetic positions' own combined market value
+    so `equity == cash + sum(position.market_value)` still reconciles
+    (`PortfolioSnapshot`'s own required invariant, Phase 1) -- `equity`
+    itself stays fixed at a comfortably large, constant figure regardless
+    of how many positions are synthesized."""
+    equity = Decimal("10000000")
+    marked_position_value = sum((p.market_value for p in positions), start=Decimal(0))
+    cash = equity - marked_position_value
+    portfolio = create_portfolio_snapshot(
+        portfolio_id="acceptance-portfolio", event_time=_EVENT_TIME, cash=cash, equity=equity, realized_pnl=Decimal(0), unrealized_pnl=Decimal(0),
+        peak_equity=equity, daily_start_equity=equity, positions=positions, source_execution_session_id=None,
+    )
+    price = create_price_snapshot(
+        instrument_id=_INSTRUMENT, bid=Decimal("1999"), ask=Decimal("2001"), reference_price=Decimal("2000"), event_time=_EVENT_TIME, source_event_id=None,
+    )
+    policy = PortfolioRiskPolicy(
+        max_order_notional=None, max_position_notional=None, max_instrument_gross_exposure=None, max_strategy_gross_exposure=None,
+        max_portfolio_gross_exposure=None, max_portfolio_net_exposure=None, max_concentration_fraction=None, max_leverage=None,
+        max_daily_realized_loss=None, max_total_loss=None, max_drawdown_fraction=None, max_consecutive_losses=None, minimum_cash_buffer=None,
+        maximum_price_age=None, maximum_portfolio_snapshot_age=None, allow_reduce_only_during_halt=True,
+    )
+    return PortfolioRiskGatewayContext(
+        store=PortfolioRiskLedgerStore(storage_root), portfolio_id="acceptance-portfolio", portfolio_snapshot=portfolio, price_snapshot=price,
+        risk_spec=PortfolioRiskSpec(schema_version=1, policy=policy), portfolio_halted=False, consecutive_losses=0,
+    )
+
+
+def _existing_positions_for_reduce_only_orders(paper_orders: list, *, strategy_id: str, contract_multiplier: Decimal) -> tuple:
+    """Real, confirmed defect found and fixed via this phase's own
+    acceptance-test run: a REAL strategy's own orders are unpredictable,
+    and among them can be a genuine reduce-only close -- `evaluate_risk`
+    correctly denies it (`INCOHERENT_EVALUATION_STATE`) against a
+    synthetic ALWAYS-FLAT portfolio, since there is nothing to reduce.
+    This is the gate working exactly as designed, not a bug in it -- the
+    FIX belongs in the test fixture: synthesize a plausible pre-existing
+    position, OPPOSITE side from the reduce-only order (a reduce-only
+    order always reduces the OPPOSITE-side position), sized comfortably
+    LARGER than the order's own quantity (so the trade classifies as
+    REDUCING, never crossing through zero into a new direction, which
+    Phase 2's own `classify_trade_risk` always counts as INCREASING
+    regardless of resulting magnitude). `mark_price == average_entry_
+    price` makes `unrealized_pnl == 0` trivially reconcile with
+    `PositionSnapshot`'s own required invariant."""
+    from quant_platform.portfolio_risk.snapshots import PositionSnapshot
+
+    positions = []
+    for order in paper_orders:
+        if not order.reduce_only:
+            continue
+        opposite_side = OrderSide.SELL if order.side is OrderSide.BUY else OrderSide.BUY
+        quantity = Decimal(str(order.quantity)) * Decimal(2)
+        positions.append(PositionSnapshot(
+            instrument_id=order.instrument, strategy_id=strategy_id, side=opposite_side, quantity=quantity,
+            average_entry_price=Decimal("2000"), mark_price=Decimal("2000"), unrealized_pnl=Decimal(0), realized_pnl=Decimal(0),
+            contract_multiplier=contract_multiplier,
+        ))
+    return tuple(positions)
+
+
+def _runner_environment(real_paper_session: dict, execution_storage_root: Path, *, positions: tuple = ()) -> RunnerEnvironment:
     return RunnerEnvironment(
         manifest_store=ExecutionSessionManifestStore(execution_storage_root), event_store=ExecutionSessionEventStore(execution_storage_root),
         paper_bridge_environment=_paper_bridge_environment(real_paper_session),
+        portfolio_risk_context=_portfolio_risk_context(execution_storage_root / "portfolio_risk", positions=positions),
     )
 
 
@@ -304,7 +387,17 @@ class TestRealBridgeLongAndShortMarketOrders:
 
         spec = _build_spec(real_paper_session, seed=1)
         storage_root = tmp_path / "session_root"
-        environment = _runner_environment(real_paper_session, storage_root)
+        # Real, confirmed defect found and fixed via this phase's own
+        # acceptance-test run: the REAL strategy's own orders are
+        # unpredictable and can include a genuine reduce-only close,
+        # which `evaluate_risk` correctly denies against an always-flat
+        # synthetic portfolio (nothing to reduce) -- see
+        # `_existing_positions_for_reduce_only_orders`'s own docstring.
+        paper_spec = real_paper_session["paper_spec"]
+        positions = _existing_positions_for_reduce_only_orders(
+            paper_orders, strategy_id=paper_spec.strategy_candidate_identity, contract_multiplier=Decimal(str(paper_spec.instrument.contract_multiplier)),
+        )
+        environment = _runner_environment(real_paper_session, storage_root, positions=positions)
         adapter = DeterministicDummyBrokerAdapter(adapter_id="acceptance-adapter-1", scenario=_DEFAULT_SCENARIO)
 
         manifest = run_execution_session(spec, environment=environment, adapter=adapter, paper_orders=paper_orders, market_events=market_events, event_time=_EVENT_TIME)
@@ -820,8 +913,16 @@ class TestDeterministicReplayAcrossProcessesAndHashSeeds:
         spec = _build_spec(real_paper_session, seed=14)
         market_events_factory = lambda: _bars([101.0, 100.0, 99.0], start=_EVENT_TIME)  # noqa: E731
 
-        first = replay_execution_session(spec, storage_root=tmp_path / "replay_first", paper_bridge_environment=_paper_bridge_environment(real_paper_session), paper_orders=[order], market_events=market_events_factory(), adapter_id="replay-adapter-first", event_time=_EVENT_TIME)
-        second = replay_execution_session(spec, storage_root=tmp_path / "replay_second", paper_bridge_environment=_paper_bridge_environment(real_paper_session), paper_orders=[order], market_events=market_events_factory(), adapter_id="replay-adapter-second", event_time=_EVENT_TIME)
+        first = replay_execution_session(
+            spec, storage_root=tmp_path / "replay_first", paper_bridge_environment=_paper_bridge_environment(real_paper_session),
+            portfolio_risk_context=_portfolio_risk_context(tmp_path / "replay_first" / "portfolio_risk"), paper_orders=[order],
+            market_events=market_events_factory(), adapter_id="replay-adapter-first", event_time=_EVENT_TIME,
+        )
+        second = replay_execution_session(
+            spec, storage_root=tmp_path / "replay_second", paper_bridge_environment=_paper_bridge_environment(real_paper_session),
+            portfolio_risk_context=_portfolio_risk_context(tmp_path / "replay_second" / "portfolio_risk"), paper_orders=[order],
+            market_events=market_events_factory(), adapter_id="replay-adapter-second", event_time=_EVENT_TIME,
+        )
         assert first.manifest.current_stage is ExecutionSessionStage.COMPLETED
         assert second.manifest.current_stage is ExecutionSessionStage.COMPLETED
         assert first.semantic_digest == second.semantic_digest

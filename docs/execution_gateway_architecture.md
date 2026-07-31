@@ -457,6 +457,25 @@ A safety cancel or an authorized reduce-only submit is deliberately
 (`models.REDUCE_ONLY_PERMITTING_KILL_SWITCH_STATES` is a strict superset
 of `NEW_EXPOSURE_PERMITTING_KILL_SWITCH_STATES`).
 
+## Portfolio-risk dispatch gate (Milestone 9 Phase 4)
+
+A SECOND, independent, mandatory gate now sits alongside the kill-switch
+gate on the SAME dispatch path: `execution_gateway.portfolio_risk_gate.
+authorize_portfolio_risk_dispatch`/`reserve_portfolio_risk_dispatch`,
+called in `runner.py`'s `_run_intents_and_events` immediately before
+`dispatcher.dispatch_command`, exactly like `kill_switch.authorize_
+dispatch` already is. No `ExecutionIntent` may reach the dispatcher
+without both gates passing. This is `quant_platform.portfolio_risk`
+(Milestone 9)'s own first real integration into this package -- full
+design detail (semantic migration, authorization lifecycle, recovery,
+cross-milestone verification, concurrency, defects found and fixed) lives
+in `docs/portfolio_risk_architecture.md`'s "Execution gateway integration
+(Phase 4)" section, not duplicated here. `ExecutionIntent.risk_
+authorization_id` was renamed to `execution_bridge_authorization_id`
+(same meaning: Milestone 8's own bridge-eligibility proof) and a NEW
+`portfolio_risk_authorization_id: str | None` field added -- see that
+same section for the full migration story.
+
 ## Crash recovery
 
 `recovery.recover_unknown_orders` (Section 23) NEVER trusts cached

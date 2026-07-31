@@ -1,26 +1,30 @@
 # Portfolio Risk and Capital Management Engine (Milestone 9) -- Architecture
 
-## Status: Phase 1 (domain foundation) + Phase 2 (deterministic exposure calculation and pre-trade risk evaluation) + Phase 3 (immutable authorization lifecycle, append-only ledger, persistence, replay, verification) delivered
+## Status: Phase 1 (domain foundation) + Phase 2 (deterministic exposure calculation and pre-trade risk evaluation) + Phase 3 (immutable authorization lifecycle, append-only ledger, persistence, replay, verification) + Phase 4 (execution gateway integration) delivered
 
-This document covers everything Phase 1, Phase 2, AND Phase 3 actually
-deliver -- exceptions, config schemas, enums, content-addressed policy/
-spec identity, portfolio/price snapshot models, risk-decision/risk-
+This document covers everything Phase 1 through Phase 4 actually deliver
+-- exceptions, config schemas, enums, content-addressed policy/spec
+identity, portfolio/price snapshot models, risk-decision/risk-
 authorization models (Phase 1); the pure exposure/projection/policy-
 check/sizing/evaluation layer that turns those models into a real
-`RiskDecision` (Phase 2); and the durable, append-only, hash-chained risk
+`RiskDecision` (Phase 2); the durable, append-only, hash-chained risk
 ledger, `RiskAuthorization` issuance/reservation/consumption lifecycle,
 recovery, reconciliation, independent verification, deterministic replay,
 and reporting that turn a `RiskDecision` into an auditable, single-use
-authorization (Phase 3). It explicitly marks every later-phase concept
-(CLI, execution-gateway enforcement, acceptance workflow) as NOT YET
-IMPLEMENTED rather than silently omitting it. Sections for those later
-phases are present as headings with a one-line status note, so this
-document's own structure does not need to be reshuffled as each phase
-lands -- only expanded.
+authorization (Phase 3); and the mandatory, fail-closed integration with
+`quant_platform.execution_gateway` (Milestone 8) that makes a
+`RiskAuthorization` an actual PRECONDITION for dispatch, not merely a
+durable record alongside it (Phase 4). It explicitly marks every later-
+phase concept (CLI expansion, real broker execution) as NOT YET
+IMPLEMENTED rather than silently omitting it.
 
 **Phase 3 baseline**: Phase 2 was committed at
-`4aac98c` ("Add deterministic portfolio risk evaluation engine"). Every
-Phase 3 module described below was built on top of that exact commit.
+`4aac98c` ("Add deterministic portfolio risk evaluation engine"). Phase 3
+was built on top of that commit and itself committed at `7ef860c` ("Add
+durable portfolio risk authorization lifecycle"). Phase 4 (this section)
+is built on top of `7ef860c` and is, per its own governing instructions,
+NOT committed -- see `docs/milestone9_phase4_delivery_report.md` for the
+exact `git status` at hand-off.
 
 ## Scope and explicit safety boundary (verbatim safety statements)
 
@@ -1082,18 +1086,313 @@ ultimately derive from. `PortfolioRiskLockError` is raised by `ledger.
 portfolio_risk_lock` both for a genuine lock-acquisition failure
 (`ExperimentLockError`, fail-fast contention) AND for a known Windows-
 specific release-side filesystem race (see defect #8 below) -- both are
-caller-retryable, so both resolve to the same exception type.
+caller-retryable, so both resolve to the same exception type. Phase 4
+adds one further sibling under `execution_gateway`'s OWN exception
+hierarchy (not this package's) -- see "Execution gateway integration
+(Phase 4)" below.
 
-## Known limitations (Phase 1 + Phase 2 + Phase 3 scope, not defects)
+## Execution gateway integration (Phase 4)
 
-- No CLI or execution-gateway enforcement exists yet -- see "PHASE 3
-  EXPLICITLY DOES NOT YET IMPLEMENT" above.
-- `execution_gateway.paper_bridge.ExecutionIntent.risk_authorization_id`
-  currently holds Milestone 8's own `execution_bridge_authorization_id`
-  concept, not this milestone's `portfolio_risk_authorization_id` concept
-  -- see "SEMANTIC COLLISION DECISION" above for the exact required
-  future migration. Phase 3 continues to leave this unresolved, per its
-  own explicit scope boundary (no `execution_gateway` modification).
+Phase 4 is the first real integration between Milestone 8
+(`execution_gateway`) and Milestone 9 (`portfolio_risk`), realizing the
+dependency direction documented since Phase 1 ("Package architecture and
+dependency direction" above): `execution_gateway` now depends on
+`portfolio_risk`; `portfolio_risk` still never imports `execution_gateway`
+(verified in both directions by the delivery report's own grep).
+
+### Primary guarantee
+
+**No `ExecutionIntent` may reach `dispatcher.dispatch_command` without
+first passing through a mandatory, fail-closed portfolio-risk gate.**
+Implemented entirely in a NEW module, `execution_gateway.
+portfolio_risk_gate`, and wired into `runner.py`'s `_run_intents_and_
+events` (the ONLY code path that bridges a paper order into a NEW
+`SubmitOrderCommand` and dispatches it) between intent construction and
+`dispatch_command`. Verified structurally, not just by testing: exactly
+two call sites of `dispatch_command` exist anywhere in `execution_gateway`
+-- the gated one in `_run_intents_and_events`, and `authorize_cancel_or_
+reduce_only_submit` (used ONLY for `CancelOrderCommand`/`ReplaceOrderCommand`
+in this codebase, which do not correspond to a NEW execution intent at
+all, and are therefore deliberately NOT gated -- see that function's own
+docstring for the explicit scoping rationale).
+
+### Flow
+
+```
+ExecutionIntent -> [authorize_portfolio_risk_dispatch] -> RiskAuthorization
+                 -> [reserve_portfolio_risk_dispatch]   -> RESERVED
+                 -> dispatcher.dispatch_command (runner.py's own call, unchanged)
+                 -> [consume_portfolio_risk_dispatch]   -> CONSUMED  (ONLY on COMMAND_DISPATCH_SUCCEEDED)
+```
+
+`authorize_portfolio_risk_dispatch` builds a `RiskEvaluationRequest` from
+the intent's own fields, records it, calls Phase 2's `evaluate_risk`
+UNMODIFIED, records the resulting `RiskDecision`, and -- only if
+`APPROVED` -- issues a `RiskAuthorization` via Phase 3's `issuance.
+issue_risk_authorization` UNMODIFIED. A DENIED/HALTED decision (or any
+identity/binding failure) raises `ExecutionPortfolioRiskAuthorizationError`
+(a new `execution_gateway`-domain exception, mirroring `ExecutionHaltError`'s
+identical role for a kill-switch refusal) -- `runner.py` durably records
+this via the previously-unused `EXECUTION_INTENT_REJECTED` ledger entry
+kind before the exception propagates uncaught (the SAME "no try/except
+around this call" precedent `authorize_dispatch`'s own kill-switch
+refusal already established). `reserve_portfolio_risk_dispatch`/
+`consume_portfolio_risk_dispatch` are thin, fail-closed wrappers around
+Phase 3's `lifecycle.reserve_authorization`/`consume_authorization`,
+UNMODIFIED. **No portfolio-risk evaluator logic and no dispatch-
+transaction logic was rewritten anywhere in this phase** -- Phase 4 is
+integration, not a rewrite, exactly as scoped.
+
+**Consumption is tied to `COMMAND_DISPATCH_SUCCEEDED` ONLY.** A capability
+rejection (`COMMAND_REJECTED`), an ambiguous adapter exception
+(`COMMAND_MARKED_UNKNOWN`), or a synchronous broker refusal
+(`COMMAND_DISPATCH_REJECTED`) all leave the authorization RESERVED, never
+consumed and never auto-invalidated -- `recover_portfolio_risk_dispatch_
+gate` (below) is what later resolves that ambiguity, using BOTH
+packages' own durable evidence, never a guess.
+
+`consumption_identity` is always `intent.execution_intent_id` -- already
+a deterministic, unique-per-intent, content-addressed id. Reusing it
+(rather than minting a third id) makes an exact retry of the same
+intent's dispatch attempt idempotent by construction (Phase 3's own
+`validate_authorization_use` semantics), and gives recovery a direct,
+unambiguous way to find the corresponding execution-gateway order for
+any RESERVED-but-unresolved authorization.
+
+### Semantic migration: `execution_bridge_authorization_id` / `portfolio_risk_authorization_id`
+
+Resolves the collision documented since Phase 1 ("SEMANTIC COLLISION
+DECISION" above). `ExecutionIntent.risk_authorization_id` (which actually
+held Milestone 8's OWN bridge-eligibility proof,
+`ExecutionAuthorization.execution_authorization_id`) is RENAMED to
+`execution_bridge_authorization_id` -- same meaning, same value, same
+sha256 validation, still participates in `execution_intent_id`'s
+identity (unchanged behavior). A NEW field, `portfolio_risk_
+authorization_id: str | None`, holds THIS milestone's own concept --
+`RiskAuthorization.risk_authorization_id` -- always `None` at bridge-
+construction time (the bridge has no portfolio-risk context) and bound
+afterward via `bind_portfolio_risk_authorization` (a NEW helper,
+`dataclasses.replace` under the hood).
+
+**Deliberately excluded from `to_identity_payload()`**: binding an
+authorization to an already-minted intent must never retroactively
+change that intent's own `execution_intent_id` (which every downstream
+id -- `client_order_id`, every command's own identity, `broker_order_id`,
+every fill id -- already cascades from) -- a circular, self-contradictory
+result otherwise, since a `RiskAuthorization` must bind to an ALREADY-
+COMPUTED `execution_intent_id` (Phase 1's own required binding field),
+but embedding the authorization id INTO that same intent's identity
+would require the id before the intent exists. Resolved by excluding the
+field from identity entirely; `bind_portfolio_risk_authorization`
+structurally asserts `execution_intent_id` is unchanged after binding.
+
+**`identity_version` bumped from 1 to 2** for every newly-constructed
+intent -- exactly the purpose this pre-existing field was reserved for.
+`ExecutionIntent.from_json_dict` reads `identity_version` to decide how
+to parse: `1` (or absent) triggers `_migrate_execution_intent_payload_
+v1_to_v2`, a deterministic, pure migration helper that maps the OLD
+`risk_authorization_id` key onto `execution_bridge_authorization_id`
+verbatim (never reinterpreted) and sets `portfolio_risk_authorization_id
+= None` (pre-migration data predates this milestone's own authorization
+concept entirely -- there is nothing to backfill, and claiming otherwise
+would be exactly the "silently reinterpret historical data" this
+migration must never do). The reconstructed object KEEPS `identity_
+version=1` and its ORIGINAL `execution_intent_id` -- old data replays to
+the exact same id it always did; only the in-memory field NAMES change,
+never the persisted economic identity. `identity_version >= 2` payloads
+are read directly, no migration. A payload missing BOTH `execution_
+bridge_authorization_id` and `risk_authorization_id` is genuinely corrupt
+(neither schema shape) and raises a plain `KeyError`, exactly like any
+other missing required field on this class already does.
+
+Blast radius of the rename: `paper_bridge.py` (5 sites, all updated),
+`ExecutionLedgerEntryKind` (one new member, `PORTFOLIO_RISK_AUTHORIZATION_
+BOUND`, an audit-trail convenience entry recorded by `runner.py` right
+after a successful bind -- the `portfolio_risk` ledger's own `RISK_
+AUTHORIZATION_ISSUED` entry remains the authoritative source, this is
+never a second source of truth), and 3 pre-existing unit test files that
+constructed `ExecutionIntent` directly with the old field name (all
+updated, all still passing).
+
+### `PortfolioRiskGatewayContext` -- deliberately NOT threaded through `ExecutionGatewaySpec`
+
+`portfolio_id`, `portfolio_snapshot`, `price_snapshot`, `risk_spec`,
+`portfolio_halted`, `consecutive_losses` live in a NEW, separate context
+object (`portfolio_risk_gate.PortfolioRiskGatewayContext`), passed
+alongside `RunnerEnvironment` -- deliberately NOT added as fields on
+`ExecutionGatewaySpec`/`ExecutionGatewayConfigSchema`. Adding them there
+would change `execution_gateway_spec_id`'s own identity computation for
+EVERY existing spec, a far more invasive, identity-breaking change than
+Phase 4's own "integration, not rewrite" scope calls for. `portfolio_
+snapshot`/`price_snapshot`/`risk_spec` are FIXED for the lifetime of one
+`run_execution_session` call -- Phase 2's `evaluate_risk` is stateless
+and caller-supplied-everything by design (no portfolio-risk evaluator
+rewrite in this phase), so this context does not evolve the snapshot as
+fills accrue mid-session (see Known Limitations). `price_snapshot.
+instrument_id` matching every intent's own `instrument_id` is safe to
+assume because `ExecutionGatewaySpec` already scopes one whole execution
+session to exactly one instrument (Milestone 8's own pre-existing
+invariant, Check 8 in `paper_bridge.execution_intent_from_paper_order`).
+
+`RunnerEnvironment` gains one new REQUIRED field, `portfolio_risk_context`
+-- never optional, since the gate is mandatory. `replay.replay_execution_
+session` gains a matching required parameter, threaded straight through
+(mirrors how `paper_bridge_environment` is already handled). The CLI
+(`ml_cli.py`) wires a MINIMAL, always-present DEFAULT context
+automatically -- deliberately no new CLI flags or config-schema fields
+(out of Phase 4's own scope: "no CLI expansion"). Every limit on the
+default `PortfolioRiskPolicy` is `None` ("not configured", Phase 1's own
+pre-existing convention -- NOT a bypass flag; no field anywhere in this
+package exists whose purpose is "skip risk evaluation"). The gate still
+runs for REAL, through the genuine `evaluate_risk` pipeline, on every
+CLI-driven dispatch -- it simply always approves until an operator
+supplies real policy configuration (a known, honestly-documented Known
+Limitation, not a silently-glossed-over gap).
+
+### Recovery
+
+`recover_portfolio_risk_dispatch_gate` (new, `portfolio_risk_gate.py`)
+runs at the SAME `ADAPTER_INITIALIZED` runner stage as `execution_
+gateway`'s OWN `recover_unknown_orders`, immediately after it (order
+matters: portfolio-risk recovery's own cross-reference reads execution-
+gateway order state that `recover_unknown_orders` must have already
+resolved as much as it can). It calls Phase 3's `recovery.recover_
+portfolio_risk_session` UNMODIFIED, then for every authorization it
+classifies `reserved_unresolved_blocked`, cross-references the
+corresponding execution-gateway order (found via `consumption_identity`
+== `execution_intent_id`, exact and unambiguous):
+
+- Order confirmed `DISPATCHED`/`ACKNOWLEDGED`/`PARTIALLY_FILLED`/`FILLED`
+  -> the dispatch DID succeed even though the `consume` call never
+  durably completed (a crash between dispatch success and consume) ->
+  **`consumed_now`** (the missed consume is durably completed).
+- Order confirmed `CREATED`/`VALIDATED`/`REJECTED`/`CANCELLED`/`EXPIRED`
+  (never went live, or was refused before ever reaching the broker) ->
+  **`invalidated_now`** (released so the authorization does not stay
+  blocked forever).
+- Order still `UNKNOWN` even after execution_gateway's own recovery, or
+  no matching `SubmitOrderCommand` was ever created at all (the crash
+  window between reservation and the first dispatch-transaction ledger
+  write) -> **`remains_blocked`** -- never blindly reused, never guessed.
+
+This directly resolves the required "crash before dispatch"/"crash after
+reservation"/"crash after dispatch" scenarios: since `reserve_portfolio_
+risk_dispatch` is the last durable step before `dispatch_command`, "crash
+before dispatch" and "crash after reservation" describe the SAME
+recovery window (no command exists yet -> `remains_blocked`, safe,
+inspectable, no double-use possible); "crash after dispatch" is the
+`consumed_now` case above.
+
+### Cross-milestone verification
+
+`portfolio_risk_gate.verify_execution_portfolio_risk_integration`
+combines each package's OWN independent verification (`execution_gateway.
+verification.verify_execution_session`, `portfolio_risk.verification.
+verify_portfolio_risk_session` with `record=False` -- exactly like
+`replay.py`'s own comparison utility, so this function is itself side-
+effect-free and repeatable -- NEITHER modified nor re-implemented here)
+with cross-ledger checks NEITHER package alone can perform, since neither
+has visibility into the other's own ledger: every accepted `ExecutionIntent`
+has a matching `RiskAuthorization` bound to the correct `portfolio_id`
+(`dispatched_intent_without_risk_authorization`/`authorization_binding_
+mismatch` if not); every `PORTFOLIO_RISK_AUTHORIZATION_BOUND` audit entry
+agrees with the portfolio-risk ledger's own `execution_intent_id` index
+(`execution_ledger_authorization_binding_mismatch` if not); and an
+authorization is `CONSUMED` if and only if its intent's command resolved
+to `COMMAND_DISPATCH_SUCCEEDED` (`consumed_authorization_without_
+successful_dispatch`/`successful_dispatch_without_consumed_authorization`
+if not -- the "single economic execution" cross-check).
+
+### Concurrency
+
+Two real, confirmed defects were found via this phase's own adversarial
+concurrency testing and fixed at root cause (see "Defects found and
+fixed" below, #9 and #10). After both fixes: two threads authorizing
+DIFFERENT intents concurrently both succeed (an internal bounded retry
+loop, mirroring Phase 3's own `_MAX_APPEND_RACE_RETRIES` convention,
+resolves a losing ledger-append race by recomputing fresh sequence
+numbers); two threads reserving the SAME intent concurrently are
+idempotently absorbed to exactly one ledger entry; `PortfolioRiskLockError`
+(fail-fast lock contention, a documented, expected, RETRYABLE
+infrastructure condition) always propagates UNCHANGED rather than being
+misclassified as a business-level `ExecutionPortfolioRiskAuthorizationError`
+denial.
+
+A KNOWN, PRE-EXISTING, OUT-OF-SCOPE flake source remains: the shared
+`historical.locking.DatasetLock` primitive both packages' locks wrap has
+its own documented stale-lock-reclaim race (the exact same underlying
+fragility already responsible for Phase 3's own "defect #8") that can,
+extremely rarely (empirically roughly 1-in-200-to-300 attempts under a
+synthetic, maximally-tight `threading.Barrier` stress pattern far
+tighter than any realistic caller would ever produce), cause a genuine,
+momentary loss of mutual exclusion. Confirmed via direct reproduction and
+root-cause investigation to live entirely inside shared, pre-existing
+locking infrastructure used by multiple milestones -- fixing it would
+require rewriting that primitive's own lock-acquisition protocol,
+explicitly outside Phase 4's own scope. See Known Limitations.
+
+### Defects found and fixed during Phase 4's own development
+
+Continuing the numbering from Phase 3's own "Defects found and fixed"
+section (defects 1-8):
+
+9. **`authorize_portfolio_risk_dispatch` could leak a raw, confusing
+   `RiskAuthorizationReuseError` under a genuine concurrent race** --
+   this function makes THREE separate appends to the SAME shared per-
+   portfolio ledger (evaluation request, decision, authorization
+   issuance). Two concurrent calls for two DIFFERENT intents could each
+   pass `portfolio_risk_lock` for their own FIRST append, then race a
+   LATER one, since the three-append sequence is not atomic as a whole
+   -- unlike Phase 3's own single-append reserve/consume transactions
+   (already race-safe). The losing call surfaced a bare, misleading
+   ledger-sequence-conflict exception instead of succeeding. Fixed by
+   wrapping the whole evaluate-and-record sequence in a bounded retry
+   loop that recomputes fresh sequence numbers on a losing race -- safe
+   because every step is a pure function of its inputs.
+10. **`PortfolioRiskLockError` (transient lock contention) was
+    misclassified as a business-level denial** -- `authorize_portfolio_
+    risk_dispatch`/`reserve_portfolio_risk_dispatch`/`consume_portfolio_
+    risk_dispatch` each had a broad `except PortfolioRiskError as exc:
+    raise ExecutionPortfolioRiskAuthorizationError(...)` clause that also
+    caught `PortfolioRiskLockError` (a `PortfolioRiskError` subclass),
+    wrapping a purely transient, RETRYABLE infrastructure condition into
+    an exception whose name implies "this dispatch was refused" -- a
+    caller catching the wrapped type and treating it as final (never
+    retry this intent) would be WRONG when the underlying cause was only
+    lock contention. Found via this phase's own concurrency test
+    development (a `_retry_on_lock` test helper stopped seeing the
+    `PortfolioRiskLockError` it was specifically watching for). Fixed by
+    adding an explicit `except PortfolioRiskLockError: raise` before each
+    broader `except PortfolioRiskError` clause, letting lock errors
+    propagate unchanged.
+
+## Known limitations (Phase 1 through Phase 4 scope, not defects)
+
+- **No CLI expansion, no real broker execution** -- Phase 4 wires the
+  gate into every REAL dispatch path but adds no new CLI flags/commands
+  and no live-trading code; the CLI's own default portfolio-risk context
+  is minimal/unconfigured (see "PortfolioRiskGatewayContext" above).
+- `execution_gateway.paper_bridge.ExecutionIntent`'s semantic collision
+  (documented since Phase 1) is now RESOLVED by Phase 4's own field
+  rename/split -- see "Semantic migration" above. This bullet is kept
+  here, struck through in spirit, purely so a reader scanning historical
+  limitations understands the collision no longer exists as of Phase 4.
+- **Phase 4's `PortfolioRiskGatewayContext` does not evolve the
+  portfolio/price snapshot mid-session** -- `portfolio_snapshot`/
+  `price_snapshot`/`risk_spec` are fixed for one whole `run_execution_
+  session` call. A session that bridges MULTIPLE orders evaluates every
+  one against the SAME starting snapshot, never one updated by an
+  earlier order's own fill within that same call. This mirrors Phase 2's
+  own stateless `evaluate_risk` contract exactly (no portfolio-risk
+  evaluator rewrite in this phase) -- a future phase wanting live,
+  fill-aware re-evaluation would need to construct a NEW context between
+  orders itself; nothing in Phase 4 does this automatically.
+- **A known, pre-existing, out-of-scope shared-infrastructure flake
+  source** -- `historical.locking.DatasetLock`'s own documented stale-
+  lock-reclaim race can, extremely rarely under maximally-tight
+  concurrent contention, cause a genuine, momentary loss of mutual
+  exclusion. See "Concurrency" above for the full, honest write-up;
+  confirmed not to be a Phase 4 defect, confirmed out of scope to fix.
 - **`evaluate_risk` still does not construct a `RiskAuthorization`
   itself** -- `issuance.issue_risk_authorization` is a separate function a
   caller invokes with an `APPROVED` `RiskDecision`; Phase 3 does not wire
@@ -1149,22 +1448,29 @@ caller-retryable, so both resolve to the same exception type.
 
 ## Future phases (not implemented, not started)
 
-- `execution_gateway` dispatch-gate integration: refusing to dispatch any
-  `ExecutionIntent` without a valid, matching, unconsumed
-  `RiskAuthorization` -- calling `reserve_authorization`/`consume_
-  authorization` around the actual dispatch, and performing the
-  `ExecutionIntent` field migration described in "SEMANTIC COLLISION
-  DECISION" above. Explicitly NOT started by Phase 3.
+- **`execution_gateway` dispatch-gate integration is DONE (Phase 4)** --
+  removed from this list; see "Execution gateway integration (Phase 4)"
+  above.
+- Evolving `PortfolioRiskGatewayContext`'s portfolio/price snapshot
+  mid-session as fills accrue, instead of one fixed snapshot per
+  `run_execution_session` call -- see this phase's own Known Limitations.
+- New CLI flags/config-schema fields letting an operator supply a REAL
+  `PortfolioRiskPolicy` to the execution-gateway CLI, replacing today's
+  minimal always-unconfigured default context. Explicitly out of Phase
+  4's own scope ("no CLI expansion").
 - Deriving `evaluate_risk`'s `portfolio_halted`/`consecutive_losses`
-  parameters from the Phase 3 ledger's own recorded history, instead of a
-  caller-supplied parameter.
+  parameters from the portfolio-risk ledger's own recorded history,
+  instead of a caller-supplied parameter.
 - Wiring `checks.check_portfolio_halted` (or a successor) to consult
-  `policy.allow_reduce_only_during_halt` once a real dispatch gate exists
-  to act on the distinction.
-- A CLI surface on the shared `ml_cli.py` parser.
+  `policy.allow_reduce_only_during_halt` now that a real dispatch gate
+  exists to act on the distinction.
 - A real, end-to-end acceptance workflow chaining a genuine paper/
-  execution session through real risk evaluation AND the Phase 3
-  authorization lifecycle.
+  execution session through real risk evaluation AND the full
+  authorization lifecycle -- Phase 4 extends `tests/integration/
+  test_execution_gateway_acceptance.py` with a working (always-approving)
+  portfolio-risk context so the EXISTING acceptance workflow continues to
+  pass, but does not add new acceptance scenarios exercising a
+  DENYING/HALTING policy end-to-end through the real bridge.
 - Real cost-component modeling (spread/slippage/commission) inside
   `valuation.py`'s post-trade projection, reusing this platform's
   existing `backtesting.costs`/`paper_trading.costs` formulas rather than
@@ -1173,4 +1479,6 @@ caller-retryable, so both resolve to the same exception type.
   snapshots/policy as part of independent verification, once an
   artifact store for those exists -- see "Independent verification
   honesty classification" above for the precise gap this would close.
+- A root-cause fix to `historical.locking.DatasetLock`'s own stale-lock-
+  reclaim race (shared infrastructure, out of scope for this milestone).
 - Milestone 10 has not been started.

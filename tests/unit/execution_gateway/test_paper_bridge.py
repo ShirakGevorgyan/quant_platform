@@ -38,8 +38,9 @@ def _intent(**overrides: object) -> ExecutionIntent:
         "execution_intent_id": "0" * 64, "execution_session_id": _SHA_A, "paper_session_id": _SHA_B, "source_decision_id": _SHA_C,
         "source_paper_order_id": _SHA_D, "instrument_id": "EURUSD", "side": OrderSide.BUY, "quantity": Decimal("1.5"), "order_type": OrderTypeKind.MARKET,
         "limit_price": None, "stop_price": None, "time_in_force": TimeInForceKind.DAY, "reduce_only": False, "close_position": False,
-        "strategy_candidate_id": _SHA_A, "model_artifact_id": _SHA_B, "risk_authorization_id": _SHA_E, "source_event_id": None,
-        "source_event_time": "2026-01-01T00:00:00+00:00", "created_sequence": 0, "contract_multiplier": Decimal("100"), "identity_version": 1,
+        "strategy_candidate_id": _SHA_A, "model_artifact_id": _SHA_B, "execution_bridge_authorization_id": _SHA_E, "portfolio_risk_authorization_id": None,
+        "source_event_id": None, "source_event_time": "2026-01-01T00:00:00+00:00", "created_sequence": 0, "contract_multiplier": Decimal("100"),
+        "identity_version": 2,
     }
     base.update(overrides)
     return ExecutionIntent(**base)  # type: ignore[arg-type]

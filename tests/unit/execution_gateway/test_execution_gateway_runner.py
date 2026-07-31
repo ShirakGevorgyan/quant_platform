@@ -32,6 +32,7 @@ from quant_platform.execution_gateway.paper_bridge import (
     PaperBridgeEnvironment,
 )
 from quant_platform.execution_gateway.persistence import ExecutionSessionEventStore
+from quant_platform.execution_gateway.portfolio_risk_gate import PortfolioRiskGatewayContext
 from quant_platform.execution_gateway.runner import (
     RunnerEnvironment,
     pause_execution_session,
@@ -52,6 +53,9 @@ from quant_platform.execution_gateway.specs import (
 from quant_platform.paper_trading.events import create_quote_event
 from quant_platform.paper_trading.models import PositionIntentKind
 from quant_platform.paper_trading.orders import create_order_request
+from quant_platform.portfolio_risk.ledger import PortfolioRiskLedgerStore
+from quant_platform.portfolio_risk.snapshots import create_portfolio_snapshot, create_price_snapshot
+from quant_platform.portfolio_risk.specs import PortfolioRiskPolicy, PortfolioRiskSpec
 
 _SHA_PAPER_SESSION = "a" * 64
 _SHA_PAPER_SPEC = "b" * 64
@@ -108,8 +112,8 @@ def _bypass_paper_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
             source_decision_id=paper_order.strategy_decision_id, source_paper_order_id=paper_order.order_id, instrument_id=paper_order.instrument,
             side=paper_order.side, quantity=Decimal(str(paper_order.quantity)), order_type=paper_order.order_type, limit_price=None, stop_price=None,
             time_in_force=paper_order.time_in_force, reduce_only=paper_order.reduce_only, close_position=False, strategy_candidate_id="1" * 64,
-            model_artifact_id="2" * 64, risk_authorization_id="3" * 64, source_event_id=source_event_id, source_event_time="2026-01-01T00:00:00+00:00",
-            created_sequence=created_sequence, contract_multiplier=Decimal("1"), identity_version=1,
+            model_artifact_id="2" * 64, execution_bridge_authorization_id="3" * 64, portfolio_risk_authorization_id=None, source_event_id=source_event_id,
+            source_event_time="2026-01-01T00:00:00+00:00", created_sequence=created_sequence, contract_multiplier=Decimal("1"), identity_version=2,
         )
         authorization = ExecutionAuthorization(
             execution_authorization_id="4" * 64, authorization_mode=AuthorizationMode.TEST_ONLY_DUMMY_EXECUTION,
@@ -126,11 +130,36 @@ class _FakePaperManifestStore:
         return object()
 
 
+def _portfolio_risk_context(tmp_path) -> PortfolioRiskGatewayContext:
+    """An always-approving context (no configured limits) -- this file's
+    own tests exercise runner.py's OWN orchestration logic, not portfolio-
+    risk denial/reservation behavior (covered by the dedicated Phase 4
+    integration test file), so the gate should simply never block here."""
+    equity = Decimal("1000000")
+    portfolio = create_portfolio_snapshot(
+        portfolio_id="test-portfolio", event_time=_NOW, cash=equity, equity=equity, realized_pnl=Decimal(0), unrealized_pnl=Decimal(0),
+        peak_equity=equity, daily_start_equity=equity, positions=(), source_execution_session_id=None,
+    )
+    price = create_price_snapshot(instrument_id="EURUSD", bid=Decimal("1.0995"), ask=Decimal("1.1005"), reference_price=Decimal("1.1"), event_time=_NOW, source_event_id=None)
+    policy = PortfolioRiskPolicy(
+        max_order_notional=None, max_position_notional=None, max_instrument_gross_exposure=None, max_strategy_gross_exposure=None,
+        max_portfolio_gross_exposure=None, max_portfolio_net_exposure=None, max_concentration_fraction=None, max_leverage=None,
+        max_daily_realized_loss=None, max_total_loss=None, max_drawdown_fraction=None, max_consecutive_losses=None, minimum_cash_buffer=None,
+        maximum_price_age=None, maximum_portfolio_snapshot_age=None, allow_reduce_only_during_halt=True,
+    )
+    return PortfolioRiskGatewayContext(
+        store=PortfolioRiskLedgerStore(tmp_path / "portfolio_risk"), portfolio_id="test-portfolio", portfolio_snapshot=portfolio, price_snapshot=price,
+        risk_spec=PortfolioRiskSpec(schema_version=1, policy=policy), portfolio_halted=False, consecutive_losses=0,
+    )
+
+
 def _environment(tmp_path) -> RunnerEnvironment:
     manifest_store = ExecutionSessionManifestStore(tmp_path)
     event_store = ExecutionSessionEventStore(tmp_path)
     bridge_environment = PaperBridgeEnvironment(manifest_store=_FakePaperManifestStore(), event_store=None, artifact_store=None, eligibility_environment=None)  # type: ignore[arg-type]
-    return RunnerEnvironment(manifest_store=manifest_store, event_store=event_store, paper_bridge_environment=bridge_environment)
+    return RunnerEnvironment(
+        manifest_store=manifest_store, event_store=event_store, paper_bridge_environment=bridge_environment, portfolio_risk_context=_portfolio_risk_context(tmp_path),
+    )
 
 
 class TestRunExecutionSessionCleanRun:

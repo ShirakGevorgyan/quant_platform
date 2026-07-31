@@ -22,7 +22,7 @@ earlier one has failed."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 
@@ -169,7 +169,30 @@ class ExecutionIntent:
 
     strategy_candidate_id: str
     model_artifact_id: str
-    risk_authorization_id: str
+    execution_bridge_authorization_id: str
+    """Milestone 8's OWN bridge-eligibility proof -- `ExecutionAuthorization.
+    execution_authorization_id`, the id proving this paper order was
+    cleared to bridge from paper trading into the execution gateway AT
+    ALL. Renamed from this field's original name, `risk_authorization_id`
+    (Milestone 9 Phase 4's semantic migration) -- see `portfolio_risk_
+    authorization_id` immediately below and `docs/portfolio_risk_
+    architecture.md`'s "SEMANTIC COLLISION DECISION" section for the full
+    history of why these are two distinct concepts that must never share
+    one field name."""
+
+    portfolio_risk_authorization_id: str | None
+    """Milestone 9's OWN concept -- `portfolio_risk.authorization.
+    RiskAuthorization.risk_authorization_id`, the id proving a specific
+    quantity/price was cleared to dispatch against a specific, evaluated
+    PORTFOLIO state. Always `None` at bridge-construction time (the
+    bridge has no portfolio-risk context) -- populated later, via
+    `bind_portfolio_risk_authorization`, once `execution_gateway.
+    portfolio_risk_gate.authorize_portfolio_risk_dispatch` has evaluated
+    this exact intent and issued a matching authorization. Deliberately
+    EXCLUDED from `to_identity_payload()` (see there) so binding it after
+    the fact never changes `execution_intent_id` -- the intent's own
+    economic identity does not depend on WHICH authorization later
+    satisfies it, only on its own content."""
 
     source_event_id: str | None
     source_event_time: str
@@ -183,9 +206,11 @@ class ExecutionIntent:
             ("execution_session_id", self.execution_session_id), ("paper_session_id", self.paper_session_id),
             ("source_decision_id", self.source_decision_id), ("source_paper_order_id", self.source_paper_order_id),
             ("strategy_candidate_id", self.strategy_candidate_id), ("model_artifact_id", self.model_artifact_id),
-            ("risk_authorization_id", self.risk_authorization_id),
+            ("execution_bridge_authorization_id", self.execution_bridge_authorization_id),
         ):
             _require_sha256(value, field_name=f"ExecutionIntent.{field_name}")
+        if self.portfolio_risk_authorization_id is not None:
+            _require_sha256(self.portfolio_risk_authorization_id, field_name="ExecutionIntent.portfolio_risk_authorization_id")
         if not self.instrument_id:
             raise ExecutionIntentError("ExecutionIntent.instrument_id must not be empty")
         if not self.quantity.is_finite() or self.quantity <= 0:
@@ -220,17 +245,49 @@ class ExecutionIntent:
             "limit_price": _optional_decimal_json(self.limit_price), "stop_price": _optional_decimal_json(self.stop_price),
             "time_in_force": self.time_in_force.value, "reduce_only": self.reduce_only, "close_position": self.close_position,
             "strategy_candidate_id": self.strategy_candidate_id, "model_artifact_id": self.model_artifact_id,
-            "risk_authorization_id": self.risk_authorization_id, "source_event_id": self.source_event_id, "source_event_time": self.source_event_time,
+            "execution_bridge_authorization_id": self.execution_bridge_authorization_id,
+            "portfolio_risk_authorization_id": self.portfolio_risk_authorization_id,
+            "source_event_id": self.source_event_id, "source_event_time": self.source_event_time,
             "created_sequence": self.created_sequence, "contract_multiplier": decimal_to_json(self.contract_multiplier), "identity_version": self.identity_version,
         }
 
     def to_identity_payload(self) -> dict[str, object]:
+        """Excludes `execution_intent_id` (the object's own id, as usual)
+        AND `portfolio_risk_authorization_id` -- the latter is discovered
+        AFTER this intent already exists (see the field's own docstring),
+        so it must never participate in the hash that defines
+        `execution_intent_id` itself, or binding an authorization to an
+        intent would retroactively change that same intent's own
+        identity -- a circular, self-contradictory result."""
         payload = dict(self.to_json_dict())
         del payload["execution_intent_id"]
+        del payload["portfolio_risk_authorization_id"]
         return payload
 
     @classmethod
     def from_json_dict(cls, raw: dict[str, object]) -> ExecutionIntent:
+        """Reads either schema shape (Milestone 9 Phase 4's semantic
+        migration renamed `risk_authorization_id` to `execution_bridge_
+        authorization_id` and added `portfolio_risk_authorization_id`):
+
+        - `identity_version == 1` (or missing entirely, i.e. absent from
+          `raw`): the OLD, pre-migration shape -- `raw` carries
+          `risk_authorization_id` only. Read via `_migrate_execution_
+          intent_payload_v1_to_v2` (never silently reinterpreted inline --
+          the migration is one explicit, deterministic, documented step).
+          The reconstructed object keeps `identity_version=1` and its
+          ORIGINAL `execution_intent_id` unchanged -- old data replays to
+          the exact same id it always did; only the in-memory field NAMES
+          change, never the persisted economic identity.
+        - `identity_version >= 2`: the current shape -- both fields read
+          directly, no migration needed.
+
+        A payload that is missing BOTH `execution_bridge_authorization_id`
+        AND `risk_authorization_id` is genuinely corrupt (neither schema
+        shape) and raises a plain `KeyError`, exactly as any other
+        missing required field on this class already does."""
+        if "execution_bridge_authorization_id" not in raw and "risk_authorization_id" in raw:
+            raw = _migrate_execution_intent_payload_v1_to_v2(raw)
         return cls(
             execution_intent_id=str(raw["execution_intent_id"]), execution_session_id=str(raw["execution_session_id"]),
             paper_session_id=str(raw["paper_session_id"]), source_decision_id=str(raw["source_decision_id"]),
@@ -240,10 +297,51 @@ class ExecutionIntent:
             stop_price=(None if raw.get("stop_price") is None else parse_decimal(raw["stop_price"], field_name="stop_price")),
             time_in_force=TimeInForceKind(raw["time_in_force"]), reduce_only=bool(raw["reduce_only"]), close_position=bool(raw["close_position"]),
             strategy_candidate_id=str(raw["strategy_candidate_id"]), model_artifact_id=str(raw["model_artifact_id"]),
-            risk_authorization_id=str(raw["risk_authorization_id"]), source_event_id=(None if raw.get("source_event_id") is None else str(raw["source_event_id"])),
+            execution_bridge_authorization_id=str(raw["execution_bridge_authorization_id"]),
+            portfolio_risk_authorization_id=(None if raw.get("portfolio_risk_authorization_id") is None else str(raw["portfolio_risk_authorization_id"])),
+            source_event_id=(None if raw.get("source_event_id") is None else str(raw["source_event_id"])),
             source_event_time=str(raw["source_event_time"]), created_sequence=int(str(raw["created_sequence"])),
             contract_multiplier=parse_decimal(raw["contract_multiplier"], field_name="contract_multiplier"), identity_version=int(str(raw["identity_version"])),
         )
+
+
+def _migrate_execution_intent_payload_v1_to_v2(raw: dict[str, object]) -> dict[str, object]:
+    """Deterministic migration helper (Milestone 9 Phase 4's required
+    semantic migration): maps a pre-migration `ExecutionIntent.to_json_
+    dict()` payload (`risk_authorization_id`, no `portfolio_risk_
+    authorization_id`) onto the current field names, WITHOUT inventing
+    any data that was not there. `risk_authorization_id`'s old value
+    always meant Milestone 8's own bridge-authorization concept (see
+    `execution_bridge_authorization_id`'s own docstring) -- it is copied
+    across verbatim, never reinterpreted as a portfolio-risk id.
+    `portfolio_risk_authorization_id` is set to `None`: pre-migration data
+    predates this milestone's own authorization concept entirely, so
+    there is no value to backfill -- claiming otherwise would be exactly
+    the "silently reinterpret historical data" this migration must never
+    do. Pure and side-effect-free; never called for `identity_version >=
+    2` data, which already has the current shape."""
+    migrated = dict(raw)
+    migrated["execution_bridge_authorization_id"] = migrated.pop("risk_authorization_id")
+    migrated.setdefault("portfolio_risk_authorization_id", None)
+    return migrated
+
+
+def bind_portfolio_risk_authorization(intent: ExecutionIntent, *, portfolio_risk_authorization_id: str) -> ExecutionIntent:
+    """Returns a NEW `ExecutionIntent` carrying `portfolio_risk_
+    authorization_id` -- safe because that field is excluded from `to_
+    identity_payload()` (see its own docstring), so `execution_intent_id`
+    (and everything cascading from it: `client_order_id`, every command's
+    own identity, `broker_order_id`, every fill id) is UNCHANGED by this
+    call. This is the only sanctioned way to attach a portfolio-risk
+    authorization to an already-minted intent -- never construct a second
+    `ExecutionIntent` by hand for this purpose."""
+    rebound = replace(intent, portfolio_risk_authorization_id=portfolio_risk_authorization_id)
+    if rebound.execution_intent_id != intent.execution_intent_id:
+        raise ExecutionIntentError(  # pragma: no cover -- structurally unreachable given to_identity_payload's exclusion; a defense-in-depth assertion, not a reachable code path.
+            "internal error: binding a portfolio_risk_authorization_id changed execution_intent_id -- "
+            "to_identity_payload() no longer excludes portfolio_risk_authorization_id"
+        )
+    return rebound
 
 
 def _create_execution_intent(**kwargs: object) -> ExecutionIntent:
@@ -366,8 +464,9 @@ def execution_intent_from_paper_order(
         source_paper_order_id=paper_order.order_id, instrument_id=paper_order.instrument, side=paper_order.side, quantity=quantity,
         order_type=paper_order.order_type, limit_price=limit_price, stop_price=stop_price, time_in_force=paper_order.time_in_force,
         reduce_only=paper_order.reduce_only, close_position=close_position, strategy_candidate_id=strategy_candidate_id,
-        model_artifact_id=model_artifact_id, risk_authorization_id=authorization.execution_authorization_id, source_event_id=source_event_id,
-        source_event_time=format_utc_timestamp(pd.Timestamp(event_time)), created_sequence=created_sequence, contract_multiplier=contract_multiplier, identity_version=1,
+        model_artifact_id=model_artifact_id, execution_bridge_authorization_id=authorization.execution_authorization_id,
+        portfolio_risk_authorization_id=None, source_event_id=source_event_id,
+        source_event_time=format_utc_timestamp(pd.Timestamp(event_time)), created_sequence=created_sequence, contract_multiplier=contract_multiplier, identity_version=2,
     )
 
     # Check 11: authorization belongs to the same source order.
@@ -389,6 +488,7 @@ __all__ = [
     "ExecutionAuthorization",
     "ExecutionIntent",
     "PaperBridgeEnvironment",
+    "bind_portfolio_risk_authorization",
     "create_execution_authorization",
     "execution_intent_from_paper_order",
 ]

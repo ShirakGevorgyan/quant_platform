@@ -23,6 +23,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
+from quant_platform.core.exceptions import ExecutionPortfolioRiskAuthorizationError
 from quant_platform.execution_gateway.adapter import ExecutionAdapter
 from quant_platform.execution_gateway.commands import (
     CancelOrderCommand,
@@ -49,12 +50,20 @@ from quant_platform.execution_gateway.models import (
 )
 from quant_platform.execution_gateway.paper_bridge import (
     PaperBridgeEnvironment,
+    bind_portfolio_risk_authorization,
     execution_intent_from_paper_order,
 )
 from quant_platform.execution_gateway.persistence import (
     ExecutionLedgerEntry,
     ExecutionSessionEventStore,
     compute_execution_ledger_semantic_digest,
+)
+from quant_platform.execution_gateway.portfolio_risk_gate import (
+    PortfolioRiskGatewayContext,
+    authorize_portfolio_risk_dispatch,
+    consume_portfolio_risk_dispatch,
+    recover_portfolio_risk_dispatch_gate,
+    reserve_portfolio_risk_dispatch,
 )
 from quant_platform.execution_gateway.reconciliation import (
     reconcile_execution_session,
@@ -77,6 +86,15 @@ class RunnerEnvironment:
     manifest_store: ExecutionSessionManifestStore
     event_store: ExecutionSessionEventStore
     paper_bridge_environment: PaperBridgeEnvironment
+    portfolio_risk_context: PortfolioRiskGatewayContext
+    """Milestone 9 Phase 4: REQUIRED, never optional -- `_run_intents_and_
+    events` unconditionally gates every new `ExecutionIntent` through
+    `portfolio_risk_gate.authorize_portfolio_risk_dispatch`/`reserve_
+    portfolio_risk_dispatch` before it may reach `dispatcher.dispatch_
+    command`. There is no configuration that disables this gate; a
+    caller with no real portfolio-risk policy yet must still supply a
+    context (e.g. an unconfigured `PortfolioRiskPolicy` where every limit
+    is `None`), never omit one."""
 
 
 def _kill_switch_events_from_ledger(ledger: list[ExecutionLedgerEntry]) -> list[ExecutionKillSwitchTransitionEvent]:
@@ -148,6 +166,15 @@ def run_execution_session(
 
     if manifest.current_stage is ExecutionSessionStage.ADAPTER_INITIALIZED:
         recover_unknown_orders(execution_session_id=execution_session_id, event_store=environment.event_store, adapter=adapter, capabilities=adapter.capabilities(), event_time=event_time)
+        # Milestone 9 Phase 4: execution_gateway's OWN order-state recovery
+        # (above) must run FIRST -- portfolio-risk recovery's own cross-
+        # reference (below) resolves a RESERVED-but-unresolved
+        # authorization by reading the execution-gateway order state THAT
+        # RECOVERY JUST ESTABLISHED, never a stale pre-recovery state.
+        recover_portfolio_risk_dispatch_gate(
+            context=environment.portfolio_risk_context, execution_session_id=execution_session_id,
+            execution_ledger=environment.event_store.read_events(execution_session_id), recovery_time=event_time,
+        )
         manifest = environment.manifest_store.transition(execution_session_id, target_stage=ExecutionSessionStage.RECOVERY_CHECKED)
 
     if manifest.current_stage is ExecutionSessionStage.RECOVERY_CHECKED:
@@ -203,13 +230,47 @@ def _run_intents_and_events(
             created_sequence=sequence, event_time=event_time,
         )
         _append(environment.event_store, execution_session_id, kind=ExecutionLedgerEntryKind.EXECUTION_INTENT_ACCEPTED, payload=intent.to_json_dict(), event_time=event_time)
+
+        # Milestone 9 Phase 4: NO execution intent may reach the dispatcher
+        # without a valid Portfolio Risk Authorization -- mandatory,
+        # fail-closed, never bypassed. A DENIED/HALTED decision (or any
+        # other portfolio-risk refusal) is durably recorded via the
+        # PRE-EXISTING (previously unused) EXECUTION_INTENT_REJECTED entry
+        # kind before the exception propagates uncaught, exactly mirroring
+        # `authorize_dispatch`'s own kill-switch-refusal precedent
+        # immediately below (also uncaught here -- `run_execution_session`
+        # itself has no try/except around this call, by existing design).
+        try:
+            risk_authorization = authorize_portfolio_risk_dispatch(intent=intent, context=environment.portfolio_risk_context, event_time=event_time)
+        except ExecutionPortfolioRiskAuthorizationError as exc:
+            _append(
+                environment.event_store, execution_session_id, kind=ExecutionLedgerEntryKind.EXECUTION_INTENT_REJECTED,
+                payload={"execution_intent_id": intent.execution_intent_id, "source_paper_order_id": paper_order.order_id, "reason": str(exc)},
+                event_time=event_time,
+            )
+            raise
+        intent = bind_portfolio_risk_authorization(intent, portfolio_risk_authorization_id=risk_authorization.risk_authorization_id)
+        _append(
+            environment.event_store, execution_session_id, kind=ExecutionLedgerEntryKind.PORTFOLIO_RISK_AUTHORIZATION_BOUND,
+            payload={"execution_intent_id": intent.execution_intent_id, "risk_authorization_id": risk_authorization.risk_authorization_id},
+            event_time=event_time,
+        )
+
         command = create_submit_order_command(
             execution_session_id=execution_session_id, execution_intent_id=intent.execution_intent_id, command_sequence=sequence, event_time=event_time,
             instrument_id=intent.instrument_id, side=intent.side, quantity=intent.quantity, order_type=intent.order_type, time_in_force=intent.time_in_force,
             reduce_only=intent.reduce_only, contract_multiplier=intent.contract_multiplier, limit_price=intent.limit_price, stop_price=intent.stop_price,
         )
         authorize_dispatch(kill_switch_state, command)
-        dispatch_command(execution_session_id=execution_session_id, event_store=environment.event_store, adapter=adapter, command=command, event_time=event_time)
+        reserve_portfolio_risk_dispatch(authorization=risk_authorization, intent=intent, context=environment.portfolio_risk_context, event_time=event_time)
+        outcome = dispatch_command(execution_session_id=execution_session_id, event_store=environment.event_store, adapter=adapter, command=command, event_time=event_time)
+        if outcome.resolution is not None and outcome.resolution.entry_kind is ExecutionLedgerEntryKind.COMMAND_DISPATCH_SUCCEEDED:
+            # Every other outcome (COMMAND_REJECTED, COMMAND_MARKED_UNKNOWN,
+            # COMMAND_DISPATCH_REJECTED) leaves the authorization RESERVED,
+            # never consumed and never auto-invalidated -- `recover_
+            # portfolio_risk_dispatch_gate` resolves that ambiguity later,
+            # using both packages' own durable evidence.
+            consume_portfolio_risk_dispatch(authorization=risk_authorization, intent=intent, context=environment.portfolio_risk_context, event_time=event_time)
         sequence += 1
 
     advance = getattr(adapter, "advance_market_event", None)
@@ -249,7 +310,20 @@ def authorize_cancel_or_reduce_only_submit(
     """Exposed for `runner.py` callers (kill-switch escalation logic, the
     CLI's own operator-triggered cancel) that need to dispatch a command
     OUTSIDE the ordinary `run_execution_session` intent-bridging loop --
-    still always through `authorize_dispatch` first, never around it."""
+    still always through `authorize_dispatch` first, never around it.
+
+    DELIBERATELY NOT gated through `portfolio_risk_gate` (Milestone 9
+    Phase 4): every actual call site in this codebase passes only a
+    `CancelOrderCommand`/`ReplaceOrderCommand` -- operating on an ALREADY-
+    authorized, already-dispatched order, never a NEW economic
+    submission. A cancel/replace does not correspond to a new
+    `ExecutionIntent` at all, so "no execution intent may reach the
+    dispatcher without a valid Portfolio Risk Authorization" does not
+    apply here by definition. If a future caller ever passes a genuinely
+    NEW `SubmitOrderCommand` through this function (the type signature
+    technically allows it), that command would bypass the portfolio-risk
+    gate entirely -- a gap worth closing before such a caller is added,
+    not applicable to anything this milestone actually does."""
     ledger = environment.event_store.read_events(execution_session_id)
     kill_switch_state = resolve_execution_kill_switch_state(_kill_switch_events_from_ledger(ledger))
     authorize_dispatch(kill_switch_state, command)

@@ -128,6 +128,7 @@ import argparse
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import TypeVar
 
@@ -196,6 +197,7 @@ from quant_platform.execution_gateway.manifests import ExecutionSessionManifestS
 from quant_platform.execution_gateway.models import ExecutionLedgerEntryKind, ExecutionSessionStage
 from quant_platform.execution_gateway.paper_bridge import PaperBridgeEnvironment
 from quant_platform.execution_gateway.persistence import ExecutionLedgerEntry, ExecutionSessionEventStore
+from quant_platform.execution_gateway.portfolio_risk_gate import PortfolioRiskGatewayContext
 from quant_platform.execution_gateway.reconciliation import reconcile_execution_session
 from quant_platform.execution_gateway.reports import generate_execution_session_report
 from quant_platform.execution_gateway.runner import (
@@ -300,6 +302,10 @@ from quant_platform.paper_trading.runner import (
 )
 from quant_platform.paper_trading.specs import PaperTradingSpec, compute_paper_session_spec_id
 from quant_platform.paper_trading.verification import verify_paper_session
+from quant_platform.portfolio_risk.ledger import PortfolioRiskLedgerStore
+from quant_platform.portfolio_risk.models import PORTFOLIO_RISK_SPEC_SCHEMA_VERSION
+from quant_platform.portfolio_risk.snapshots import create_portfolio_snapshot, create_price_snapshot
+from quant_platform.portfolio_risk.specs import PortfolioRiskPolicy, PortfolioRiskSpec
 from quant_platform.robustness.manifests import RobustnessManifest, RobustnessManifestStore
 from quant_platform.robustness.models import RobustnessStage
 from quant_platform.robustness.multiple_testing import StrategyFamily
@@ -2251,10 +2257,48 @@ def _execution_gateway_paper_bridge_environment(config: ExecutionGatewayConfigSc
     )
 
 
+def _execution_gateway_default_portfolio_risk_context(config: ExecutionGatewayConfigSchema, *, storage_root: str | None = None) -> PortfolioRiskGatewayContext:
+    """Milestone 9 Phase 4: the CLI wires a MINIMAL, always-present
+    portfolio-risk context automatically -- deliberately NO new CLI flags
+    or `ExecutionGatewayConfigSchema` fields (out of this phase's own
+    scope: "no CLI expansion"). Every limit on the resulting
+    `PortfolioRiskPolicy` is `None` ("not configured", Phase 1's own
+    pre-existing convention -- NOT a bypass flag; no field anywhere in
+    this package exists whose purpose is "skip risk evaluation"). The
+    gate itself still runs for REAL, through the genuine `evaluate_risk`
+    pipeline, on every dispatch through this CLI -- it will simply always
+    approve until an operator-supplied policy exists. Documented as a
+    known, honest limitation in `docs/milestone9_phase4_delivery_report.md`,
+    not silently glossed over."""
+    event_time = utc_now().to_pydatetime()
+    paper_orders = _load_paper_orders_for_session(config, config.paper_session_id)
+    instrument_id = paper_orders[0].instrument if paper_orders else "unconfigured_instrument"
+    equity = Decimal("1000000")
+    portfolio_snapshot = create_portfolio_snapshot(
+        portfolio_id=config.paper_session_id, event_time=event_time, cash=equity, equity=equity, realized_pnl=Decimal(0), unrealized_pnl=Decimal(0),
+        peak_equity=equity, daily_start_equity=equity, positions=(), source_execution_session_id=None,
+    )
+    price_snapshot = create_price_snapshot(
+        instrument_id=instrument_id, bid=Decimal(1), ask=Decimal(1), reference_price=Decimal(1), event_time=event_time, source_event_id=None,
+    )
+    policy = PortfolioRiskPolicy(
+        max_order_notional=None, max_position_notional=None, max_instrument_gross_exposure=None, max_strategy_gross_exposure=None,
+        max_portfolio_gross_exposure=None, max_portfolio_net_exposure=None, max_concentration_fraction=None, max_leverage=None,
+        max_daily_realized_loss=None, max_total_loss=None, max_drawdown_fraction=None, max_consecutive_losses=None, minimum_cash_buffer=None,
+        maximum_price_age=None, maximum_portfolio_snapshot_age=None, allow_reduce_only_during_halt=True,
+    )
+    return PortfolioRiskGatewayContext(
+        store=PortfolioRiskLedgerStore(storage_root if storage_root is not None else config.ml_artifacts_root), portfolio_id=config.paper_session_id,
+        portfolio_snapshot=portfolio_snapshot, price_snapshot=price_snapshot,
+        risk_spec=PortfolioRiskSpec(schema_version=PORTFOLIO_RISK_SPEC_SCHEMA_VERSION, policy=policy), portfolio_halted=False, consecutive_losses=0,
+    )
+
+
 def _execution_gateway_runner_environment(config: ExecutionGatewayConfigSchema) -> ExecutionGatewayRunnerEnvironment:
     return ExecutionGatewayRunnerEnvironment(
         manifest_store=_execution_gateway_manifest_store(config), event_store=_execution_gateway_event_store(config),
         paper_bridge_environment=_execution_gateway_paper_bridge_environment(config),
+        portfolio_risk_context=_execution_gateway_default_portfolio_risk_context(config),
     )
 
 
@@ -2533,7 +2577,8 @@ def cmd_replay_execution_session(args: argparse.Namespace) -> int:
     paper_orders = _load_paper_orders_for_session(config, spec.paper_session_id)
     market_events = load_replay_events(Path(args.replay_source))
     result = replay_execution_session(
-        spec, storage_root=Path(args.replay_storage_root), paper_bridge_environment=_execution_gateway_paper_bridge_environment(config), paper_orders=paper_orders,
+        spec, storage_root=Path(args.replay_storage_root), paper_bridge_environment=_execution_gateway_paper_bridge_environment(config),
+        portfolio_risk_context=_execution_gateway_default_portfolio_risk_context(config, storage_root=args.replay_storage_root), paper_orders=paper_orders,
         market_events=market_events, adapter_id=args.adapter_id, event_time=utc_now().to_pydatetime(),
     )
     print(f"execution_session_id: {result.execution_session_id}")
