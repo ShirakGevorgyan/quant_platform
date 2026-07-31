@@ -1207,3 +1207,109 @@ class PortfolioRiskLockError(PortfolioRiskError):
     mirrors `execution_gateway`'s own `ExecutionSessionLockError`
     exactly, reusing the same underlying `ml.concurrency.experiment_lock`
     infrastructure."""
+
+
+# --------------------------------------------------------------------------
+# Deterministic market data platform and feature store (Milestone 10)
+# --------------------------------------------------------------------------
+class MarketDataError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.market_data`. This
+    package is the single authoritative source for market, macro,
+    calendar, and derived feature data consumed by research, ML,
+    backtesting, portfolio risk, execution, and replay -- it never opens
+    a network connection, never imports a broker SDK, and never claims
+    live-feed connectivity. Every event and feature it produces is
+    immutable and content-addressed; the same input data always produces
+    identical output, or this package raises rather than silently
+    diverging."""
+
+
+class MarketDataEventError(MarketDataError):
+    """Raised when a `Tick`/`Quote`/`Trade`/`Candle` is structurally
+    invalid: a non-finite/non-positive price, a negative volume, `ask <
+    bid`, an OHLC relationship violation, a naive (non-timezone-aware)
+    timestamp, `arrival_time` before `event_time`, or a `timeframe` that
+    is present where not applicable (tick/quote/trade) or absent where
+    required (candle)."""
+
+
+class MarketDataOrderError(MarketDataError):
+    """Raised when a sequence of market data events violates strict
+    ordering: a non-monotonic `event_time`/`sequence`, a future
+    timestamp relative to a caller-supplied reference time, or an
+    unresolved duplicate id -- the market-data analogue of
+    `MarketEventOrderError`."""
+
+
+class MarketDataIdentityError(MarketDataError):
+    """Raised when an `event_id`/`feature_id` cannot be computed, or a
+    provided object does not reproduce the identity it is being verified
+    against -- a forged or tampered record."""
+
+
+class MarketDataPersistenceError(MarketDataError):
+    """Raised for durable market-data/feature store failures: corruption,
+    a sequence gap, a conflicting append at an already-occupied
+    coordinate, or a malformed stored record."""
+
+
+class MarketDataLockError(MarketDataError):
+    """Raised when a second writer attempts to append to the same event
+    or feature store partition concurrently -- mirrors
+    `PortfolioRiskLockError` exactly, reusing the same underlying
+    `ml.concurrency.experiment_lock` infrastructure."""
+
+
+class MarketCalendarError(MarketDataError):
+    """Raised when a market calendar specification or session-expectation
+    query is structurally invalid or cannot be evaluated safely."""
+
+
+class MacroDataError(MarketDataError):
+    """Raised when a macro/economic-calendar event is structurally
+    invalid, or is used before its own release (`event_time`) in a
+    context that requires point-in-time safety."""
+
+
+class MarketDataQualityError(MarketDataError):
+    """Raised by a caller that asks a quality report containing a
+    CRITICAL issue to fail closed rather than merely be reported --
+    never raised by report generation itself, which always returns a
+    complete report regardless of how many issues it found."""
+
+
+class FeatureStoreError(MarketDataError):
+    """Raised when a `FeatureRecord` is structurally invalid, or an
+    append would silently overwrite an already-stored value at the same
+    (feature_name, feature_version, instrument, timeframe, timestamp)
+    coordinate with a DIFFERENT value -- feature history is append-only
+    and never mutated; an identical re-append is idempotently absorbed
+    instead of raising."""
+
+
+class FeatureIdentityError(MarketDataError):
+    """Raised when a `feature_id` cannot be computed, or a provided
+    `FeatureRecord` does not reproduce the identity it is being verified
+    against."""
+
+
+class FeatureGenerationError(MarketDataError):
+    """Raised when a deterministic feature computation cannot proceed
+    safely: mismatched input lengths, a non-positive window, or a result
+    that would be non-finite -- never raised merely because a window's
+    warm-up period has insufficient history (that case yields `None` for
+    the affected points, which callers skip rather than store)."""
+
+
+class MarketDataReplayError(MarketDataError):
+    """Raised when replaying raw events into a fresh feature store fails
+    to reproduce identical feature ids, ordering, values, or semantic
+    digest -- the market-data analogue of
+    `PortfolioRiskVerificationError`'s replay-divergence role."""
+
+
+class MarketDataVerificationError(MarketDataError):
+    """Raised by `market_data.verification` (or a caller consuming its
+    report) when a FATAL cross-consistency check fails and the caller
+    has asked for that to raise rather than merely be reported as an
+    issue."""
