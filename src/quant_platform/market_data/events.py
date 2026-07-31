@@ -377,6 +377,12 @@ class MarketEventStore:
     def _events_path(self, provider: str, instrument_id: str) -> Path:
         return self._partition_dir(provider, instrument_id) / "events.jsonl"
 
+    def events_path(self, provider: str, instrument_id: str) -> Path:
+        """Public accessor for `recovery.py`'s tolerant-read path -- the
+        only legitimate reason outside this class to know the physical
+        file location; ordinary reads always go through `read_events`."""
+        return self._events_path(provider, instrument_id)
+
     def _lock_path(self, provider: str, instrument_id: str) -> Path:
         return self._partition_dir(provider, instrument_id) / ".events.lock"
 

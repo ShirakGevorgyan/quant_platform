@@ -1313,3 +1313,96 @@ class MarketDataVerificationError(MarketDataError):
     report) when a FATAL cross-consistency check fails and the caller
     has asked for that to raise rather than merely be reported as an
     issue."""
+
+
+# --------------------------------------------------------------------------
+# Durable repository, dataset versioning, incremental ingestion,
+# partitioning, and reconciliation (Milestone 10, Phase 2)
+# --------------------------------------------------------------------------
+class MarketDataPathSecurityError(MarketDataError):
+    """Raised when a dataset/partition/checkpoint key would resolve to a
+    filesystem path outside the intended storage root (path traversal),
+    or otherwise contains characters unsafe to use as a path component --
+    the market-data analogue of `PathSecurityError`."""
+
+
+class DatasetManifestError(MarketDataError):
+    """Raised when a `DatasetManifest` is structurally invalid, or an
+    operation would advance one to a state inconsistent with its own
+    durable evidence (a partition it references is missing/unverified, a
+    digest mismatch, an incoherent event/row count or time range)."""
+
+
+class DatasetIdentityError(MarketDataError):
+    """Raised when a `dataset_id` cannot be computed, or a provided
+    manifest does not reproduce the identity it is being verified
+    against -- a forged or tampered manifest."""
+
+
+class PartitionError(MarketDataError):
+    """Raised when a `Partition` is structurally invalid, its recorded
+    content digest does not match its own member list, or a requested
+    partitioning operation cannot proceed safely (an out-of-range
+    boundary, an empty partition, a member assigned to the wrong
+    partition key)."""
+
+
+class IngestionError(MarketDataError):
+    """Base class for ingestion-batch failures: a structurally invalid
+    batch, a sequence/partition-membership inconsistency, or a batch that
+    cannot be safely committed."""
+
+
+class IngestionConflictError(IngestionError):
+    """Raised when an ingestion batch is submitted under a `batch_id`
+    that already has a durably recorded result for DIFFERENT content
+    (a different ordered event-id list or ingestion_time) -- an exact
+    repeat of the SAME content under the SAME `batch_id` is idempotently
+    absorbed instead and never raises this."""
+
+
+class CheckpointError(MarketDataError):
+    """Raised when a checkpoint is structurally invalid, or a provided
+    checkpoint does not reproduce the identity it is being verified
+    against -- a forged or tampered checkpoint."""
+
+
+class StaleCheckpointError(CheckpointError):
+    """Raised when a checkpoint's own recorded coordinate/digest does not
+    match the durable data it claims to describe (behind OR ahead of the
+    actual store) -- a checkpoint is never trusted without this
+    independent re-validation."""
+
+
+class MarketDataRecoveryError(MarketDataError):
+    """Raised when deterministic repository recovery cannot safely
+    reconstruct dataset/partition/manifest/checkpoint state from durable
+    evidence alone -- surfaced rather than guessed. Never used to justify
+    fabricating data that was never actually durably committed."""
+
+
+class MarketDataReconciliationError(MarketDataError):
+    """Raised when repository reconciliation cannot complete
+    structurally (e.g. a referenced store cannot be read at all), as
+    opposed to an ordinary structured reconciliation issue (missing
+    partition, wrong digest, ...), which is a normal, expected,
+    non-raising finding."""
+
+
+class RepositoryCorruptionError(MarketDataError):
+    """Raised for structural repository corruption a reconciliation
+    ISSUE would understate: an unrecoverable trailing record that is not
+    a clean truncation, a manifest whose own digest does not match its
+    identity payload, or evidence that has been tampered with rather than
+    merely incomplete. Distinct from `MarketDataPersistenceError`
+    (Phase 1's I/O-level corruption signal, still raised for a single
+    corrupted store file) -- this is the repository-level escalation for
+    corruption that recovery/reconciliation determined it must not
+    silently quarantine past."""
+
+
+class ExportError(MarketDataError):
+    """Raised when a deterministic export cannot be produced safely: a
+    non-finite/non-Decimal value slipping into an exported field, an
+    inconsistent column set across rows, or a requested export format
+    this package does not support."""

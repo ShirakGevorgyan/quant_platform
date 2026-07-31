@@ -36,6 +36,7 @@ otherwise need a new field for."""
 from __future__ import annotations
 
 import itertools
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
@@ -48,24 +49,45 @@ from quant_platform.market_data.candles import (
     candle_range,
     candle_upper_wick,
 )
+from quant_platform.market_data.checkpoints import (
+    CheckpointStore,
+    FeatureGenerationCheckpoint,
+    create_feature_generation_checkpoint,
+)
 from quant_platform.market_data.feature_store import FeatureRecord, FeatureStore, create_feature_record
+from quant_platform.market_data.identity import compute_content_id
+from quant_platform.market_data.ingestion import rebuild_touched_partitions
+from quant_platform.market_data.manifests import (
+    DatasetKey,
+    DatasetKind,
+    DatasetManifest,
+    PartitioningSpec,
+    create_dataset_manifest,
+)
+from quant_platform.market_data.partitions import partition_key_for
+from quant_platform.market_data.repository import MarketDataRepository
 
 __all__ = [
     "DEFAULT_WINDOWS",
     "WINDOWED_FEATURE_BASE_NAMES",
     "WINDOWLESS_FEATURE_NAMES",
+    "FeatureIncrementalResult",
     "atr",
     "body_size_series",
+    "carry_window_size_for",
     "ema",
     "generate_candle_features",
+    "generate_feature_dataset_incremental",
     "high_low_range_series",
     "log_returns",
     "price_delta",
+    "rebuild_feature_dataset_manifest",
     "returns",
     "rolling_mean",
     "rolling_std",
     "rsi",
     "sma",
+    "stored_feature_name",
     "volume_delta",
     "vwap",
     "wick_ratios",
@@ -260,8 +282,21 @@ def rsi(closes: list[Decimal], window: int) -> list[Decimal | None]:
 # --------------------------------------------------------------------------
 def generate_candle_features(
     candles: list[Candle], *, feature_version: int, store: FeatureStore, feature_names: tuple[str, ...] | None = None,
-    windows: dict[str, int] | None = None,
+    windows: dict[str, int] | None = None, only_persist_timestamps: frozenset[datetime] | None = None,
 ) -> list[FeatureRecord]:
+    """`only_persist_timestamps`, when given, restricts which computed
+    points are actually written to `store` -- every point is still
+    COMPUTED over the full `candles` series (needed for correct rolling
+    context), but only those whose timestamp is in the set are persisted.
+    Milestone 10 Phase 2's `generate_feature_dataset_incremental` uses
+    this to recompute a bounded LEADING "carry" window purely for
+    context, without re-attempting to persist those carry positions --
+    `atr`/`rsi` both use an artificial "insufficient prior data" fallback
+    at index 0 of WHATEVER series they are given (correct when that
+    series is genuine full history, wrong when it is a truncated carry
+    window), so re-persisting a recomputed carry-window value would
+    otherwise spuriously conflict with the CORRECT value already stored
+    for that same timestamp from the original, non-truncated computation."""
     if not candles:
         return []
     instrument_ids = {c.instrument_id for c in candles}
@@ -331,9 +366,219 @@ def generate_candle_features(
         for timestamp, value in zip(timestamps, series, strict=True):
             if value is None:
                 continue
+            if only_persist_timestamps is not None and timestamp not in only_persist_timestamps:
+                continue
             record = create_feature_record(
                 feature_name=stored_name, feature_version=feature_version, instrument_id=instrument_id, timestamp=timestamp,
                 timeframe=timeframe, value=value, metadata={},
             )
             records.append(store.append(record))
     return records
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 2: incremental generation over a durable repository.
+#
+# One `DatasetKey` (`DatasetKind.DERIVED_FEATURES`) is exactly one STORED
+# feature name (e.g. `"sma_20"`, matching Phase 1's own `FeatureStore`
+# partitioning by `(feature_name, feature_version, instrument_id)`) -- a
+# caller wanting several named features incrementally calls
+# `generate_feature_dataset_incremental` once per feature, each with its
+# own manifest/partition/checkpoint lineage. This mirrors the milestone's
+# own "changed feature spec/version creates a new feature dataset
+# lineage" requirement exactly: two different indicators (or the same
+# indicator at two different windows) are two different lineages, never
+# one dataset with a hidden extra dimension.
+# --------------------------------------------------------------------------
+_UNBOUNDED_CARRY_FEATURES = frozenset({"vwap", "ema"})
+"""`vwap` (as implemented in Phase 1 -- cumulative since the start of the
+series, see module docstring) has no bounded trailing-window context that
+suffices to continue it correctly; a bounded carry window would silently
+compute a WRONG cumulative average from the wrong starting point.
+
+`ema` is unbounded for a DIFFERENT, equally fundamental reason, found
+during this phase's own adversarial testing (a parametrized "incremental
+equals full recomputation" test caught it -- see the delivery report's
+"Defects found and fixed" section): EMA is RECURSIVE, seeded by a plain
+SMA of the first `window` values of WHATEVER series it is given, then
+each subsequent value depends on the PREVIOUS one. A bounded carry window
+re-seeds EMA from a DIFFERENT starting point than the original full
+computation used -- and because the recursion never "forgets" its seed,
+every value computed from a re-seeded carry window is silently WRONG,
+not merely at one boundary point but for the entire carry-forward chain.
+Unlike `atr`/`rsi` (whose own boundary approximation is confined to
+their first `window` positions and therefore never corrupts a genuinely
+NEW point once `only_persist_timestamps` stops re-persisting the carry
+region -- see `generate_candle_features`'s own docstring), EMA has no
+such confinement: there is no bounded carry window that is ever
+sufficient. Phase 2 keeps both `vwap` and `ema` correct by always
+re-reading the FULL raw history for them -- a documented, deliberate
+PERFORMANCE (never correctness) limitation."""
+
+_PAIRWISE_CARRY_FEATURES = frozenset({"return", "log_return", "price_delta", "volume_delta"})
+
+
+def stored_feature_name(base_name: str, *, window: int | None = None) -> str:
+    if base_name in WINDOWED_FEATURE_BASE_NAMES:
+        resolved_window = DEFAULT_WINDOWS[base_name] if window is None else window
+        return f"{base_name}_{resolved_window}"
+    if window is not None:
+        raise FeatureGenerationError(f"{base_name!r} is not a windowed feature; window must be None")
+    return base_name
+
+
+def carry_window_size_for(base_name: str, *, window: int | None = None) -> int | None:
+    """The number of trailing raw candles, immediately BEFORE the first
+    genuinely new one, that must be re-read to give `base_name` correct
+    rolling context. `None` means "the entire history" (`vwap` only)."""
+    if base_name in _UNBOUNDED_CARRY_FEATURES:
+        return None
+    if base_name in WINDOWED_FEATURE_BASE_NAMES:
+        return DEFAULT_WINDOWS[base_name] if window is None else window
+    if base_name in _PAIRWISE_CARRY_FEATURES:
+        return 1
+    return 0  # high_low_range / body_size / upper_wick_ratio / lower_wick_ratio: pointwise, no context needed
+
+
+def _semantic_digest_for_features(records: list[FeatureRecord]) -> str:
+    ordered = sorted(records, key=lambda r: (r.timestamp, r.feature_id))
+    canonical = [{k: v for k, v in r.to_json_dict().items() if k != "feature_id"} for r in ordered]
+    return compute_content_id("feature_dataset_semantic_digest", {"records": canonical})
+
+
+def rebuild_feature_dataset_manifest(
+    *, repository: MarketDataRepository, dataset_key: DatasetKey, partitioning: PartitioningSpec, raw_source_dataset_id: str,
+    creation_time: datetime,
+) -> DatasetManifest:
+    """The `DERIVED_FEATURES` analogue of `ingestion.
+    rebuild_dataset_manifest_from_events` -- recomputes FRESH from
+    `repository.feature_store`'s and `repository.partition_store`'s
+    current durable state, never from a diff."""
+    if dataset_key.dataset_kind is not DatasetKind.DERIVED_FEATURES:
+        raise FeatureGenerationError("rebuild_feature_dataset_manifest requires a DERIVED_FEATURES dataset_key")
+    assert dataset_key.feature_name is not None and dataset_key.feature_version is not None
+    all_records = repository.feature_store.read_records(dataset_key.feature_name, dataset_key.feature_version, dataset_key.instrument_id)
+    if not all_records:
+        manifest = create_dataset_manifest(
+            dataset_key=dataset_key, schema_version=1, timeframe=None, partitioning=partitioning, first_event_time=None,
+            last_event_time=None, event_count=0, ordered_partition_ids=(), raw_source_dataset_id=raw_source_dataset_id,
+            semantic_digest=compute_content_id("feature_dataset_semantic_digest", {"records": []}),
+            physical_digest=compute_content_id("dataset_physical_digest", {"member_ids": []}), creation_time=creation_time,
+        )
+        return repository.manifest_store.append(dataset_key, manifest)
+
+    first_event_time = min(r.timestamp for r in all_records)
+    last_event_time = max(r.timestamp for r in all_records)
+    timeframe = all_records[0].timeframe
+    partition_keys = repository.partition_store.list_partition_keys(dataset_key)
+    ordered_partitions = []
+    for partition_key in partition_keys:
+        partition = repository.partition_store.read(dataset_key, partition_key)
+        if partition is None:
+            raise FeatureGenerationError(f"listed partition_key {partition_key!r} has no readable partition file")
+        ordered_partitions.append(partition)
+    ordered_partition_ids = tuple(p.partition_id for p in ordered_partitions)
+    semantic_digest = _semantic_digest_for_features(all_records)
+    physical_digest = compute_content_id("dataset_physical_digest", {"member_ids": sorted(r.feature_id for r in all_records)})
+    manifest = create_dataset_manifest(
+        dataset_key=dataset_key, schema_version=1, timeframe=timeframe, partitioning=partitioning, first_event_time=first_event_time,
+        last_event_time=last_event_time, event_count=len(all_records), ordered_partition_ids=ordered_partition_ids,
+        raw_source_dataset_id=raw_source_dataset_id, semantic_digest=semantic_digest, physical_digest=physical_digest,
+        creation_time=creation_time,
+    )
+    return repository.manifest_store.append(dataset_key, manifest)
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureIncrementalResult:
+    feature_dataset_key: DatasetKey
+    resulting_feature_dataset_id: str | None
+    new_record_count: int
+    rebuilt_partition_keys: tuple[str, ...]
+    was_no_op: bool
+
+
+def generate_feature_dataset_incremental(
+    *, repository: MarketDataRepository, raw_dataset_key: DatasetKey, feature_base_name: str, feature_version: int,
+    partitioning: PartitioningSpec, checkpoint_time: datetime, window: int | None = None,
+) -> FeatureIncrementalResult:
+    """Incrementally (re)generates ONE named feature series for
+    `raw_dataset_key`'s instrument, from whatever new raw candles have
+    been committed since the last checkpoint. A no-op (returns
+    `was_no_op=True`, touches nothing) if the raw dataset's current
+    manifest version is UNCHANGED since the last checkpoint -- there is
+    nothing new to process. Correctness invariant: the result is always
+    IDENTICAL to calling `generate_candle_features` fresh over the raw
+    dataset's ENTIRE history and restricting to this one feature -- see
+    `tests/unit/market_data/test_market_data_incremental_features.py`'s
+    `TestIncrementalEqualsFullRecomputation`."""
+    if raw_dataset_key.dataset_kind is not DatasetKind.RAW_MARKET_EVENTS:
+        raise FeatureGenerationError("generate_feature_dataset_incremental requires a RAW_MARKET_EVENTS raw_dataset_key")
+    stored_name = stored_feature_name(feature_base_name, window=window)
+    feature_dataset_key = DatasetKey(
+        dataset_kind=DatasetKind.DERIVED_FEATURES, instrument_id=raw_dataset_key.instrument_id, feature_name=stored_name, feature_version=feature_version,
+    )
+    raw_manifest = repository.manifest_store.read_current(raw_dataset_key)
+    if raw_manifest is None or raw_manifest.event_count == 0:
+        return FeatureIncrementalResult(feature_dataset_key=feature_dataset_key, resulting_feature_dataset_id=None, new_record_count=0, rebuilt_partition_keys=(), was_no_op=True)
+
+    checkpoint_store = CheckpointStore(repository.root)
+    checkpoint = checkpoint_store.read_current(feature_dataset_key)
+    previous_feature_checkpoint = checkpoint if isinstance(checkpoint, FeatureGenerationCheckpoint) else None
+    if previous_feature_checkpoint is not None and previous_feature_checkpoint.raw_dataset_id == raw_manifest.dataset_id:
+        return FeatureIncrementalResult(
+            feature_dataset_key=feature_dataset_key, resulting_feature_dataset_id=previous_feature_checkpoint.resulting_feature_dataset_id,
+            new_record_count=0, rebuilt_partition_keys=(), was_no_op=True,
+        )
+
+    assert raw_dataset_key.provider is not None
+    all_candles = sorted(
+        (e for e in repository.event_store.read_events(raw_dataset_key.provider, raw_dataset_key.instrument_id) if isinstance(e, Candle)),
+        key=lambda c: c.event_time,
+    )
+    carry_window_size = carry_window_size_for(feature_base_name, window=window)
+    cutoff = previous_feature_checkpoint.last_processed_raw_event_time if previous_feature_checkpoint is not None else None
+    if cutoff is None:
+        working_set = all_candles
+        new_candles = all_candles
+    elif carry_window_size is None:
+        working_set = all_candles
+        new_candles = [c for c in all_candles if c.event_time > cutoff]
+    else:
+        new_candles = [c for c in all_candles if c.event_time > cutoff]
+        cutoff_index = len(all_candles) - len(new_candles)
+        context_start = max(0, cutoff_index - carry_window_size)
+        working_set = all_candles[context_start:]
+
+    if not new_candles:
+        return FeatureIncrementalResult(feature_dataset_key=feature_dataset_key, resulting_feature_dataset_id=None, new_record_count=0, rebuilt_partition_keys=(), was_no_op=True)
+
+    resolved_windows = {feature_base_name: window} if (feature_base_name in WINDOWED_FEATURE_BASE_NAMES and window is not None) else None
+    only_persist = frozenset(c.event_time for c in new_candles)
+    new_records = generate_candle_features(
+        working_set, feature_version=feature_version, store=repository.feature_store, feature_names=(feature_base_name,), windows=resolved_windows,
+        only_persist_timestamps=only_persist,
+    )
+
+    touched_partition_keys = {partition_key_for(c.event_time, partitioning) for c in new_candles}
+    all_feature_records = repository.feature_store.read_records(stored_name, feature_version, raw_dataset_key.instrument_id)
+    all_members = [(r.feature_id, r.timestamp) for r in all_feature_records]
+    rebuild_touched_partitions(
+        repository=repository, dataset_key=feature_dataset_key, partitioning=partitioning, all_members=all_members, touched_partition_keys=touched_partition_keys,
+    )
+    manifest = rebuild_feature_dataset_manifest(
+        repository=repository, dataset_key=feature_dataset_key, partitioning=partitioning, raw_source_dataset_id=raw_manifest.dataset_id,
+        creation_time=checkpoint_time,
+    )
+
+    new_checkpoint = create_feature_generation_checkpoint(
+        raw_dataset_key=raw_dataset_key, raw_dataset_id=raw_manifest.dataset_id, feature_dataset_key=feature_dataset_key,
+        last_processed_raw_event_time=all_candles[-1].event_time, carry_window_size=carry_window_size,
+        resulting_feature_dataset_id=manifest.dataset_id, semantic_digest=manifest.semantic_digest, checkpoint_time=checkpoint_time,
+    )
+    checkpoint_store.append(feature_dataset_key, new_checkpoint)
+
+    return FeatureIncrementalResult(
+        feature_dataset_key=feature_dataset_key, resulting_feature_dataset_id=manifest.dataset_id, new_record_count=len(new_records),
+        rebuilt_partition_keys=tuple(sorted(touched_partition_keys)), was_no_op=False,
+    )

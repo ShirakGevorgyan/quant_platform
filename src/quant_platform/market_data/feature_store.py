@@ -150,6 +150,11 @@ class FeatureStore:
     def _records_path(self, feature_name: str, feature_version: int, instrument_id: str) -> Path:
         return self._partition_dir(feature_name, feature_version, instrument_id) / "records.jsonl"
 
+    def records_path(self, feature_name: str, feature_version: int, instrument_id: str) -> Path:
+        """Public accessor for `recovery.py`'s tolerant-read path -- see
+        `MarketEventStore.events_path`'s identical rationale."""
+        return self._records_path(feature_name, feature_version, instrument_id)
+
     def _lock_path(self, feature_name: str, feature_version: int, instrument_id: str) -> Path:
         return self._partition_dir(feature_name, feature_version, instrument_id) / ".records.lock"
 

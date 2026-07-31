@@ -1,6 +1,6 @@
 # Deterministic Market Data Platform and Feature Store (Milestone 10) -- Architecture
 
-## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) delivered
+## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) delivered
 
 ## Primary goal
 
@@ -337,37 +337,328 @@ different, more specific exception types -- e.g. `feature_store.py`'s
 hardcode any one of them); each module's own `__post_init__`/business
 logic raises its own specific subclass for domain-level violations.
 
-## Known limitations (Phase 1, honestly disclosed)
+## Durable repository, dataset versioning, and incremental ingestion (Phase 2)
 
+Phase 2 adds a REPOSITORY layer on top of Phase 1's already-durable
+`MarketEventStore`/`FeatureStore` (both were already real, file-backed,
+append-only, lock-protected stores -- Phase 2 does not make them durable
+for the first time; it adds dataset MANIFESTS, PARTITIONS, INCREMENTAL
+ingestion/generation, CHECKPOINTS, RECOVERY, RECONCILIATION, COMPACTION,
+and EXPORT on top of them).
+
+### Two identity concepts: `DatasetKey` vs `dataset_id`
+
+Exactly analogous to a git branch vs. a commit:
+
+- **`DatasetKey`** (`manifests.py`) is the STABLE routing/lineage
+  identity of "which dataset" -- e.g. "raw XAUUSD from mt5", or "sma_20
+  v1 for XAUUSD". It never changes as more data is committed. It is a
+  small, caller-declared composite, not content-addressed: `(dataset_kind,
+  instrument_id, provider)` for `RAW_MARKET_EVENTS`; `(dataset_kind,
+  instrument_id, feature_name, feature_version)` for `DERIVED_FEATURES`
+  (mutually exclusive field requirements enforced in
+  `DatasetKey.__post_init__`).
+- **`dataset_id`** (on `DatasetManifest`) is a per-VERSION,
+  content-addressed identity that changes every time new data is
+  committed. `DatasetManifest.to_identity_payload()` excludes
+  `dataset_id` itself, `physical_digest` (a physical-layout signal --
+  see Compaction below), `creation_time` (a caller-supplied operational
+  label, exactly like `portfolio_risk.ledger.RiskLedgerEntry.
+  recorded_time`), and `completion_status` (always `"complete"` -- a
+  manifest object is only ever constructed once a commit is fully
+  complete, see Atomicity below). `DatasetManifestStore` retains the
+  FULL version history per `DatasetKey` (append-only, never overwritten)
+  -- "dataset version identities" means every commit, not only the
+  latest.
+
+### Partitioning
+
+`partitions.py` supports DAILY and MONTHLY calendar-based granularities
+only -- the "minimum useful set" the specification explicitly permits
+choosing; fixed-event-count partitioning is a documented, out-of-scope
+extension (every required correctness property -- boundary-timestamp
+handling, deterministic membership, checkpoint carry windows -- is fully
+exercised by time-based partitioning alone). A `Partition` binds
+`dataset_key` + `partition_key` (e.g. `"2026-01-05"`) + an ORDERED
+member-id list + `schema_version` + a content digest. Member ordering
+within a partition is `(member_time, member_id)` -- NEVER raw
+arrival/ingestion order -- so partition (and therefore dataset) identity
+depends only on economic content and event-time ordering, never on which
+order a caller happened to submit ingestion batches in.
+`PartitionStore` keeps only the CURRENT version of each partition file
+(atomically replaced via `core.json.write_json_atomic`'s temp-then-rename)
+-- a partition is a derived index over already-durable primary facts
+(raw events or feature records), always fully reconstructible from them,
+unlike the primary event/feature records themselves, which are
+append-only and never overwritten.
+
+### Incremental ingestion (`ingestion.py`)
+
+Three orderings, never assumed identical (per the specification's own
+explicit requirement):
+
+1. **Provider/source sequence** -- whatever a raw provider itself
+   claims; carried, if present, in `source_event_id`; never interpreted.
+2. **Repository append sequence** -- `MarketDataEvent.sequence`,
+   assigned by the CALLER (via `ingestion.next_sequence_for`) before
+   construction, since `sequence` participates in an event's own content
+   identity. Events are appended in EXACTLY the order the caller submits
+   them -- arrival order, not event-time order.
+3. **Event-time ordering** -- partition membership (and therefore
+   dataset identity) is always ordered by this.
+
+**Late-arriving historical events -- the chosen, explicit model**: a
+late event is appended to the arrival-ordered raw store like any other
+event, and the ONE partition its `event_time` belongs to is REBUILT from
+its current complete membership, producing a new `partition_id` and
+therefore a NEW manifest VERSION. The event is never rejected, and no
+existing manifest version is ever mutated. This is "append to an
+arrival-ordered raw store while changing canonical event-time views" --
+chosen because it neither loses information (rejection) nor requires an
+expensive full-dataset rebuild for one late event (a brand-new version
+covering the whole history).
+
+**Batch idempotency**: `IngestionBatchStore` is an append-only ledger
+(`{batch_id, content_digest, status}`) per `DatasetKey`. A `batch_id`,
+once used, is permanently bound to one content digest -- an exact retry
+(same `batch_id`, same digest) is idempotently absorbed; a conflicting
+retry (same `batch_id`, different digest) fails closed with
+`IngestionConflictError`. This is what `MarketEventStore.append`'s own
+per-event idempotency does NOT give for free: the underlying store has
+no concept of "batch," only individual events.
+
+### Checkpoints (`checkpoints.py`)
+
+A checkpoint is NEVER the primary source of truth -- always
+independently re-derivable and re-verified from the underlying manifest/
+store state (`verify_raw_ingestion_checkpoint`/
+`verify_feature_generation_checkpoint` recompute a fresh checkpoint and
+compare field-by-field; a stale checkpoint, behind OR ahead of durable
+data, raises `StaleCheckpointError`; a hand-edited one raises
+`CheckpointError`).
+
+**Carry state, by design choice**: `FeatureGenerationCheckpoint` stores a
+`carry_window_size: int | None` (how many trailing raw candles
+incremental generation must re-read before the new batch), NOT cached
+partial sums/EMA state. The raw event store is itself durable and
+replayable; re-deriving needed context from it via a bounded backward
+read is strictly safer than trusting a cached accumulator that could
+silently drift with no way to detect it.
+
+### Incremental feature generation -- the core correctness property
+
+`feature_generation.generate_feature_dataset_incremental` must always
+produce output IDENTICAL to a full fresh recomputation over the entire
+raw history, restricted to one feature. One `DatasetKey`
+(`DERIVED_FEATURES`) is exactly one STORED feature name (e.g.
+`"sma_20"`), matching `FeatureStore`'s own Phase 1 partitioning -- a
+caller wanting several named features calls this function once per
+feature, each with its own manifest/partition/checkpoint lineage.
+
+**Carry window per feature** (`carry_window_size_for`):
+- Windowed indicators (`rolling_mean`/`rolling_std`/`atr`/`rsi`/`sma`):
+  carry = `window` trailing candles.
+- Pairwise indicators (`return`/`log_return`/`price_delta`/
+  `volume_delta`): carry = 1.
+- Pointwise indicators (`high_low_range`/`body_size`/wick ratios):
+  carry = 0 (no context needed).
+- `vwap` AND `ema`: carry = `None` ("unbounded" -- the ENTIRE raw
+  history is always re-read). `vwap` is cumulative since the start of
+  the series by definition (Phase 1), so no bounded window suffices.
+  `ema` is unbounded for a different, equally fundamental reason (found
+  during this phase's own adversarial testing -- see the delivery
+  report's "Defects found and fixed"): it is RECURSIVE, seeded by an SMA
+  of the first `window` values of whatever series it is given, then each
+  value depends on the previous one. A bounded carry window re-seeds EMA
+  from a different starting point than a full computation would use --
+  and because the recursion never forgets its seed, every subsequent
+  value is silently wrong, not confined to one boundary point the way
+  `atr`/`rsi`'s own boundary approximation is. Both are a documented,
+  deliberate PERFORMANCE (never correctness) limitation.
+
+**`only_persist_timestamps`**: `generate_candle_features` (Phase 1)
+gained an optional parameter restricting which computed points are
+actually WRITTEN to the store, while every point is still COMPUTED over
+the full input series (needed for correct rolling context). Incremental
+generation recomputes a bounded leading "carry" window purely for
+context and must NEVER re-attempt to persist those carry positions --
+`atr`/`rsi` both use an artificial "insufficient prior data" fallback at
+position 0 of whatever series they are given (correct for genuine full
+history, wrong for a truncated carry window), so re-persisting a
+recomputed carry-window value would otherwise spuriously conflict with
+the correct value already stored for that timestamp. This parameter
+defaults to `None` (persist everything, Phase 1's original behavior) --
+zero behavior change for any existing caller.
+
+### Recovery (`recovery.py`)
+
+Recovery NEVER GUESSES: it reconstructs partitions/manifests EXCLUSIVELY
+from whatever `MarketEventStore`/`FeatureStore` durably, verifiably hold
+RIGHT NOW -- the same "always recompute fresh from current store state"
+functions ingestion itself uses, never a diff against a prior manifest,
+and never a replay of an ingestion batch's original (not durably
+retained) event list. A batch left `RESERVED` without a matching
+`COMMITTED` entry is reported PENDING, never fabricated -- the caller
+must resubmit that exact batch (idempotently convergent either way).
+
+**Truncated trailing record** -- the one form of "repair" this module
+performs: a process killed mid-write of the LAST line of a `.jsonl` file
+leaves a partial, unparseable fragment as the final line, with every
+earlier line still complete. `read_jsonl_tolerating_truncated_tail`
+parses every line strictly and, ONLY if the final line fails, discards
+it and reports it; a failure on any non-final line is genuine corruption
+and raises `RepositoryCorruptionError`. When a truncated tail is
+discarded, `recovery.py` PHYSICALLY rewrites the file (atomically, via
+temp-then-rename) to remove the corrupted bytes -- otherwise every
+subsequent STRICT read (`MarketEventStore.read_events` etc.) would keep
+failing on the same corrupted line.
+
+### Atomicity -- the honest transaction boundary
+
+A completed manifest never points to a missing/partially-written
+partition or a digest mismatch, because manifests are always the LAST
+thing written in any flow (ingestion, recovery, compaction), always
+derived FRESH from already-durably-written partitions/events at the
+moment of manifest construction. Multi-file atomicity across
+(event-append, partition-write, manifest-append) is NOT attempted as one
+indivisible transaction -- instead, a deterministic STAGED protocol with
+recoverable states: each individual write (`MarketEventStore.append`,
+`FeatureStore.append`, `PartitionStore.write` via `write_json_atomic`,
+`DatasetManifestStore.append`) is independently atomic and idempotent,
+and `recovery.py`'s "rebuild fresh from current store state" functions
+are what make an interruption BETWEEN those individual writes safe --
+never a lost or duplicated economic fact, at worst a manifest that has
+not yet caught up (which recovery/reconciliation both detect and fix).
+
+### Reconciliation vs. verification -- the honesty split
+
+`reconciliation.py` produces STRUCTURED ISSUES (missing/orphan
+partition, wrong digest/count, duplicate coordinate, broken lineage,
+stale checkpoint, semantic mismatch) -- ordinary, expected, non-raising
+findings, reusing `ml.models.ValidationReport` exactly like
+`quality.py`/`verification.py` already do. `verification.py`'s Phase 2
+additions (`verify_raw_dataset`/`verify_feature_dataset`) go one step
+further: they recompute each PARTITION's and MANIFEST's own content id
+from its own recorded fields and compare (forged-identity detection,
+distinct from "does the content match the raw store," which
+reconciliation already checks), and REUSE Phase 1's
+`verify_market_event_store`/`verify_feature_store` directly for
+event/feature-level identity (documented reuse, not re-derivation).
+`verify_feature_dataset`'s optional
+`cross_check_against_fresh_recomputation=True` regenerates every
+requested feature fresh, into a throwaway scratch store, straight from
+the raw candles the dataset's own manifest claims as lineage, and
+compares every resulting value against what is actually stored --
+catching COHERENT tampering (a value changed AND consistently
+re-hashed) that pure identity/digest recomputation cannot, since a
+consistently-forged id is, by construction, invisible to any check that
+only asks "does this object reproduce its own id." This is proven, not
+merely claimed: `tests/unit/market_data/
+test_market_data_repository_verification.py`'s
+`TestFreshRecomputeCatchesCoherentTampering` hand-tampers a stored value
+AND correctly re-computes its own `feature_id` to match, confirms the
+basic (identity-only) check reports zero criticals, then confirms the
+cross-check catches it.
+
+### Compaction (`compaction.py`) -- narrowly scoped, by design
+
+The specification marks compaction OPTIONAL ("only if it can be done
+safely within scope"). This phase implements the safe subset: rebuilding
+every partition and the manifest for a dataset fresh from its own
+current durable data -- normalizing physical storage back to exactly
+what `build_partition`/the manifest-rebuild functions would produce from
+scratch (the identical operation `recovery.py` performs after an
+interruption, here invoked as routine maintenance). Deliberately NOT
+implemented: combining small partitions into larger ones by CHANGING
+granularity (e.g. daily -> monthly) -- doing that safely would require
+partition physical paths to be scoped by granularity so old and new
+partition files never collide at the same path, a storage-layout change
+touching every module that writes a `Partition`. Verified invariants:
+event/feature identities, `semantic_digest`, logical ordering, and
+replay result never change; `dataset_id` may change if a partition was
+physically hand-edited/drifted (compaction corrects it back to canonical
+form) -- a new, still fully valid manifest version, never a mutation of
+a prior one.
+
+### Deterministic export (`export.py`)
+
+JSON Lines only, not CSV -- every value already round-trips exactly
+through this package's own `to_json_dict()` convention (`Decimal` as
+exact strings, ISO-8601 UTC timestamps), so JSONL reuses already-tested
+serialization rather than a second CSV-specific quoting scheme, and adds
+no pandas dependency purely for export. Row order is always
+`(timestamp, id)` -- canonical logical order, independent of physical
+append order. `export_semantic_digest` is a digest of the exported ROW
+SET alone (sorted before hashing, order-independent) -- proven identical
+across independent filesystem roots and nested vs. shallow paths in
+`tests/unit/market_data/test_market_data_export.py`.
+
+### Concurrency
+
+Every Phase 2 store reuses the SAME `ml.concurrency.experiment_lock`
+primitive Phase 1/`portfolio_risk`/`execution_gateway` already build on
+-- confirmed, via direct testing, to be FAIL-FAST (a second concurrent
+caller for the same lock path is rejected immediately with
+`MarketDataLockError`, never made to wait). This means two genuinely
+concurrent writers targeting different, pre-assigned repository-append
+sequences for the same `DatasetKey` are not both guaranteed to land on
+their first attempt -- `ingestion.py`'s own module docstring states that
+sequence assignment is the CALLER's responsibility, requiring external
+coordination for true multi-writer concurrency. The guarantee this
+package actually provides, and the one its own concurrency tests verify:
+no corruption ever occurs under a race, any failure is a typed,
+retryable `MarketDataLockError` (or an ordinary sequence-gap
+`MarketDataPersistenceError` from a caller-side coordination gap, never
+silently misclassified as a business/data-quality denial), and a lock
+loser always converges to the correct final state on retry. The same
+pre-existing, shared `historical.locking.DatasetLock` stale-lock-reclaim
+race already documented during Milestone 9 Phase 3/4's own concurrency
+testing was independently reproduced again here (confirmed via its own
+diagnostic log line, `"Reclaiming unreadable/corrupted dataset lock
+file"`); out of this phase's scope to fix, mitigated the same way M9
+did -- keeping concurrency-test thread/iteration counts modest.
+
+## Known limitations (honestly disclosed)
+
+Phase 1:
 - No instrument registry/master-data service: `instrument_id` defaults
   to `f"{provider}__{symbol}"` (derived in `normalization.
   derive_instrument_id`) when not explicitly supplied. `__`, not `:` or
   `/`, joins the two -- `:` is a reserved drive-separator character on
   Windows and broke `MarketEventStore`/`FeatureStore`'s own path-based
-  partitioning during this phase's own smoke testing (see the delivery
-  report's "Defects found and fixed" section).
-- No tick-to-candle resampling/aggregation: out of Phase 1's literal
-  scope (not in the milestone's feature-generation list), and
-  `historical.resampling` already exists for the historical pipeline's
-  own leak-free resampling concern.
-- `vwap` is cumulative, not session-reset (see "Disclosed
-  simplifications" above).
-- `atr`/`rsi` use simple, not Wilder, smoothing (see above).
-- Macro events (`macro.py`) are modeled and point-in-time-safe
-  (`is_macro_event_available_at`), but Phase 1 does not wire them into
-  `feature_generation.py` -- no macro-derived feature exists yet. This is
-  an honest scope boundary: the milestone's feature-generation list is
-  entirely candle-derived ("returns... wick ratios"); macro-derived
-  features are a reasonable future phase.
-- No CLI surface: this package is a library only in Phase 1, matching
-  the milestone's own module list (no CLI expansion was requested or
-  added).
+  partitioning during Phase 1's own smoke testing.
+- No tick-to-candle resampling/aggregation.
+- `vwap` is cumulative, not session-reset; `atr`/`rsi` use simple, not
+  Wilder, smoothing (deliberate, disclosed formula choices).
+- Macro events (`macro.py`) are modeled and point-in-time-safe but not
+  wired into feature generation -- no macro-derived feature exists yet.
+- No CLI surface: library only.
+
+Phase 2:
+- Partitioning supports DAILY/MONTHLY only, not fixed-event-count.
+- Compaction does not combine partitions across a granularity change
+  (see "Compaction" above for the exact reason).
+- Partition-rebuild and manifest-rebuild both read the FULL underlying
+  event/feature history and filter/aggregate in memory -- correct and
+  deterministic, but not O(partition size); a genuinely large-scale
+  deployment would need windowed store reads, out of Phase 1/2's scope.
+- `ema`/`vwap` incremental generation always re-reads the full raw
+  history (a documented performance, not correctness, limitation -- see
+  above).
+- Recovery's file-rewrite (removing a discarded truncated trailing
+  record) assumes no concurrent writer targets the same path during the
+  recovery call -- a reasonable operational assumption for crash
+  recovery (run before ordinary traffic resumes), not enforced by an
+  additional lock.
+- No CLI surface: library only, matching Phase 1.
 
 ## Future phases (not started)
 
 Session-reset VWAP; Wilder-smoothed ATR/RSI variants; macro-derived
 features with point-in-time enforcement wired into generation; tick-to-
-candle resampling; a real instrument registry; integration with
-`portfolio_risk`/`execution_gateway` as their own authoritative market-
-data source (this milestone explicitly forbade touching either package
-in Phase 1).
+candle resampling; a real instrument registry; fixed-event-count and
+granularity-changing (daily-to-monthly) compaction; windowed/bounded
+store reads for large-scale partition rebuild; integration with
+`portfolio_risk`/`execution_gateway` as their own authoritative
+market-data source (this milestone explicitly forbade touching either
+package).
