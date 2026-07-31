@@ -45,7 +45,14 @@ from pathlib import Path
 
 import pandas as pd
 
+from quant_platform.market_data.backfill import BACKFILL_PLAN_KIND, BackfillPlan
 from quant_platform.market_data.candles import Candle
+from quant_platform.market_data.checkpoints import (
+    RAW_INGESTION_CHECKPOINT_KIND,
+    CheckpointStore,
+    HistoricalIngestionCheckpoint,
+    RawIngestionCheckpoint,
+)
 from quant_platform.market_data.events import (
     MarketDataEvent,
     MarketEventStore,
@@ -56,16 +63,24 @@ from quant_platform.market_data.feature_store import FEATURE_RECORD_KIND, Featur
 from quant_platform.market_data.identity import compute_content_id, require_tz_aware
 from quant_platform.market_data.manifests import DatasetKey, DatasetKind, compute_dataset_id
 from quant_platform.market_data.partitions import PARTITION_KIND
+from quant_platform.market_data.provenance import ProvenanceStore, find_provenance_conflicts
+from quant_platform.market_data.quarantine import QUARANTINE_RECORD_KIND, QuarantineStore
 from quant_platform.market_data.repository import MarketDataRepository
+from quant_platform.market_data.source_manifests import SOURCE_MANIFEST_KIND, SourceManifest
 from quant_platform.ml.models import ValidationIssue, ValidationReport, ValidationSeverity
 from quant_platform.ml.persistence import format_utc_timestamp
 
 __all__ = [
     "VERIFICATION_REPORT_SCHEMA_VERSION",
+    "verify_backfill_plan",
     "verify_feature_dataset",
     "verify_feature_store",
+    "verify_historical_ingestion_checkpoint",
     "verify_market_event_store",
+    "verify_provenance_store",
+    "verify_quarantine_store",
     "verify_raw_dataset",
+    "verify_source_manifest",
 ]
 
 VERIFICATION_REPORT_SCHEMA_VERSION = 1
@@ -261,3 +276,157 @@ def verify_feature_dataset(
                 ))
 
     return ValidationReport(schema_version=VERIFICATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=format_utc_timestamp(pd.Timestamp(as_of)))
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 3: historical-ingestion verification. STRUCTURALLY
+# INDEPENDENT (like every function above): each recomputes an object's own
+# content id from its own recorded fields, and cross-checks durable
+# evidence across stores -- never trusts a cached report, an in-memory
+# set, or a caller assertion. `verify_source_manifest`/
+# `verify_backfill_plan` do NOT re-read the original source bytes (the
+# strongest possible check -- see module docstring's own honesty
+# taxonomy) -- a caller wanting that re-reads the source file/adapter and
+# compares `adapter.content_digest()` to `SourceManifest.content_digest`
+# directly (`orchestration.run_ingestion_operation` already does exactly
+# this at its own `SOURCE_VERIFIED` stage).
+# --------------------------------------------------------------------------
+def verify_source_manifest(manifest: SourceManifest, *, as_of: datetime) -> ValidationReport:
+    require_tz_aware(as_of, field_name="as_of")
+    issues: list[ValidationIssue] = []
+    recomputed_id = compute_content_id(SOURCE_MANIFEST_KIND, manifest.to_identity_payload())
+    if recomputed_id != manifest.source_manifest_id:
+        issues.append(_issue(
+            ValidationSeverity.CRITICAL, "forged_source_manifest_identity",
+            f"SourceManifest {manifest.source_manifest_id!r}'s own recorded fields do not reproduce its own id -- forged or tampered.",
+        ))
+    if len(manifest.content_digest) != 64:
+        issues.append(_issue(ValidationSeverity.CRITICAL, "malformed_content_digest", f"SourceManifest.content_digest {manifest.content_digest!r} is not a 64-char sha256 hex digest."))
+    return ValidationReport(schema_version=VERIFICATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=format_utc_timestamp(pd.Timestamp(as_of)))
+
+
+def verify_backfill_plan(plan: BackfillPlan, *, as_of: datetime) -> ValidationReport:
+    require_tz_aware(as_of, field_name="as_of")
+    issues: list[ValidationIssue] = []
+    recomputed_id = compute_content_id(BACKFILL_PLAN_KIND, plan.to_identity_payload())
+    if recomputed_id != plan.backfill_plan_id:
+        issues.append(_issue(
+            ValidationSeverity.CRITICAL, "forged_backfill_plan_identity",
+            f"BackfillPlan {plan.backfill_plan_id!r}'s own recorded fields do not reproduce its own id -- forged or tampered.",
+        ))
+    declared = set(plan.expected_partitions_touched)
+    batch_keys = {b.partition_key for b in plan.batches}
+    if declared != batch_keys:
+        issues.append(_issue(
+            ValidationSeverity.CRITICAL, "plan_batches_partition_mismatch",
+            f"BackfillPlan.expected_partitions_touched {sorted(declared)} does not match the partition_key set covered by its own batches {sorted(batch_keys)}.",
+        ))
+    return ValidationReport(schema_version=VERIFICATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=format_utc_timestamp(pd.Timestamp(as_of)))
+
+
+def verify_provenance_store(*, provenance_store: ProvenanceStore, dataset_key: DatasetKey, repository: MarketDataRepository, as_of: datetime) -> ValidationReport:
+    """Recomputes every `ProvenanceRecord`'s own id from its recorded
+    fields (forged-identity detection), runs `find_provenance_conflicts`
+    (bidirectional row<->event linkage), and confirms every referenced
+    `event_id` actually exists in the repository's raw event store --
+    the "provenance references an existing event" half of "quarantine
+    exclusion" (the other half -- that no event ALSO appears in
+    quarantine for the same coordinate -- is a cross-store check; see
+    `reconciliation.reconcile_historical_ingestion_operation`)."""
+    require_tz_aware(as_of, field_name="as_of")
+    issues: list[ValidationIssue] = []
+    records = provenance_store.read_all(dataset_key)
+
+    for record in records:
+        recomputed_id = compute_content_id("provenance_record", record.to_identity_payload())
+        if recomputed_id != record.provenance_id:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "forged_provenance_identity",
+                f"ProvenanceRecord {record.provenance_id!r}'s own recorded fields do not reproduce its own id -- forged or tampered.",
+            ))
+
+    for conflict in find_provenance_conflicts(records):
+        severity = ValidationSeverity.CRITICAL if conflict.issue_code == "coordinate_bound_to_multiple_events" else ValidationSeverity.WARNING
+        issues.append(_issue(severity, conflict.issue_code, conflict.detail))
+
+    if records and dataset_key.provider is not None:
+        existing_event_ids = {market_data_event_id(e) for e in repository.event_store.read_events(dataset_key.provider, dataset_key.instrument_id)}
+        missing = sorted({r.event_id for r in records} - existing_event_ids)
+        if missing:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "provenance_references_missing_event",
+                f"{len(missing)} provenance record(s) reference event_id(s) not present in the repository: {missing[:10]}.",
+            ))
+
+    return ValidationReport(schema_version=VERIFICATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=format_utc_timestamp(pd.Timestamp(as_of)))
+
+
+def verify_quarantine_store(*, quarantine_store: QuarantineStore, dataset_key: DatasetKey, as_of: datetime) -> ValidationReport:
+    require_tz_aware(as_of, field_name="as_of")
+    issues: list[ValidationIssue] = []
+    records = quarantine_store.read_all(dataset_key)
+    for record in records:
+        recomputed_id = compute_content_id(QUARANTINE_RECORD_KIND, record.to_identity_payload())
+        if recomputed_id != record.quarantine_record_id:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "forged_quarantine_identity",
+                f"QuarantineRecord {record.quarantine_record_id!r}'s own recorded fields do not reproduce its own id -- forged or tampered.",
+            ))
+    seen_coordinates: dict[tuple[str, int], str] = {}
+    for record in records:
+        key = (record.source_manifest_id, record.source_row_index)
+        existing = seen_coordinates.get(key)
+        if existing is not None and existing != record.quarantine_record_id:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "quarantine_coordinate_conflict",
+                f"source coordinate {key!r} has two different quarantine_record_id values durably recorded -- append-only history was violated.",
+            ))
+        seen_coordinates[key] = record.quarantine_record_id
+    return ValidationReport(schema_version=VERIFICATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=format_utc_timestamp(pd.Timestamp(as_of)))
+
+
+def verify_historical_ingestion_checkpoint(checkpoint: HistoricalIngestionCheckpoint, *, repository: MarketDataRepository) -> ValidationReport:
+    """Recomputes `checkpoint`'s own id (forged-identity detection), and
+    confirms its embedded `repository_checkpoint_id` refers to a
+    `RawIngestionCheckpoint` that GENUINELY EXISTS in the checkpoint
+    store's history and reproduces ITS OWN id from its own recorded
+    fields -- the bridge described in `checkpoints.py`'s own
+    `HistoricalIngestionCheckpoint` docstring. This deliberately does
+    NOT call `checkpoints.verify_raw_ingestion_checkpoint` (which checks
+    a checkpoint against CURRENT live repository state, and is
+    EXPECTED to report the referenced checkpoint "stale" once ANY later
+    activity -- this operation's own subsequent stages, or an unrelated
+    later operation -- advances the repository past the point-in-time
+    this checkpoint captured; that is normal, not evidence of tampering).
+    A `HistoricalIngestionCheckpoint` embeds `repository_checkpoint_id`
+    to prove "this repository state genuinely existed at commit time",
+    never "the repository has not changed since"."""
+    issues: list[ValidationIssue] = []
+    recomputed_id = compute_content_id("historical_ingestion_checkpoint", checkpoint.to_identity_payload())
+    if recomputed_id != checkpoint.checkpoint_id:
+        issues.append(_issue(
+            ValidationSeverity.CRITICAL, "forged_historical_checkpoint_identity",
+            f"HistoricalIngestionCheckpoint {checkpoint.checkpoint_id!r}'s own recorded fields do not reproduce its own id -- forged or tampered.",
+        ))
+
+    checkpoint_history = [
+        c for c in CheckpointStore(repository.root).read_history(checkpoint.dataset_key)
+        if isinstance(c, RawIngestionCheckpoint) and c.checkpoint_id == checkpoint.repository_checkpoint_id
+    ]
+    if not checkpoint_history:
+        issues.append(_issue(
+            ValidationSeverity.CRITICAL, "missing_repository_checkpoint",
+            f"HistoricalIngestionCheckpoint {checkpoint.checkpoint_id!r} references repository_checkpoint_id "
+            f"{checkpoint.repository_checkpoint_id!r}, which does not appear in the checkpoint store's history.",
+        ))
+    else:
+        referenced = checkpoint_history[0]
+        recomputed_repository_checkpoint_id = compute_content_id(RAW_INGESTION_CHECKPOINT_KIND, referenced.to_identity_payload())
+        if recomputed_repository_checkpoint_id != referenced.checkpoint_id:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "forged_repository_checkpoint",
+                f"RawIngestionCheckpoint {referenced.checkpoint_id!r} (referenced by HistoricalIngestionCheckpoint "
+                f"{checkpoint.checkpoint_id!r}) does not reproduce its own id from its own recorded fields -- forged or tampered.",
+            ))
+
+    return ValidationReport(schema_version=VERIFICATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=format_utc_timestamp(pd.Timestamp(checkpoint.checkpoint_time)))

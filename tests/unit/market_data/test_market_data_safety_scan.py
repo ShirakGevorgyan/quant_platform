@@ -1,9 +1,13 @@
-"""Safety scan (Milestone 10, Phase 2): confirms the shipped
-`market_data` source contains no network clients, no broker code, no
-credentials, no live-trading code, no `float`-typed financial dataclass
-fields, no `uuid4`/`random`-derived economic identity, no internal
-wall-clock economic input, no overwrite/bypass flags, no silent broad
-exception handling, and no unsafe `pickle` usage -- plus dedicated
+"""Safety scan (Milestone 10, Phases 2 and 3): confirms the shipped
+`market_data` source (EVERY `*.py` file in the package, including every
+Phase 3 historical-ingestion module -- `_all_source_files()` globs the
+whole directory, so nothing needs re-pointing when a new module is
+added) contains no network clients, no broker code, no credentials, no
+live-trading code, no `float`-typed financial dataclass fields, no
+`uuid4`/`random`-derived economic identity, no internal wall-clock
+economic input, no overwrite/bypass flags, no silent broad exception
+handling, no unsafe `pickle` usage, no cloud-service SDK imports, no
+`eval`/`exec`, and no shell command execution -- plus dedicated
 path-traversal-rejection tests.
 
 THE SCANNER IS PROVEN NON-VACUOUS: `TestScannerCatchesDeliberatelyBadCode`
@@ -40,6 +44,10 @@ _OVERWRITE_BYPASS_FLAG = re.compile(r"\b(force|overwrite|skip_verification|bypas
 _BARE_EXCEPT = re.compile(r"^\s*except\s*:\s*$", re.MULTILINE)
 _SWALLOWED_EXCEPTION = re.compile(r"except\s+Exception\s*:\s*\n\s*pass\b")
 _UNSAFE_PICKLE = re.compile(r"^\s*import\s+pickle\b|\bpickle\.loads?\(", re.MULTILINE)
+_CLOUD_SDK_IMPORTS = re.compile(r"^\s*(import|from)\s+(boto3|botocore|azure|google\.cloud|gcloud)\b", re.MULTILINE)
+_EVAL_OR_EXEC = re.compile(r"\beval\(|\bexec\(")
+_SHELL_EXECUTION = re.compile(r"\bsubprocess\.\w+\(|\bos\.system\(|\bos\.popen\(")
+_FLOAT_CALL = re.compile(r"\bfloat\(")
 
 
 def _all_source_files() -> list[Path]:
@@ -48,6 +56,21 @@ def _all_source_files() -> list[Path]:
 
 def _combined_source() -> str:
     return "\n".join(p.read_text(encoding="utf-8") for p in _all_source_files())
+
+
+def _float_call_lines_outside_prose(text: str) -> list[str]:
+    """`float(` appears legitimately in this package's own PROSE (module
+    docstrings use backtick-quoted inline code, e.g. `` `float(Decimal
+    ("0.1"))` `` in `identity.py`'s own "never float" explanation) but
+    never in real Python syntax with a backtick on the same line -- this
+    filters those prose mentions out while still catching a genuine
+    `float(...)` call site, which would mean a financial value was
+    parsed through binary floating point somewhere it should not be."""
+    flagged = []
+    for line in text.splitlines():
+        if _FLOAT_CALL.search(line) and "`" not in line:
+            flagged.append(line)
+    return flagged
 
 
 def _uuid4_lines_outside_temp_naming(text: str) -> list[str]:
@@ -129,6 +152,37 @@ class TestNoUnsafePickle:
         assert not _UNSAFE_PICKLE.search(source)
 
 
+class TestNoCloudServiceSdkImports:
+    def test_no_cloud_sdk_imports(self) -> None:
+        source = _combined_source()
+        assert not _CLOUD_SDK_IMPORTS.search(source)
+
+
+class TestNoEvalOrExec:
+    def test_no_eval_or_exec(self) -> None:
+        source = _combined_source()
+        assert not _EVAL_OR_EXEC.search(source)
+
+
+class TestNoShellCommandExecution:
+    def test_no_subprocess_or_os_system(self) -> None:
+        source = _combined_source()
+        assert not _SHELL_EXECUTION.search(source)
+
+
+class TestNoFloatFinancialParsing:
+    """Beyond `TestNoFloatFinancialFields`'s dataclass-field check: no
+    `float(...)` CALL anywhere in the package -- every Decimal parsing
+    path (`identity.parse_decimal`, `source_normalization.
+    parse_source_decimal`) goes through `Decimal(str(raw))` directly,
+    never a float intermediate."""
+
+    def test_no_float_call_outside_prose(self) -> None:
+        for path in _all_source_files():
+            flagged = _float_call_lines_outside_prose(path.read_text(encoding="utf-8"))
+            assert flagged == [], f"{path.name} calls float(...) outside prose: {flagged}"
+
+
 class TestPathTraversalRejection:
     def test_partition_key_path_traversal_is_rejected(self) -> None:
         key = DatasetKey(dataset_kind=DatasetKind.RAW_MARKET_EVENTS, instrument_id="mt5__XAUUSD", provider="mt5")
@@ -185,6 +239,26 @@ class TestScannerCatchesDeliberatelyBadCode:
     def test_pickle_usage_is_caught(self) -> None:
         assert _UNSAFE_PICKLE.search("import pickle\n")
         assert _UNSAFE_PICKLE.search("pickle.loads(data)\n")
+
+    def test_cloud_sdk_import_is_caught(self) -> None:
+        assert _CLOUD_SDK_IMPORTS.search("import boto3\n")
+        assert _CLOUD_SDK_IMPORTS.search("from google.cloud import storage\n")
+
+    def test_eval_or_exec_is_caught(self) -> None:
+        assert _EVAL_OR_EXEC.search("eval('1 + 1')\n")
+        assert _EVAL_OR_EXEC.search("exec(user_code)\n")
+
+    def test_shell_execution_is_caught(self) -> None:
+        assert _SHELL_EXECUTION.search("subprocess.run(['ls'])\n")
+        assert _SHELL_EXECUTION.search("os.system('rm -rf /')\n")
+
+    def test_float_call_outside_prose_is_caught(self) -> None:
+        flagged = _float_call_lines_outside_prose("value = float(raw_text)\n")
+        assert flagged
+
+    def test_float_call_inside_backtick_prose_is_not_flagged(self) -> None:
+        flagged = _float_call_lines_outside_prose('"""`float(Decimal("0.1"))` is not exactly 0.1"""\n')
+        assert flagged == []
 
 
 class TestSafetyScanIsActuallyExercisedAgainstRealSource:

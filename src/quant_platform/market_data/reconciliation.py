@@ -35,7 +35,12 @@ from quant_platform.market_data.partitions import build_partition, partition_key
 from quant_platform.market_data.repository import MarketDataRepository
 from quant_platform.ml.models import ValidationIssue, ValidationReport, ValidationSeverity
 
-__all__ = ["RECONCILIATION_REPORT_SCHEMA_VERSION", "reconcile_feature_dataset", "reconcile_raw_dataset"]
+__all__ = [
+    "RECONCILIATION_REPORT_SCHEMA_VERSION",
+    "reconcile_feature_dataset",
+    "reconcile_historical_ingestion_operation",
+    "reconcile_raw_dataset",
+]
 
 RECONCILIATION_REPORT_SCHEMA_VERSION = 1
 
@@ -175,5 +180,111 @@ def reconcile_feature_dataset(
                 issues.append(_issue(ValidationSeverity.CRITICAL, "stale_checkpoint", str(exc)))
             except CheckpointError as exc:
                 issues.append(_issue(ValidationSeverity.CRITICAL, "forged_checkpoint", str(exc)))
+
+    return ValidationReport(schema_version=RECONCILIATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=generated_at)
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 3: historical-ingestion reconciliation. Spans FOUR
+# stores one operation touched (`orchestration.OperationStore`,
+# `quarantine.QuarantineStore`, `provenance.ProvenanceStore`,
+# `checkpoints.CheckpointStore`) plus the raw dataset manifest history --
+# exactly the cross-store integrity `verification.py`'s Phase 3 functions
+# (each scoped to ONE store) deliberately do not attempt alone.
+# --------------------------------------------------------------------------
+def reconcile_historical_ingestion_operation(*, repository: MarketDataRepository, dataset_key: DatasetKey, operation_id: str, generated_at: str) -> ValidationReport:
+    from quant_platform.market_data.checkpoints import HistoricalIngestionCheckpoint
+    from quant_platform.market_data.orchestration import IngestionStage, OperationStore
+    from quant_platform.market_data.provenance import ProvenanceStore
+    from quant_platform.market_data.quarantine import QuarantineStore
+    from quant_platform.market_data.verification import verify_historical_ingestion_checkpoint
+
+    issues: list[ValidationIssue] = []
+    history = [r for r in OperationStore(repository.root).read_all(dataset_key) if r.operation_id == operation_id]
+    if not history:
+        issues.append(_issue(ValidationSeverity.CRITICAL, "operation_not_found", f"No operation ledger entry exists for operation_id {operation_id!r} under {dataset_key!r}."))
+        return ValidationReport(schema_version=RECONCILIATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=generated_at)
+
+    latest = history[-1]
+    if latest.stage is not IngestionStage.COMPLETED:
+        issues.append(_issue(ValidationSeverity.WARNING, "operation_not_completed", f"operation_id {operation_id!r} is at stage {latest.stage.value!r}, not COMPLETED."))
+
+    quarantine_records = [q for q in QuarantineStore(repository.root).read_all(dataset_key) if q.ingestion_batch_id == operation_id]
+    provenance_records = [p for p in ProvenanceStore(repository.root).read_all(dataset_key) if p.ingestion_batch_id == operation_id]
+
+    quarantined_coords = {(q.source_manifest_id, q.source_row_index) for q in quarantine_records}
+    provenance_coords = {(p.source_manifest_id, p.source_row_index) for p in provenance_records}
+    overlap = quarantined_coords & provenance_coords
+    if overlap:
+        issues.append(_issue(
+            ValidationSeverity.CRITICAL, "row_both_quarantined_and_ingested",
+            f"{len(overlap)} source row coordinate(s) appear in BOTH quarantine and provenance for operation_id {operation_id!r}: {sorted(overlap)[:10]}.",
+        ))
+
+    rows_parsed_record = next((r for r in history if r.stage is IngestionStage.ROWS_PARSED), None)
+    rows_validated_record = next((r for r in history if r.stage is IngestionStage.ROWS_VALIDATED), None)
+    source_verified_record = next((r for r in history if r.stage is IngestionStage.SOURCE_VERIFIED), None)
+    if rows_parsed_record is not None and rows_validated_record is not None:
+        parsed_count = int(str(rows_parsed_record.stage_evidence["parsed_row_count"]))
+        valid_count = int(str(rows_validated_record.stage_evidence["valid_row_count"]))
+        quarantined_count = int(str(rows_validated_record.stage_evidence["quarantined_row_count"]))
+        if valid_count + quarantined_count != parsed_count:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "row_count_mismatch",
+                f"operation_id {operation_id!r}: valid_row_count({valid_count}) + quarantined_row_count({quarantined_count}) != parsed_row_count({parsed_count}).",
+            ))
+        if len(provenance_records) != valid_count:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "provenance_count_mismatch",
+                f"operation_id {operation_id!r}: {len(provenance_records)} provenance record(s) durably exist, expected valid_row_count={valid_count}.",
+            ))
+
+        # Coordinate-level, NOT batch-id-filtered: `QuarantineStore`
+        # idempotently absorbs a later operation's rediscovery of a row
+        # an EARLIER operation already quarantined for the identical
+        # reason (see `quarantine.QuarantineRecord.to_identity_payload`'s
+        # own docstring) -- the durably stored record's `ingestion_batch_id`
+        # then still names whichever operation wrote it FIRST, so
+        # completeness must be checked by COORDINATE, never by re-filtering
+        # on this operation's own batch id.
+        quarantined_row_indices_raw = rows_validated_record.stage_evidence.get("quarantined_row_indices")
+        if quarantined_row_indices_raw is not None and source_verified_record is not None:
+            assert isinstance(quarantined_row_indices_raw, list)
+            expected_indices = {int(str(i)) for i in quarantined_row_indices_raw}
+            source_manifest_id = str(source_verified_record.stage_evidence["source_manifest_id"])
+            actual_indices = {
+                q.source_row_index for q in QuarantineStore(repository.root).read_all(dataset_key) if q.source_manifest_id == source_manifest_id
+            }
+            missing_indices = sorted(expected_indices - actual_indices)
+            if missing_indices:
+                issues.append(_issue(
+                    ValidationSeverity.CRITICAL, "quarantine_count_mismatch",
+                    f"operation_id {operation_id!r}: row(s) {missing_indices} were quarantined by this operation's own row processing "
+                    "but have no corresponding durable QuarantineRecord for this source_manifest_id.",
+                ))
+
+    completed_record = next((r for r in history if r.stage is IngestionStage.COMPLETED), None)
+    if completed_record is not None:
+        resulting_dataset_id = str(completed_record.stage_evidence["resulting_dataset_id"])
+        manifest_history_ids = {m.dataset_id for m in repository.manifest_store.read_history(dataset_key)}
+        if resulting_dataset_id not in manifest_history_ids:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "resulting_dataset_id_not_in_manifest_history",
+                f"operation_id {operation_id!r} claims resulting_dataset_id={resulting_dataset_id!r}, which does not appear in the dataset's own manifest history.",
+            ))
+
+    historical_checkpoints = [
+        c for c in CheckpointStore(repository.root).read_history(dataset_key)
+        if isinstance(c, HistoricalIngestionCheckpoint) and c.operation_id == operation_id
+    ]
+    if not historical_checkpoints:
+        if latest.stage is IngestionStage.COMPLETED:
+            issues.append(_issue(
+                ValidationSeverity.CRITICAL, "missing_historical_checkpoint",
+                f"operation_id {operation_id!r} is COMPLETED but no HistoricalIngestionCheckpoint exists for it.",
+            ))
+    else:
+        checkpoint_report = verify_historical_ingestion_checkpoint(historical_checkpoints[-1], repository=repository)
+        issues.extend(checkpoint_report.issues)
 
     return ValidationReport(schema_version=RECONCILIATION_REPORT_SCHEMA_VERSION, issues=tuple(issues), generated_at=generated_at)

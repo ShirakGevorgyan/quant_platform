@@ -52,18 +52,22 @@ from quant_platform.ml.persistence import parse_json_strict
 
 __all__ = [
     "FEATURE_GENERATION_CHECKPOINT_KIND",
+    "HISTORICAL_INGESTION_CHECKPOINT_KIND",
     "RAW_INGESTION_CHECKPOINT_KIND",
     "CheckpointStore",
     "FeatureGenerationCheckpoint",
+    "HistoricalIngestionCheckpoint",
     "RawIngestionCheckpoint",
     "compute_raw_ingestion_checkpoint",
     "create_feature_generation_checkpoint",
+    "create_historical_ingestion_checkpoint",
     "verify_feature_generation_checkpoint",
     "verify_raw_ingestion_checkpoint",
 ]
 
 RAW_INGESTION_CHECKPOINT_KIND = "raw_ingestion_checkpoint"
 FEATURE_GENERATION_CHECKPOINT_KIND = "feature_generation_checkpoint"
+HISTORICAL_INGESTION_CHECKPOINT_KIND = "historical_ingestion_checkpoint"
 
 
 # --------------------------------------------------------------------------
@@ -277,10 +281,106 @@ def verify_feature_generation_checkpoint(checkpoint: FeatureGenerationCheckpoint
 
 
 # --------------------------------------------------------------------------
-# Durable storage -- one append-only history per dataset_key, holding
-# EITHER checkpoint kind (discriminated by the stored "kind" field).
+# Historical-ingestion checkpoint (Milestone 10, Phase 3). Unlike
+# `RawIngestionCheckpoint` (a HINT re-derived and re-verified fresh from
+# repository state; see module docstring), this checkpoint binds facts
+# that are NOT independently re-derivable from repository state alone --
+# `source_manifest_id`/`backfill_plan_id`/`operation_id`/
+# `last_processed_source_row_index` describe where an `orchestration.py`
+# OPERATION left off in its SOURCE, which the repository itself has no
+# way to know (the repository only ever sees already-normalized events,
+# never source rows). It therefore embeds `repository_checkpoint_id` --
+# a `RawIngestionCheckpoint`'s own id, computed and durably stored
+# alongside it -- as the bridge back to repository-side re-derivation,
+# rather than duplicating that logic here.
 # --------------------------------------------------------------------------
-Checkpoint = RawIngestionCheckpoint | FeatureGenerationCheckpoint
+@dataclass(frozen=True, slots=True)
+class HistoricalIngestionCheckpoint:
+    checkpoint_id: str
+    dataset_key: DatasetKey
+    source_manifest_id: str
+    backfill_plan_id: str
+    operation_id: str
+    last_processed_source_row_index: int | None
+    """`None` only for an operation whose source produced zero rows."""
+    committed_event_ids_digest: str
+    quarantine_digest: str
+    resulting_dataset_id: str
+    provenance_digest: str
+    repository_checkpoint_id: str
+    instrument_mapping_id: str
+    timeframe_mapping_id: str | None
+    timezone_policy_id: str
+    checkpoint_time: datetime
+
+    def __post_init__(self) -> None:
+        if self.last_processed_source_row_index is not None and self.last_processed_source_row_index < 0:
+            raise CheckpointError(f"HistoricalIngestionCheckpoint.last_processed_source_row_index must be >= 0 or None, got {self.last_processed_source_row_index}")
+        require_tz_aware(self.checkpoint_time, field_name="HistoricalIngestionCheckpoint.checkpoint_time")
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "kind": HISTORICAL_INGESTION_CHECKPOINT_KIND, "checkpoint_id": self.checkpoint_id, "dataset_key": self.dataset_key.to_json_dict(),
+            "source_manifest_id": self.source_manifest_id, "backfill_plan_id": self.backfill_plan_id, "operation_id": self.operation_id,
+            "last_processed_source_row_index": self.last_processed_source_row_index,
+            "committed_event_ids_digest": self.committed_event_ids_digest, "quarantine_digest": self.quarantine_digest,
+            "resulting_dataset_id": self.resulting_dataset_id, "provenance_digest": self.provenance_digest,
+            "repository_checkpoint_id": self.repository_checkpoint_id, "instrument_mapping_id": self.instrument_mapping_id,
+            "timeframe_mapping_id": self.timeframe_mapping_id, "timezone_policy_id": self.timezone_policy_id,
+            "checkpoint_time": serialize_timestamp(self.checkpoint_time, field_name="checkpoint_time"),
+        }
+
+    def to_identity_payload(self) -> dict[str, object]:
+        payload = dict(self.to_json_dict())
+        del payload["checkpoint_id"]
+        del payload["checkpoint_time"]
+        return payload
+
+    @classmethod
+    def from_json_dict(cls, raw: dict[str, object]) -> HistoricalIngestionCheckpoint:
+        from quant_platform.ml.persistence import as_json_dict
+
+        raw_last_index = raw.get("last_processed_source_row_index")
+        return cls(
+            checkpoint_id=str(raw["checkpoint_id"]), dataset_key=DatasetKey.from_json_dict(as_json_dict(raw["dataset_key"], field_name="dataset_key")),
+            source_manifest_id=str(raw["source_manifest_id"]), backfill_plan_id=str(raw["backfill_plan_id"]), operation_id=str(raw["operation_id"]),
+            last_processed_source_row_index=(None if raw_last_index is None else int(str(raw_last_index))),
+            committed_event_ids_digest=str(raw["committed_event_ids_digest"]), quarantine_digest=str(raw["quarantine_digest"]),
+            resulting_dataset_id=str(raw["resulting_dataset_id"]), provenance_digest=str(raw["provenance_digest"]),
+            repository_checkpoint_id=str(raw["repository_checkpoint_id"]), instrument_mapping_id=str(raw["instrument_mapping_id"]),
+            timeframe_mapping_id=(None if raw.get("timeframe_mapping_id") is None else str(raw["timeframe_mapping_id"])),
+            timezone_policy_id=str(raw["timezone_policy_id"]), checkpoint_time=deserialize_timestamp(raw["checkpoint_time"], field_name="checkpoint_time"),
+        )
+
+
+def create_historical_ingestion_checkpoint(
+    *, dataset_key: DatasetKey, source_manifest_id: str, backfill_plan_id: str, operation_id: str,
+    last_processed_source_row_index: int | None, committed_event_ids_digest: str, quarantine_digest: str, resulting_dataset_id: str,
+    provenance_digest: str, repository_checkpoint_id: str, instrument_mapping_id: str, timeframe_mapping_id: str | None,
+    timezone_policy_id: str, checkpoint_time: datetime,
+) -> HistoricalIngestionCheckpoint:
+    provisional = HistoricalIngestionCheckpoint(
+        checkpoint_id="0" * 64, dataset_key=dataset_key, source_manifest_id=source_manifest_id, backfill_plan_id=backfill_plan_id,
+        operation_id=operation_id, last_processed_source_row_index=last_processed_source_row_index,
+        committed_event_ids_digest=committed_event_ids_digest, quarantine_digest=quarantine_digest, resulting_dataset_id=resulting_dataset_id,
+        provenance_digest=provenance_digest, repository_checkpoint_id=repository_checkpoint_id, instrument_mapping_id=instrument_mapping_id,
+        timeframe_mapping_id=timeframe_mapping_id, timezone_policy_id=timezone_policy_id, checkpoint_time=checkpoint_time,
+    )
+    checkpoint_id = compute_content_id(HISTORICAL_INGESTION_CHECKPOINT_KIND, provisional.to_identity_payload())
+    return HistoricalIngestionCheckpoint(
+        checkpoint_id=checkpoint_id, dataset_key=dataset_key, source_manifest_id=source_manifest_id, backfill_plan_id=backfill_plan_id,
+        operation_id=operation_id, last_processed_source_row_index=last_processed_source_row_index,
+        committed_event_ids_digest=committed_event_ids_digest, quarantine_digest=quarantine_digest, resulting_dataset_id=resulting_dataset_id,
+        provenance_digest=provenance_digest, repository_checkpoint_id=repository_checkpoint_id, instrument_mapping_id=instrument_mapping_id,
+        timeframe_mapping_id=timeframe_mapping_id, timezone_policy_id=timezone_policy_id, checkpoint_time=checkpoint_time,
+    )
+
+
+# --------------------------------------------------------------------------
+# Durable storage -- one append-only history per dataset_key, holding
+# ANY checkpoint kind (discriminated by the stored "kind" field).
+# --------------------------------------------------------------------------
+Checkpoint = RawIngestionCheckpoint | FeatureGenerationCheckpoint | HistoricalIngestionCheckpoint
 
 
 @contextmanager
@@ -331,6 +431,8 @@ class CheckpointStore:
                 checkpoints.append(RawIngestionCheckpoint.from_json_dict(raw))
             elif kind == FEATURE_GENERATION_CHECKPOINT_KIND:
                 checkpoints.append(FeatureGenerationCheckpoint.from_json_dict(raw))
+            elif kind == HISTORICAL_INGESTION_CHECKPOINT_KIND:
+                checkpoints.append(HistoricalIngestionCheckpoint.from_json_dict(raw))
             else:
                 raise MarketDataPersistenceError(f"Corrupted checkpoint line for dataset {dataset_key!r}: unknown kind {kind!r}")
         return checkpoints

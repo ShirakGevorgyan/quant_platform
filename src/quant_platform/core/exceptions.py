@@ -1406,3 +1406,125 @@ class ExportError(MarketDataError):
     non-finite/non-Decimal value slipping into an exported field, an
     inconsistent column set across rows, or a requested export format
     this package does not support."""
+
+
+# --------------------------------------------------------------------------
+# Historical ingestion orchestration and offline source adapters
+# (Milestone 10, Phase 3)
+# --------------------------------------------------------------------------
+class HistoricalIngestionError(MarketDataError):
+    """Base class for every failure in `quant_platform.market_data`'s
+    historical ingestion layer. This layer is OFFLINE-ONLY: it never
+    opens a network connection, never imports a broker/vendor SDK, and
+    never defines a credential field -- it imports already-acquired
+    local files (CSV/JSON Lines) or in-memory fixtures into the durable
+    repository built in Phase 2."""
+
+
+class SourceAdapterError(HistoricalIngestionError):
+    """Raised when a source adapter cannot safely produce raw records: a
+    malformed file, an unsupported/unrecognized schema, a declared
+    encoding the file does not actually match, or a request for a record
+    kind the adapter does not support. Adapters raise this for
+    STRUCTURAL problems with the source itself -- a single bad ROW is a
+    validation-layer concern (`RowValidationError`/quarantine), never
+    this."""
+
+
+class SourceManifestError(HistoricalIngestionError):
+    """Raised when a `SourceManifest` is structurally invalid: an
+    inconsistent field combination, a non-finite/negative byte size, or
+    an attempt to construct one from content that does not match its own
+    declared digest."""
+
+
+class SourceIdentityError(HistoricalIngestionError):
+    """Raised when a `source_manifest_id` cannot be computed, or a
+    provided `SourceManifest` does not reproduce the identity it is
+    being verified against -- a forged or tampered manifest."""
+
+
+class InstrumentMappingError(HistoricalIngestionError):
+    """Raised when an instrument/symbol mapping cannot be safely
+    resolved: an unmapped source symbol under a fail-closed policy, an
+    ambiguous mapping (the same source symbol bound to two different
+    `instrument_id` values within one mapping spec), or a structurally
+    invalid mapping spec."""
+
+
+class TimeframeMappingError(HistoricalIngestionError):
+    """Raised when a source-declared timeframe label cannot be safely
+    resolved to a canonical `Timeframe`: an unknown label, or a
+    structurally invalid mapping spec."""
+
+
+class RowValidationError(HistoricalIngestionError):
+    """Raised when a raw source row fails validation AND the active
+    policy is fail-fast (never quarantine) -- the row-level analogue of
+    `MarketDataEventError`. Under quarantine policy, the identical
+    validation failure produces a `QuarantineRecord` instead of raising;
+    this exception exists for the caller that explicitly asked
+    (`fail_fast=True`) not to have invalid rows silently diverted."""
+
+
+class SourceQuarantineError(HistoricalIngestionError):
+    """Raised when a quarantine append would silently overwrite an
+    already-quarantined source coordinate with DIFFERENT evidence -- an
+    identical re-append (same source coordinate, same content) is
+    idempotently absorbed instead and never raises this. Named distinctly
+    from `historical.repair`'s own, unrelated `QuarantineError` (a
+    different package's different quarantine concept -- historical bar
+    repair vs. this layer's source-row ingestion quarantine)."""
+
+
+class BackfillPlanError(HistoricalIngestionError):
+    """Raised when a backfill plan cannot be safely constructed: an
+    inverted or non-finite requested interval, a structurally invalid
+    overlap/gap policy combination, or (under `REJECT_ANY_OVERLAP`) a
+    requested interval that genuinely overlaps already-covered durable
+    data. An admissible-but-imperfect plan (gaps present under
+    `allow_and_report`, for instance) is never this -- it is reported via
+    `BackfillPlan.issues`/`is_admissible` instead."""
+
+
+class OrchestrationError(HistoricalIngestionError):
+    """Base class for historical-ingestion stage-machine failures."""
+
+
+class OrchestrationStateError(OrchestrationError):
+    """Raised for an illegal `IngestionStage` transition, or an attempt
+    to advance an operation past a stage its own durable evidence does
+    not yet support (e.g. claiming `VERIFIED` before `REPOSITORY_
+    COMMITTED` and `PROVENANCE_COMMITTED` both durably agree)."""
+
+
+class OrchestrationConflictError(OrchestrationError):
+    """Raised when an ingestion operation is resubmitted under the same
+    operation/batch identity with DIFFERENT inputs (a changed source
+    content digest, mapping id, or normalization spec id) -- fails
+    closed rather than silently continuing a differently-sourced
+    operation under an old identity. An exact retry (identical inputs)
+    is idempotently absorbed instead and never raises this."""
+
+
+class ProvenanceError(HistoricalIngestionError):
+    """Raised when a `ProvenanceRecord` is structurally invalid, its own
+    identity cannot be reproduced from its recorded fields (forged), or
+    an index built from durable provenance evidence finds a genuine
+    conflict: one source row bound to two different events, or one event
+    bound to two different source rows, within what should be a single
+    coherent operation's provenance."""
+
+
+class HistoricalReconciliationError(HistoricalIngestionError):
+    """Raised when historical-ingestion reconciliation cannot complete
+    structurally (a referenced store/source cannot even be read), as
+    opposed to an ordinary structured reconciliation issue, which is a
+    normal, expected, non-raising finding."""
+
+
+class HistoricalVerificationError(HistoricalIngestionError):
+    """Raised by historical-ingestion verification (or a caller
+    consuming its report) when a FATAL cross-consistency check fails and
+    the caller has asked for that to raise rather than merely be
+    reported as an issue."""

@@ -1,6 +1,6 @@
 # Deterministic Market Data Platform and Feature Store (Milestone 10) -- Architecture
 
-## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) delivered
+## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) delivered
 
 ## Primary goal
 
@@ -618,6 +618,116 @@ diagnostic log line, `"Reclaiming unreadable/corrupted dataset lock
 file"`); out of this phase's scope to fix, mitigated the same way M9
 did -- keeping concurrency-test thread/iteration counts modest.
 
+## Historical ingestion orchestration and offline source adapters (Phase 3)
+
+Phase 3 answers "how does externally acquired historical data actually
+get into the Phase 2 repository, with full provenance, deterministically,
+and safely resumable after a crash" -- entirely OFFLINE. No network
+access of any kind: adapters read local files or in-memory fixtures
+only. This layer never connects to Yahoo Finance, FRED, MT5, a broker,
+or any live feed.
+
+**Source-neutral adapter contract** (`adapters.py`). `HistoricalSourceAdapter`
+is a `Protocol` (structural typing) exposing `source_kind()`,
+`source_schema_version()`, `record_kind()`, `content_digest()`,
+`byte_size()`, `describe()`, `iter_records()` -- deterministic iteration
+of `RawSourceRecord` (untyped TEXT fields exactly as read, never a
+prematurely-trusted typed event). An adapter never normalizes, validates,
+or decides final repository identity; that is entirely `orchestration.py`'s
+job. Three adapters are provided: `csv_adapter.py` (configurable column
+mapping, strict/lenient extra-column handling, BOM/quoted-field handling),
+`jsonl_adapter.py` (strict per-`RecordKind` schema, JSON numbers rejected
+for financial fields to avoid a float intermediate, reuses `core.json.
+parse_json_strict` for NaN/Infinity/duplicate-key rejection), and
+`InMemorySourceAdapter` (deterministic, for tests).
+
+**Source manifests** (`source_manifests.py`). `SourceManifest` binds a
+CONTENT DIGEST -- never a filesystem path -- plus references (not
+embedded copies) to the instrument mapping, timeframe mapping, and
+timezone policy that apply to it; changing any of those changes
+`source_manifest_id` transitively. `creation_time`/`row_count` are
+excluded from identity (operational/derived, exactly like `creation_time`
+elsewhere in this package).
+
+**Mapping specs** (`mappings.py`). `InstrumentMappingSpec`/
+`TimeframeMappingSpec` are immutable, versioned, content-addressed --
+NOT a global registry (a caller constructs whatever mapping their own
+operation needs). Provider-specific entries take precedence over a
+provider-wildcard (`provider=None`) entry; an unmapped symbol/timeframe
+fails closed.
+
+**Normalization** (`source_normalization.py`). `parse_source_timestamp`
+requires an explicit `TimestampParsingPolicy` (format list; locale-
+dependent auto-parsing is forbidden) and reuses `historical.timezones.
+localize_broker_timestamps` for DST-ambiguous/nonexistent rejection --
+never re-derived. `parse_source_decimal` never routes through `float`,
+rejects NaN/Infinity/commas, and normalizes signed zero
+(`Decimal("-0")` -> `Decimal("0")`, since the two compare equal but
+serialize differently, which would otherwise silently break content-hash
+determinism).
+
+**Provenance** (`provenance.py`). `ProvenanceRecord` binds a source row
+coordinate (`source_manifest_id` + `row_index`) to the event it produced,
+plus every identity involved (mapping/normalization/batch ids) --
+answering "which source row produced this event" and the reverse,
+independently of any log. `ProvenanceStore.append` is idempotent for an
+EXACT retry and fails closed (`ProvenanceError`) for a conflicting one.
+`dataset_id` is deliberately excluded from identity (a repository-state
+snapshot that can legitimately drift for reasons unrelated to this row;
+see the delivery report's defect list) -- `event_id` is what actually
+matters for conflict detection.
+
+**Quarantine** (`quarantine.py`). `QuarantineRecord` stores the SAFE,
+already-text-only `raw_fields` (never a blob) plus stable, machine-
+readable issue codes (17 total) and a `RetryEligibility` classification
+(RETRYABLE if corrected source content alone could fix it; PERMANENT if
+it needs a config/mapping change). Keyed by the PHYSICAL
+`(source_manifest_id, row_index)` coordinate; `ingestion_batch_id` is
+deliberately excluded from identity so two independent operations
+rediscovering the identical bad row converge instead of conflicting (see
+delivery report).
+
+**Backfill planning** (`backfill.py`). `create_backfill_plan` is a PURE
+function (no I/O) that classifies a requested interval into
+partition-aligned missing/overlapping/gap intervals against
+caller-supplied `existing_covered_partition_keys`, under an
+`OverlapPolicy` (`EXACT_DUPLICATES_ONLY`/`REJECT_ANY_OVERLAP`/
+`ALLOW_LATE_ARRIVAL_NEW_VERSION`) and `GapPolicy`
+(`ALLOW_AND_REPORT`/`REJECT`/`REQUIRE_EXPECTED_MARKET_CALENDAR`, the last
+reusing `calendar.TradingCalendar` directly). Same inputs always produce
+the same `backfill_plan_id` and ordered `batches`.
+
+**Orchestration** (`orchestration.py`). The smallest honest stage
+machine: `SOURCE_VERIFIED -> PLAN_CREATED -> BATCH_RESERVED ->
+ROWS_PARSED -> ROWS_VALIDATED -> EVENTS_NORMALIZED ->
+REPOSITORY_COMMITTED -> PROVENANCE_COMMITTED -> CHECKPOINT_COMMITTED ->
+VERIFIED -> COMPLETED`, with durable per-stage evidence via a single
+mechanism, `OperationStore.advance` (idempotent for an exact retry --
+including a full replay of an already-`COMPLETED` operation from stage
+one -- fails closed for a conflicting one, rejects illegal jumps/
+regressions). The one piece of state that cannot be recomputed fresh on
+every call -- the repository append sequence this operation's events
+must use -- is durably pinned the first time `BATCH_RESERVED` is
+recorded and always reused, so a resumed operation reproduces the exact
+same content-addressed `event_id`s as the original attempt. `dry_run=True`
+performs the identical parse/validate/normalize computation but writes
+nothing; its `resulting_dataset_id` preview reuses the same pure
+digest/manifest functions Phase 2's own commit path uses, so the preview
+always matches a real commit exactly. `replay_ingestion_operation` is a
+thin, explicitly-named alias proving the same call against a fresh
+repository reproduces identical results.
+
+**Reconciliation and verification extensions.** `verification.py` gained
+`verify_source_manifest`/`verify_backfill_plan`/`verify_provenance_store`/
+`verify_quarantine_store`/`verify_historical_ingestion_checkpoint` --
+each recomputes an object's own content id from its own recorded fields
+(forged-identity detection) and, where relevant, cross-checks against the
+repository; none re-reads the original source bytes (the caller's own
+`SOURCE_VERIFIED` stage already does that, the strongest available
+check). `reconciliation.py` gained `reconcile_historical_ingestion_operation`,
+spanning the operation ledger, quarantine store, provenance store,
+checkpoint store, and manifest history for one operation.
+
 ## Known limitations (honestly disclosed)
 
 Phase 1:
@@ -652,6 +762,30 @@ Phase 2:
   additional lock.
 - No CLI surface: library only, matching Phase 1.
 
+Phase 3:
+- CSV candle adapter has no per-row timeframe column (a CSV file always
+  shares one timeframe, declared on `SourceManifest.expected_timeframe`);
+  only JSONL rows carry a per-line `timeframe` field.
+- Reprocessing the exact same source rows under a NEW `operation_id`
+  against an already-populated dataset correctly fails closed
+  (`ProvenanceError`, checked in a pre-flight pass before any repository
+  write) rather than silently duplicating the economic event -- a
+  genuine retry of already-committed rows MUST reuse the SAME
+  `operation_id`; this is a deliberate consequence of sequence numbers
+  being pinned per-operation, not a bug, but it does mean two
+  independently-scheduled operations must coordinate on `existing_
+  covered_partition_keys` (read fresh from the repository) rather than
+  blindly resubmitting the same interval.
+- Gap-policy calendar awareness (`REQUIRE_EXPECTED_MARKET_CALENDAR`)
+  inherits every limitation `calendar.py`/`historical.calendar.
+  TradingCalendar` already discloses for OTC/provider-specific sessions.
+- `DUPLICATE_SOURCE_ROW_COORDINATE` (a repeated `row_index` from a single
+  adapter) is structurally unreachable through any of the three shipped
+  adapters (each assigns `row_index` via `enumerate()`); the check exists
+  defensively and is only reachable via a hand-constructed, adversarial
+  record list in tests.
+- No CLI surface: library only, matching Phases 1 and 2.
+
 ## Future phases (not started)
 
 Session-reset VWAP; Wilder-smoothed ATR/RSI variants; macro-derived
@@ -661,4 +795,6 @@ granularity-changing (daily-to-monthly) compaction; windowed/bounded
 store reads for large-scale partition rebuild; integration with
 `portfolio_risk`/`execution_gateway` as their own authoritative
 market-data source (this milestone explicitly forbade touching either
-package).
+package); real external collectors (Yahoo Finance, FRED, MT5, broker/
+news APIs), live streaming, and CLI expansion (explicitly out of scope
+through Phase 3, reserved for a future milestone).
