@@ -608,3 +608,133 @@ class TestCuratedSpecificSafety:
         assert offenders == [], f"unexpected FRED_API_KEY reference outside acceptance.py: {offenders}"
         source = _collector_combined_source()
         assert not _LONG_LITERAL_API_KEY.search(source)
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 4C: checks specific to `collectors/cross_asset/` --
+# the provider-neutral cross-asset market-driver universe layer.
+# `_collector_source_files()` already reaches this subpackage (it is a
+# RECURSIVE `rglob` over all of `collectors/`), so every check above
+# already covers it; this section adds Phase-4C-specific structural checks
+# the earlier phases had no occasion to need: a bar's raw OPEN time must
+# never be compared directly against a wall-clock-shaped value as if it
+# were proof of point-in-time availability (the exact `curated/`
+# `observation_date` leakage pattern above, replayed for `open_time` --
+# `resolve_bar_availability_time` exists precisely to prevent this), an
+# ETF-form mapping must never be constructible without `is_proxy=True`,
+# a futures-form bar must never be constructible without its required
+# contract/roll provenance, and `ALPHA_VANTAGE_API_KEY` must appear
+# nowhere outside `acceptance.py`.
+# --------------------------------------------------------------------------
+_CROSS_ASSET_ROOT = _COLLECTORS_ROOT / "cross_asset"
+_OPEN_TIME_AS_AVAILABILITY = re.compile(
+    r"\bopen_time\w*\s*(<=|>=|==|<|>)\s*(as_of|planning_time|operation_time|desired_end_time)\b"
+    r"|\b(as_of|planning_time|operation_time|desired_end_time)\s*(<=|>=|==|<|>)\s*open_time\w*\b"
+)
+
+
+def _cross_asset_source_files() -> list[Path]:
+    return sorted(_CROSS_ASSET_ROOT.rglob("*.py"))
+
+
+class TestCrossAssetSpecificSafety:
+    def test_cross_asset_subpackage_is_reached_by_the_scanner(self) -> None:
+        # Guards against a silent path-computation mistake that would make
+        # every check in this class vacuously true by scanning zero files.
+        files = _cross_asset_source_files()
+        assert len(files) >= 15
+        assert any(p.name == "registry.py" for p in files)
+        assert any(p.name == "availability.py" for p in files)
+        assert all(p in _collector_source_files() for p in files)
+
+    def test_no_direct_open_time_used_as_availability_proof(self) -> None:
+        """`open_time` may be PASSED to `resolve_bar_open_time`/
+        `compute_close_time` (legitimate named arguments) but must never
+        be COMPARED directly against a wall-clock-shaped time value
+        anywhere in `cross_asset/` -- doing so would bypass
+        `BarAvailabilityPolicy` resolution entirely and treat candle-open
+        as if it were proof of availability (spec Section 14's own "never
+        mark available at candle open")."""
+        for path in _cross_asset_source_files():
+            text = path.read_text(encoding="utf-8")
+            match = _OPEN_TIME_AS_AVAILABILITY.search(text)
+            assert match is None, f"{path.name} compares open_time directly against a time value: {match.group(0) if match else ''!r}"
+
+    def test_open_time_as_availability_check_is_non_vacuous(self) -> None:
+        bad_snippets = (
+            "if bar.open_time <= as_of:\n",
+            "visible = open_time_value >= planning_time\n",
+            "if desired_end_time < open_time:\n",
+        )
+        for snippet in bad_snippets:
+            assert _OPEN_TIME_AS_AVAILABILITY.search(snippet), f"scanner failed to catch: {snippet!r}"
+
+    def test_legitimate_availability_time_comparison_is_not_flagged(self) -> None:
+        """The CORRECT pattern (comparing the RESOLVED `availability_time`,
+        never the raw `open_time`, against `as_of`) must not be flagged --
+        proves the check is precise, not merely banning the phrase
+        "open_time" from ever appearing near a comparison."""
+        good_snippet = "visible = bar.availability_time <= as_of\n"
+        assert not _OPEN_TIME_AS_AVAILABILITY.search(good_snippet)
+
+    def test_no_secret_in_any_cross_asset_module(self) -> None:
+        """`acceptance.py` is the ONE sanctioned place in `cross_asset/`
+        that reads `ALPHA_VANTAGE_API_KEY` from the environment --
+        confirmed here to be the ONLY cross_asset module naming that env
+        var (`providers/alpha_vantage.py` merely DECLARES the constant
+        name, never reads the environment itself), and that no
+        cross_asset module hardcodes a credential-shaped literal."""
+        offenders = [
+            p.name for p in _cross_asset_source_files()
+            if p.name not in ("acceptance.py", "alpha_vantage.py") and "ALPHA_VANTAGE_API_KEY" in p.read_text(encoding="utf-8")
+        ]
+        assert offenders == [], f"unexpected ALPHA_VANTAGE_API_KEY reference outside acceptance.py/alpha_vantage.py: {offenders}"
+        for path in _cross_asset_source_files():
+            if path.name == "acceptance.py":
+                continue
+            assert "os.environ" not in path.read_text(encoding="utf-8"), f"{path.name} reads os.environ directly -- only acceptance.py may"
+        source = _collector_combined_source()
+        assert not _LONG_LITERAL_API_KEY.search(source)
+
+    def test_etf_form_cannot_be_constructed_without_proxy_true(self) -> None:
+        """Behavioral (not merely static) confirmation of spec Section 5's
+        "No code may label a proxy instrument as the underlying it
+        approximates" -- an ETF-form mapping structurally REJECTS
+        `is_proxy=False` at construction."""
+        from quant_platform.core.exceptions import SymbolMappingError
+        from quant_platform.market_data.collectors.cross_asset.adjustment import AdjustmentPolicyKind
+        from quant_platform.market_data.collectors.cross_asset.instrument_form import (
+            InstrumentForm,
+            create_proxy_policy,
+        )
+        from quant_platform.market_data.collectors.cross_asset.symbol_mapping import (
+            create_provider_symbol_mapping,
+        )
+
+        with pytest.raises(SymbolMappingError):
+            create_provider_symbol_mapping(
+                provider="p", provider_symbol="X", canonical_driver_id="d", instrument_form=InstrumentForm.ETF, currency="USD",
+                adjustment_policy_kind=AdjustmentPolicyKind.RAW_UNADJUSTED, proxy_policy=create_proxy_policy(is_proxy=False),
+            )
+
+    def test_provider_continuous_futures_bar_cannot_be_constructed_without_roll_provenance(self) -> None:
+        """Behavioral confirmation of spec Section 12's "never silently
+        stitch" -- a `PROVIDER_CONTINUOUS_FUTURES` bar structurally
+        REJECTS a missing `roll_provenance`."""
+        from datetime import datetime, timezone
+        from decimal import Decimal
+
+        from quant_platform.core.exceptions import MarketRecordError
+        from quant_platform.core.types import Timeframe
+        from quant_platform.market_data.collectors.cross_asset.instrument_form import InstrumentForm
+        from quant_platform.market_data.collectors.cross_asset.market_record import create_market_driver_bar
+
+        with pytest.raises(MarketRecordError):
+            create_market_driver_bar(
+                canonical_driver_id="wti_crude", provider="p", provider_symbol="CL1!", instrument_form=InstrumentForm.PROVIDER_CONTINUOUS_FUTURES,
+                open_time=datetime(2024, 1, 5, tzinfo=timezone.utc), timeframe=Timeframe.D1, open=Decimal("75"), high=Decimal("76"),
+                low=Decimal("74"), close=Decimal("75.5"), volume=None, volume_unit="native",
+                availability_time=datetime(2024, 1, 6, tzinfo=timezone.utc), availability_policy_id="a" * 64, session_policy_id="s" * 64,
+                adjustment_policy_id="j" * 64, request_manifest_id="r" * 64, response_manifest_id="p" * 64, source_manifest_id="c" * 64,
+                source_row_index=0, roll_provenance=None,
+            )

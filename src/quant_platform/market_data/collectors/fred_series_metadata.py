@@ -4,15 +4,16 @@ observations`, which `fred.py` already covers). Mirrors `fred.py`'s own
 discipline exactly: strict, text-only parsing (never through float),
 zero duplication of the transport/retry/rate-limit attempt loop.
 
-REUSE, NOT DUPLICATION: `fred._build_transport_request` already builds
-its URL from `manifest.endpoint_host`/`manifest.endpoint_path`/
-`manifest.canonical_query_params` -- nothing about it is
-observations-specific -- and `fred.execute_fred_request`'s attempt loop
-only ever touches `request_manifest`/`response_manifest`, never an
-observations-specific field. Both are reused UNCHANGED here; this
-module supplies only what is genuinely different: the metadata
-endpoint path, its own query-parameter shape, and its own strict
-response schema."""
+REUSE, NOT DUPLICATION: `execute_request.build_transport_request`
+(Milestone 10, Phase 4C: extracted from `fred.py`, where it originally
+lived as a private helper) already builds its URL from `manifest.
+endpoint_host`/`manifest.endpoint_path`/`manifest.canonical_query_params`
+-- nothing about it is observations-specific -- and `fred.
+execute_fred_request`'s attempt loop only ever touches `request_manifest`/
+`response_manifest`, never an observations-specific field. Both are
+reused UNCHANGED here; this module supplies only what is genuinely
+different: the metadata endpoint path, its own query-parameter shape,
+and its own strict response schema."""
 
 from __future__ import annotations
 

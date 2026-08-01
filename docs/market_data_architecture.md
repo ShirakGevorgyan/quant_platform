@@ -1,6 +1,6 @@
 # Deterministic Market Data Platform and Feature Store (Milestone 10) -- Architecture
 
-## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) + Phase 4A (secure external historical collector infrastructure and FRED integration) + Phase 4B (curated FRED macro universe and verified historical backfill workflow for XAUUSD research) delivered
+## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) + Phase 4A (secure external historical collector infrastructure and FRED integration) + Phase 4B (curated FRED macro universe and verified historical backfill workflow for XAUUSD research) + Phase 4C (provider-neutral cross-asset historical market collectors and curated XAUUSD market-driver universe) delivered
 
 ## Primary goal
 
@@ -810,7 +810,9 @@ walks every `@dataclass` in the subpackage and confirms none declares a
 credential-shaped field -- see "Safety scan" below). A manifest records
 only `credential_mode: "anonymous" | "api_key"`, never a secret value or
 a secret-derived digest. The real key reaches exactly one place: the
-in-flight `TransportRequest.url` built by `fred._build_transport_request`,
+in-flight `TransportRequest.url` built by `execute_request.
+build_transport_request` (Phase 4C: extracted from `fred.py`, where it
+originally lived as a private helper -- see that phase's own section),
 never logged, printed, or persisted as a whole object.
 
 **Request/response manifests** (`request_manifest.py`/
@@ -1094,9 +1096,10 @@ scope decision, not an oversight.
 `metadata.py`). `FRED_SERIES_ENDPOINT_PATH = "/fred/series"` (metadata)
 is a SEPARATE endpoint from Phase 4A's `/fred/series/observations`;
 `execute_fred_series_metadata_request` is a THIN ALIAS for `fred.
-execute_fred_request` (zero duplication -- `_build_transport_request`
-already builds URLs generically from `manifest.endpoint_host/
-endpoint_path/canonical_query_params`, so the same attempt loop serves
+execute_fred_request` (zero duplication -- `execute_request.
+build_transport_request` already builds URLs generically from
+`manifest.endpoint_host/endpoint_path/canonical_query_params`, so the
+same attempt loop serves
 both endpoints). `parse_fred_series_metadata_response` is PARSE-ONLY
 (mirrors `fred_schemas.py`'s own layering) and never compares the
 returned `series_id` against a "requested" one -- that drift decision
@@ -1349,6 +1352,572 @@ path), and running it in two child interpreters under DIFFERENT explicit
 `hash()`/dict-iteration order, only on `compute_content_id`'s canonical,
 sorted-key JSON + sha256).
 
+## Provider-neutral cross-asset historical market collectors and curated XAUUSD market-driver universe (Phase 4C)
+
+**Primary goal.** Deliver a provider-neutral, deterministic,
+point-in-time-aware historical market-data collection layer for the
+CROSS-ASSET variables that influence XAUUSD (US dollar strength, WTI and
+Brent crude, silver, and the gold reference market itself, plus five
+strong-optional regime/secondary concepts) -- distinct from Phase 4B's
+FRED MACRO universe: this phase collects tradable-instrument market bars
+(OHLCV), not economic-release observations, and the provider surface is
+architected to support MULTIPLE providers/instrument forms per concept
+from day one, unlike Phase 4B's single-source FRED design.
+
+**Package boundary.** Entirely new subpackage,
+`collectors/cross_asset/` (13 core modules + `providers/alpha_vantage.py`
++ package `__init__.py` = 22 files, ~2,300 lines): `instrument_form.py`,
+`adjustment.py`, `sessions.py`, `futures.py`, `availability.py`,
+`registry.py`, `symbol_mapping.py`, `market_record.py`, `protocols.py`,
+`market_normalization.py`, `market_backfill.py`, `datasets.py`,
+`gap_policy.py`, `market_orchestration.py`, `update_plan.py`,
+`market_reconciliation.py`, `market_verification.py`,
+`market_reports.py`, `acceptance.py`. One shared, provider-neutral
+extraction lives one level up: `collectors/execute_request.py`
+(`CollectorRequestExecution`, `build_transport_request`,
+`execute_collector_request`) -- Phase 4A's `fred.py` attempt loop was
+ALREADY 100% provider-neutral in its actual implementation (no
+FRED-specific logic anywhere in it), so this phase promotes it to a
+shared home rather than duplicating it a second time; `fred.
+execute_fred_request` is now a THIN ALIAS of `execute_collector_request`
+(confirmed zero behavioral change via a full Phase 1-4B regression
+re-run before and after the extraction). No file outside
+`collectors/cross_asset/` (and this one shared extraction) was modified
+except two stale-docstring-reference fixes and two narrow, additive
+`DatasetKind`/`SourceKind`/`RecordKind`/exception additions (below).
+`ml`/`execution_gateway`/`portfolio_risk`/`paper_trading`/`backtesting`/
+`optimization`/`robustness` were not touched.
+
+**Provider selection** (bounded assessment against OFFICIAL
+documentation only, never remembered/guessed behavior). Three
+candidates assessed: **Stooq** disqualified outright -- no official,
+documented API exists, only reverse-engineered CSV endpoints (exactly
+the "undocumented endpoint guessing" this phase's scope forbids).
+**Alpha Vantage** and the **EIA Open Data API** are both officially
+documented; Alpha Vantage's `TIME_SERIES_DAILY` endpoint was
+additionally LIVE-VERIFIED via a real HTTPS `GET` against the
+provider's own public `demo` key (confirmed the exact JSON envelope
+shape this phase's adapter parses, and confirmed the `demo` key is
+restricted to a small fixed symbol set, `IBM` only -- not a general
+free-tier credential). The EIA route structure was confirmed live via a
+real `API_KEY_MISSING` 403 JSON error, but no actual data response was
+obtainable without registering a real account, which this phase
+declines to do autonomously (a consequential external-identity action
+requiring the user's own involvement). Alpha Vantage's dedicated
+commodity endpoints (`WTI`/`BRENT`/`GOLD_SILVER_SPOT`) exist in official
+documentation but could not be live-verified the same way (the `demo`
+key does not cover them) -- **this phase implements ONLY the ONE
+endpoint that was genuinely, live-verified: `TIME_SERIES_DAILY`**, used
+exclusively for ETF-form PROXY instruments. Free tier confirmed via the
+provider's own pricing page: 25 requests/day. This is a deliberately
+conservative, self-imposed narrowing beyond what the spec strictly
+requires, justified by "do not fabricate an integration."
+
+**Instrument-form and proxy semantics** (`instrument_form.py`) -- the
+central discipline this phase's package exists to enforce: an economic
+CONCEPT (e.g. "WTI crude oil") is never the same object as a specific
+tradable INSTRUMENT FORM that approximates it. `InstrumentForm` (8
+values: `SPOT`, `CASH_INDEX`, `EXCHANGE_FUTURES_CONTRACT`,
+`PROVIDER_CONTINUOUS_FUTURES`, `ETF`, `EQUITY`, `SYNTHETIC_INDEX`,
+`ECONOMIC_PROXY`) names the SHAPE of the tradable object; `ProxyPolicy`
+(`is_proxy`, `proxy_for`, `proxy_quality: HIGH|MODERATE|LOW`, plus six
+free-text risk-disclosure fields for basis/roll/tracking-error/currency/
+session/adjustment differences) names how faithfully it approximates the
+concept. `ProxyPolicy.__post_init__` structurally enforces `proxy_for`/
+`proxy_quality` required iff `is_proxy=True`, forbidden otherwise --
+`create_proxy_policy` does NOT duplicate this check itself, so every
+violation surfaces through exactly one exception type
+(`InstrumentFormError`) regardless of construction path (a real
+inconsistency was found and fixed here during this phase's own test
+authoring: the factory originally raised a different, generic exception
+than the dataclass's own guard for the identical violation).
+
+**Curated cross-asset driver registry** (`registry.py`). Mirrors Phase
+4B's `curated.registry` keyed-set pattern exactly: `CuratedMarketDriverSpec`
+is a per-ECONOMIC-CONCEPT value object (`canonical_driver_id`,
+`canonical_name`, `registry_version`, `tier: DriverTier`, `economic_role`,
+`is_required`, `asset_class`, `preferred_instrument_form`,
+`allowed_instrument_forms`, `canonical_currency`, `canonical_quote_unit`,
+`expected_frequency`, `session_policy_id`, `adjustment_policy_id`,
+`availability_policy_id`, `continuation_policy_id` (futures forms only),
+`provider_mapping_ids`, `enabled`, `notes`); `CuratedMarketDriverRegistry`
+ALWAYS sorts by `canonical_driver_id` before computing `registry_id`, so
+identity AND iteration order are both independent of declaration order.
+`DriverTier` has four values: `CORE_XAUUSD_MARKET_DRIVER`,
+`SECONDARY_MARKET_DRIVER`, `REGIME_CONTEXT`, `EXPERIMENTAL`. Construction
+rejects: duplicate ids/names, empty/duplicate `allowed_instrument_forms`,
+`preferred_instrument_form` not in `allowed_instrument_forms`, a futures
+form present without `continuation_policy_id` (and vice versa), `enabled`
+without a non-empty `provider_mapping_ids`, and -- via `create_curated_
+market_driver_spec`'s own semantic check (it accepts the RESOLVED
+`AdjustmentPolicy` object, not merely an id, specifically to enforce
+this) -- an ETF/equity-allowing spec declaring a non-equity-like
+adjustment kind.
+
+**The 10 curated concepts** (`default_core_market_driver_specs`/
+`default_optional_market_driver_specs`, mirroring Phase 4B's
+`default_core_series_specs`/`default_extended_series_specs` shape --
+pure factories taking policy ids/objects and a `provider_mapping_ids_
+by_driver` dict, never constructing a module-level singleton): 5
+MANDATORY core drivers (`us_dollar_strength`, `wti_crude`,
+`brent_crude`, `silver`, `gold_reference`; `is_required=True` on every
+one, `tier=CORE_XAUUSD_MARKET_DRIVER`) and 5 strong-optional drivers
+(`us_equity_market_stress`, `treasury_volatility`,
+`broad_commodity_index`, `copper_industrial_growth`, `gold_miner_equity`;
+`is_required=False`). `enabled` is derived from whether the caller
+actually supplied a provider mapping for that driver id -- a required
+concept EXISTS in the registry even when this phase's own provider
+cannot supply it. Of the 10, **9 are mapped to real Alpha Vantage ETF
+proxies this phase** (`UUP`, `USO`, `BNO`, `SLV`, `GLD`, `VIXY`, `DBC`,
+`CPER`, `GDX`); **`treasury_volatility` ships UNSUPPORTED AND
+FAIL-CLOSED** -- no single-ticker ETF with a defensible, disclosable
+tracking relationship to Treasury-market implied volatility (the MOVE
+index has no directly investable ETF) was identified through this
+phase's shipped provider; the concept is documented so it exists for a
+future phase, with `enabled=False`/`provider_mapping_ids=()`, and no
+mapping is fabricated to fill the gap.
+
+**Provider symbol mapping** (`symbol_mapping.py`). `ProviderSymbolMapping`
+binds provider + provider_symbol + canonical_driver_id + instrument_form
++ exchange_or_venue + currency + adjustment_policy_kind +
+continuation_policy_id + mapping_version + proxy_policy into one
+content-addressed identity. Structural guards: a futures-form mapping
+REQUIRES `continuation_policy_id` (and a non-futures form forbids it);
+**an ETF-form mapping structurally REQUIRES `proxy_policy.is_proxy=True`**
+-- an ETF can never be labeled the literal underlying it tracks (spec
+Section 5's "no code may label a proxy instrument as the underlying it
+approximates", also exercised as a dedicated safety-scan behavioral
+check, see below). `SymbolMappingSet` validates the cross-mapping
+invariant no single mapping's own `__post_init__` can check alone: one
+`(provider, provider_symbol, mapping_version)` cannot resolve to two
+DIFFERENT `canonical_driver_id`s -- an alias change is expressed as a
+NEW mapping version, never an in-place edit.
+
+**Adjustment policy** (`adjustment.py`). Five kinds:
+`RAW_UNADJUSTED` (this phase's shipped adapter's only produced kind --
+Alpha Vantage's `TIME_SERIES_DAILY` is documented as raw/as-traded),
+`SPLIT_ADJUSTED`, `TOTAL_RETURN_ADJUSTED`,
+`PROVIDER_ADJUSTED_UNVERIFIED`, `NOT_APPLICABLE` (spot/index/futures --
+no corporate action to adjust for). No corporate-action arithmetic is
+ever performed; a policy CHANGE changes dataset identity.
+
+**Timezone and session policy** (`sessions.py`). `TimezoneSessionPolicy`
+carries `timezone_key` (validated against a small allowlist), session
+open/close times or `is_24_hour_session`, `CandleTimestampConvention`
+(`OPEN_LABELED`/`CLOSE_LABELED` -- whether a provider's own daily-bar
+date labels the session OPEN or CLOSE), a trading-week note, an optional
+holiday-calendar reference, and a free-text `provider_session_note`
+disclosing the PROVIDER's own documented session semantics -- never an
+invented centralized-exchange truth. `market_normalization.
+resolve_bar_open_time` is the pure function that interprets a provider's
+raw date text into a genuine UTC open timestamp, honoring both
+`is_24_hour_session` and the timestamp convention; two curated concepts
+under different `TimezoneSessionPolicy`s (e.g. an NYSE ETF vs. an
+Asia/Tokyo-session fixture) resolve materially different UTC open times
+for the identical calendar date -- confirmed directly in tests and
+exercised end-to-end in the mandatory fixture-acceptance universe.
+**Known constraint**: `TimezoneSessionPolicy` is a per-DRIVER-SPEC
+field, not per-mapping -- a driver with multiple mappings from different
+providers currently shares one session policy across all of them; a
+genuinely different per-mapping session would need a registry_version
+split or a future schema extension.
+
+**Futures contract and continuation policy** (`futures.py`).
+`FuturesContractMetadata` models ONE specific, individually identified
+contract (root/full symbol, exchange, expiry, optional first-notice/
+last-trade dates, contract month/year, multiplier, quote unit, currency,
+tick size, session timezone) -- rejected outright if result-critical
+fields are missing; a provider that cannot supply this must be
+classified `PROVIDER_CONTINUOUS_FUTURES` instead of a policy asserting
+individual-contract knowledge it does not have. `ContinuationPolicyKind`
+has 6 values (`PROVIDER_NATIVE_CONTINUOUS`,
+`FRONT_MONTH_NO_BACK_ADJUSTMENT`, `ROLL_ON_FIXED_DAYS_BEFORE_EXPIRY`,
+`ROLL_ON_VOLUME_CROSSOVER`, `BACK_ADJUSTED_DIFFERENCE`,
+`RATIO_ADJUSTED`); `require_adjustment_evidence` structurally guards
+that a `BACK_ADJUSTED_DIFFERENCE`/`RATIO_ADJUSTED` continuation never
+produces a bar without its own `RollProvenance.adjustment_amount`/
+`adjustment_ratio` evidence. `RollProvenance` (active/prior/next
+contract symbols, roll timestamp text, adjustment amount/ratio,
+continuation_policy_id) is attached to every bar of a continuous series
+-- never optional for a `PROVIDER_CONTINUOUS_FUTURES`-form bar (a
+structural `MarketRecordError` guard on `MarketDriverBar` itself, also
+exercised as a dedicated safety-scan behavioral check). This phase's
+shipped provider maps no futures instrument -- the futures/continuation
+code paths are exercised end-to-end through the mandatory fixture
+universe's synthetic `FakeMarketCollector` (below), never against a real
+provider this phase.
+
+**Point-in-time availability** (`availability.py`) -- mirrors Phase 4B's
+`curated.availability`'s own discipline exactly for market bars.
+`resolve_bar_availability_time` is STRUCTURALLY fail-closed: every
+branch resolves a concrete, timezone-aware datetime `>= bar_close_time`
+or raises `MarketAvailabilityUnresolvedError`; no branch can silently
+default to "available at candle open." Three kinds:
+`CLOSE_PLUS_CONSERVATIVE_DELAY` (this phase's shipped adapter's own
+policy -- a delay of `0` still requires close to have actually passed,
+never open), `NEXT_SESSION_OPEN_CONSERVATIVE`, `EXPLICIT_PUBLICATION_
+DELAY_MINUTES`. The caller must derive `bar_close_time` itself (via
+`core.time_utils.compute_close_time`) before calling -- the function
+never derives a close time on its own, only the availability delay atop
+one.
+
+**Raw and canonical market-bar records** (`market_record.py`).
+`RawMarketRecord` holds provider text UNPARSED (every financial field
+stays TEXT until normalization parses it directly to `Decimal`, never
+through `float`). `MarketDriverBar` is a deliberately NEW, materially
+richer record type -- NOT Phase 1's sequence-based `candles.Candle` --
+carrying canonical-driver/instrument-form/proxy/adjustment/futures-
+contract/continuation/availability semantics `Candle`'s envelope was
+never shaped to hold (the same "build a new record type rather than
+force-fit" precedent Phase 4B already established for
+`CuratedMacroObservation` vs. `macro.MacroEvent`). Validates: `high >=
+low`, `open`/`close` within `[low, high]`, `low > 0`, `volume >= 0` or
+`None` (never coerced to zero), `availability_time >= close_time`,
+futures-form requires `contract_metadata_id`, provider-continuous
+requires `roll_provenance`. `bar_id` identity includes `request_
+manifest_id`/`response_manifest_id`/`source_manifest_id`/`source_row_
+index` -- the SAME provenance-in-identity precedent Phase 4B's
+`CuratedMacroObservation.observation_id` already established (a bar "as
+observed in this specific response" is the identity unit, not merely
+its OHLCV values; two independent fetches of the economically-identical
+bar via different responses legitimately mint different `bar_id`s --
+see the Gap policy subsection below for why this matters and how it is
+handled). `MarketDriverBarStore` is purely content-addressed
+append-only, mirroring `curated.macro_observation.CuratedObservationStore`
+exactly, including its `append_many_and_read_all` atomic-lock-held
+append-then-read hardening (applied proactively here from the start,
+not discovered via a bug this time).
+
+**Provider-neutral collector contract** (`protocols.py`).
+`HistoricalMarketCollector` is a structural `Protocol` (mirrors
+`collectors.protocols.HistoricalHttpTransport`'s own convention):
+`provider_metadata()`, `supported_capabilities()`, `build_metadata_
+request(...)`, `build_history_request(...)`, `parse_metadata_
+response(...)`, `parse_history_response(...)`. `MarketCollectorCapabilities`
+declares candles/quotes/trades/adjusted/unadjusted/corporate-actions/
+futures-contracts/continuous-futures/pagination/anonymous-access support,
+whether a runtime credential is required, max interval/rows-per-page,
+supported granularities, and supported instrument forms.
+`require_within_capabilities` is the orchestrator's own fail-closed gate,
+called BEFORE any request is built -- REJECTS a request exceeding
+declared capabilities, never silently downgrading interval, adjustment
+mode, or instrument semantics.
+
+**Alpha Vantage adapter** (`providers/alpha_vantage.py`). The ONE
+concrete provider adapter this phase ships. `build_metadata_request`
+and `build_history_request` return the IDENTICAL request manifest --
+Alpha Vantage has no separate metadata endpoint for `TIME_SERIES_DAILY`
+(metadata and data arrive in ONE response), documented as an honest
+provider limitation; orchestration detects this (`request_manifest_id`
+equality) and fetches once, reusing the same response for both.
+`_parse_daily_envelope` fails closed on the provider's own `Information`/
+`Error Message`/`Note` top-level error/rate-limit keys rather than
+treating them as an empty-but-valid response.
+`parse_alpha_vantage_daily_records` sorts dates ASCENDING for
+deterministic `source_sequence` assignment (the provider's own response
+order is descending). Capabilities: `supported_instrument_forms=(ETF,
+EQUITY)`, `unadjusted_data_supported=True`/`adjusted_data_supported=
+False`, `futures_contracts_supported=False`/`continuous_futures_
+supported=False`, `runtime_credential_required=True`,
+`max_interval_days_per_request=None`/`max_rows_per_page=None` (one call
+returns the provider's ENTIRE available history when `outputsize=full`
+is requested; there is no server-side date-range filter to request a
+narrower window -- a caller-side `max_records_per_mapping` bound in
+`MarketBackfillSpec` is what actually caps ingestion size).
+
+**Raw-to-canonical normalization** (`market_normalization.py`). Pure,
+mirrors `curated.orchestration._normalize_curated_row`'s own contract
+exactly: `normalize_raw_market_record` never raises for an ordinary
+malformed row (quarantines instead via `INVALID_MARKET_RECORD`/
+`MISSING_MARKET_VOLUME` issue codes), reused UNCHANGED by both
+orchestration and independent verification.
+
+**Curated market backfill spec** (`market_backfill.py`).
+`MarketBackfillSpec` binds `selected_driver_ids` (the ECONOMIC CONCEPTS
+being backfilled) SEPARATELY from `selected_mapping_ids` (the EXACT
+provider surfaces supplying them) -- deliberate: more than one mapping
+per driver is permitted (the cross-provider conflict model depends on
+this; fetching the same concept from two providers simultaneously is a
+caller's explicit choice, never an automatic behind-the-scenes
+arbitration). `create_market_backfill_spec` validates every selected
+mapping against a `CuratedMarketDriverRegistry` AND a `SymbolMappingSet`
+(unknown driver, disabled driver, unknown mapping, disabled mapping, or
+a mapping belonging to a driver outside `selected_driver_ids` are all
+rejected) before a spec can even exist. `MarketCachePolicy` has two
+values, `PREFER_CACHE`/`FORCE_FRESH`, mirroring Phase 4B's own
+`CachePolicy`.
+
+**Multi-mapping orchestration** (`market_orchestration.py`, ~600
+lines). The 12-stage state machine spec Section 18 requires, exactly:
+`REGISTRY_VERIFIED -> PLAN_CREATED -> PROVIDER_METADATA_VERIFIED ->
+REQUESTS_COMMITTED -> RESPONSES_COMMITTED -> RAW_RECORDS_PARSED ->
+RECORDS_NORMALIZED -> COMPONENT_DATASETS_COMMITTED -> COMBINED_
+MANIFEST_COMMITTED -> RECONCILED -> VERIFIED -> COMPLETED`.
+`CrossAssetOperationStage`/`CrossAssetOperationStore` are a
+self-contained THIRD stage-machine implementation (after Phase 3's
+`OperationStore` and Phase 4A's `CollectorOperationStore`, following
+Phase 4B's own `CuratedOperationStore` precedent), duplicating the SAME
+proven idempotent/conflict/monotonic-progression algorithm, scoped to
+`target_dataset_namespace`. PROVIDER-NEUTRAL BY CONSTRUCTION: depends
+only on `HistoricalMarketCollector`'s structural shape --
+`collectors_by_provider`/`allowed_hosts_by_provider` let one operation
+span mappings served by DIFFERENT providers simultaneously (exercised
+directly in tests: a real `AlphaVantageCollector` and a synthetic
+fixture provider committing to the SAME operation). Per mapping: capability
+check -> provider metadata fetch+verify (symbol/driver/instrument-form/
+currency/exchange/granularity fail-closed comparisons against the
+mapping's own declared fields; a field the provider leaves undisclosed,
+e.g. Alpha Vantage's `currency=None`, is skipped, never treated as an
+automatic pass) -> history fetch (reusing the metadata response when the
+request manifests are identical) -> raw parse -> per-row normalize/
+quarantine -> a candidate-batch conflicting-duplicate-coordinate
+pre-commit check (fail-closed via `_MappingFailureError`, respects
+`fail_fast`) -> commit to `MarketDriverBarStore` -> a FULL, post-commit
+conflicting-duplicate-coordinate re-check across the ENTIRE now-durable
+bar set (raises `MarketProviderResponseError` directly, UNCONDITIONALLY,
+regardless of `fail_fast` -- once a bar is durably appended, the
+append-only store cannot roll it back, so a corruption signal here must
+escalate loudly no matter what) -> component manifest -> provenance.
+`backfill_spec.fail_fast=True` raises immediately on the first mapping
+failure, committing nothing for ANY mapping; `fail_fast=False` records
+each mapping's own outcome independently, and the combined manifest's
+`completeness_status` reflects the registry's OWN required-driver
+tracking (never merely "every selected mapping succeeded" -- a universe
+that only ever selects a SUBSET of the registry's required drivers
+correctly stays `PARTIAL`, confirmed directly in tests). Known,
+disclosed simplification: `contract_metadata_id_by_mapping`/`roll_
+provenance_by_mapping` (when supplied) apply the SAME futures identity
+to every bar produced for that mapping in ONE call -- adequate for this
+phase's fixture coverage, not a general per-row roll resolver.
+
+**Gap and conflict analysis** (`gap_policy.py`). `analyze_bar_gaps` is
+PURE, scoped to one `(canonical_driver_id, provider, provider_symbol)`
+coordinate space. Missing-bar detection uses a Mon-Fri BUSINESS-DAY
+heuristic (`calendar_assurance="limited"`, always, honestly disclosed --
+no holiday calendar is loaded this phase; a legitimate weekday holiday
+will be flagged as a candidate missing bar, a KNOWN limitation, never
+silently presented as verified). A genuine weekend closure is never
+reported missing. 24-hour sessions report zero missing-bar candidates
+(no weekday-closure assumption applies) rather than inventing an
+unverified continuous-session expectation. **Conflicting-duplicate-
+coordinate detection compares ECONOMIC CONTENT** (open/high/low/close/
+volume/volume_unit/adjustment_policy_id/availability_time/availability_
+policy_id/session_policy_id/contract_metadata_id/roll_provenance), NOT
+`bar_id` -- this was a genuine defect found and fixed during this
+phase's own test authoring: since `bar_id` embeds provenance
+(response_manifest_id etc.), the SAME economically-identical bar
+re-fetched under a legitimately different response (e.g. a `FORCE_
+FRESH` refetch whose envelope happens to include one more trailing row)
+mints a different `bar_id`, and a naive `bar_id`-based conflict check
+would have misclassified that harmless re-fetch as a data-integrity
+violation. `GapPolicy` (4 values: `ALLOW_AND_REPORT`,
+`QUARANTINE_COMPONENT`, `FAIL_REQUIRED_DRIVER`, `FAIL_UNIVERSE`) governs
+only MISSING bars -- conflicting duplicates are never a policy choice,
+always a hard integrity failure (see Orchestration above).
+
+**Dataset layout** (`datasets.py`). Mirrors `curated.datasets` exactly,
+one level more granular: one immutable `ComponentMarketDatasetManifest`
+per `ProviderSymbolMapping` (a mapping already binds provider +
+provider_symbol + canonical_driver_id + instrument_form + currency +
+adjustment + continuation + version -- exactly the granularity the spec
+requires components to never be merged across), `conflicting_coordinate_
+count` structurally REQUIRED to be `0` at construction (a component with
+unresolved conflicts can never be committed). `CombinedCrossAssetManifest`
+binds `component_manifest_ids` keyed by `mapping_id`, a
+`driver_id_by_mapping` back-reference, `required_driver_ids`/`missing_
+required_driver_ids` (recomputed as `required - satisfied`, where
+`satisfied` is the set of driver ids with at least one successful
+component THIS combined manifest binds), and enforces at construction
+that `missing_required_driver_ids` non-empty implies
+`completeness_status=PARTIAL` -- a universe missing a required driver
+can structurally never claim `COMPLETE`. Both stores are versioned
+purely by append-position (`len(history)`), with idempotent no-op
+appends on an identical id, matching `curated.datasets`'s own precedent.
+
+**Cross-provider conflict model** (folded into `market_reconciliation.
+py`, spec Section 20). When more than one mapping in a combined manifest
+serves the SAME `canonical_driver_id`, overlapping bars (by `open_time`)
+are compared deterministically: exact equality (identical `close`),
+tolerance-level difference (`|close_a - close_b| / max(|close_a|,
+|close_b|, 1) <= PRICE_TOLERANCE_RATIO`, a deliberately conservative
+0.5% constant), or material conflict (anything else) -- reported as
+`WARNING`-severity issues, never silently averaged or auto-resolved;
+every component dataset stays independently readable.
+
+**Incremental update planning** (`update_plan.py`). PURE and
+deterministic, mirrors `curated.update_plan` exactly: NEVER reads the
+wall clock, NEVER touches the network. `MappingUpdateAction` has three
+values: `NO_UPDATE_NEEDED`, `APPEND_BARS`, `POLICY_REFRESH` (triggered
+when the mapping's OWN `adjustment_policy_kind`/`continuation_policy_id`
+no longer matches what the CURRENT component manifest was built under --
+Phase 4B's `REVISION_REFRESH` analog, since cross-asset has no single
+global "revision policy" the way FRED does). Each entry additionally
+carries `needs_futures_roll_refresh: bool` (spec Section 22's own
+"futures-roll refresh needs") -- an honest flag for any futures-form
+mapping, never a computed roll decision this module does not have
+evidence for. The exact-no-op guarantee is the SAME two-layer proof
+Phase 4B established: this module's own job is only to REPORT
+`NO_UPDATE_NEEDED` correctly; `ComponentMarketDatasetManifestStore.
+append`'s own idempotent no-op-on-identical-id behavior independently
+guarantees no new version is minted even if a caller runs the backfill
+anyway.
+
+**Reconciliation** (`market_reconciliation.py`) and **verification**
+(`market_verification.py`). Reconciliation re-derives coverage/bar
+counts from the actual `MarketDriverBarStore`, cross-checks provenance
+completeness (bar without provenance / provenance without bar / duplicate
+coordinate), and runs the cross-provider conflict model above.
+Verification mirrors `curated.verification`'s own discipline: EVERY
+check REDERIVES an artifact fresh from durable state (re-read raw
+bytes, re-hash, re-parse via the SAME collector, re-normalize, re-derive
+component/combined manifest ids) using the exact same PURE functions
+orchestration used, never trusting a cached parse or a stored count.
+INDEPENDENCE CLASSIFICATION (documented in the module's own docstring,
+per spec Section 27): the reparse/renormalize checks are structurally
+independent of orchestration's OWN RUN but NOT independent of the
+provider adapter's OWN parsing implementation -- a bug inside `providers/
+alpha_vantage.py` itself would not be caught here (that risk is instead
+covered by the dedicated adversarial tamper tests); the remaining
+registry/mapping/manifest self-identity and completeness checks are
+fully structurally independent, requiring no provider-specific code at
+all.
+
+**Reports** (`market_reports.py`). Mirrors `collectors.reports`'s own
+convention exactly: every function wraps an already-produced object
+into a stable, deterministic dict, never re-deriving new facts.
+`generate_quarantine_summary_report`/`generate_provenance_summary_report`
+are re-exported UNCHANGED from `collectors.reports`. No report function
+anywhere in this module accepts a raw credential as an argument, and
+every dict is assembled purely from objects that are themselves
+structurally secret-free.
+
+**Offline replay.** No separate `replay.py` module exists -- exactly
+matching Phase 4B's own precedent: replay is simply re-running
+`run_cross_asset_backfill_operation` with `transport=None`, which
+STRUCTURALLY guarantees zero network calls (the fetch path only reaches
+the transport branch on a cache miss, and `transport=None` there raises
+before any call is attempted) -- a STRONGER guarantee than "transport
+fails when invoked," since it can never be invoked at all. Proven
+directly in tests via both the `transport=None` path and an explicit
+`_ForbiddenTransport` double that raises `AssertionError` on any
+`.get()` call.
+
+**Opt-in real-Alpha-Vantage acceptance workflow** (`acceptance.py`).
+The ONE sanctioned place in all of `collectors/cross_asset/` that reads
+an environment variable (`ALPHA_VANTAGE_API_KEY`) -- every other module
+requires a credential to be passed explicitly by the caller.
+`resolve_alpha_vantage_api_key_from_environment` returns `None` (never
+raises) when absent or blank; `run_real_alpha_vantage_acceptance_workflow`
+requires a non-empty `api_key` argument, with no implicit fallback.
+BOUNDED SUBSET (spec Section 24): exercises the ONE highest-value core
+driver this platform can genuinely verify against a live provider,
+`gold_reference` via `GLD` -- never claiming to validate the full
+10-concept universe against a real provider (fixture-based acceptance,
+below, is what covers the full conceptual universe). Runs the full
+pipeline, then a SECOND cached-replay pass with a `_ForbiddenTransport`
+to prove offline replay reproduces an identical semantic result with
+zero network calls. `RedactedCrossAssetAcceptanceReport`'s own field set
+structurally cannot carry a secret (no field name resembles a
+credential); the corresponding test resolves the key via the same
+function and calls `pytest.skip(...)` with a precise reason when absent
+-- the expected state for ordinary CI and this offline development
+environment.
+
+**Mandatory fixture-based acceptance**
+(`test_collectors_cross_asset_fixture_acceptance.py`). The ALWAYS-RUN,
+no-network counterpart, assembling ONE curated universe covering: all 5
+core concepts (dollar/WTI/Brent/silver/gold, via Alpha-Vantage-shaped
+ETF fixtures), a genuinely separate `copper_industrial_growth` driver on
+an Asia/Tokyo session (multiple timezones/session cutoffs, WITHIN one
+universe -- `TimezoneSessionPolicy` being per-driver-spec, not
+per-mapping, means this required a second driver rather than a second
+mapping on `wti_crude`, see the Sessions subsection's "known
+constraint"), a `wti_crude` `PROVIDER_CONTINUOUS_FUTURES` mapping with
+full roll provenance via a synthetic `FakeMarketCollector` (mixed
+instrument forms, cross-provider: `wti_crude` has BOTH an Alpha Vantage
+ETF mapping and this fixture futures mapping), one deliberately missing
+business day, an exact-duplicate-bar idempotency proof, a conflicting-
+duplicate-bar hard-fail proof (raises `MarketProviderResponseError`
+unconditionally, per the Orchestration subsection above), raw-response
+caching, provider metadata verification, normalization, component/
+combined datasets, gap analysis, reconciliation, verification, offline
+replay (byte-identical `combined_manifest_id` on a second, `transport=
+None` pass), a deterministic credential-free report export, and
+point-in-time visibility after close only. `FakeMarketCollector`
+(`_cross_asset_test_helpers.py`) is a fully synthetic
+`HistoricalMarketCollector` double -- NOT shaped like Alpha Vantage's
+real schema -- that builds GENUINELY SEPARATE metadata/history request
+manifests (unlike Alpha Vantage's single-endpoint reuse), exercising
+orchestration's two-fetch code path the real adapter never triggers.
+
+**Safety scan extension**
+(`test_market_data_safety_scan.py::TestCrossAssetSpecificSafety`).
+`_collector_source_files()`'s existing recursive `rglob` already reaches
+`collectors/cross_asset/`, so every general check (no network/broker
+imports, no credential-shaped dataclass fields, no float-typed financial
+fields, no wall-clock reads, no bare/swallowed exceptions, no pickle/
+cloud-SDK/eval-exec/shell-execution, no committed long-literal API key)
+already applies with zero changes needed. This phase adds Phase-
+4C-specific structural checks mirroring Phase 4B's own `curated/`-
+specific section exactly: `open_time` (a bar's raw OPEN) must never be
+compared directly against a wall-clock-shaped value as if it proved
+availability (the `curated/` `observation_date`-as-availability-proof
+check, replayed for market bars -- `resolve_bar_availability_time`
+exists precisely to prevent this bypass), `ALPHA_VANTAGE_API_KEY` must
+appear nowhere outside `acceptance.py`/`alpha_vantage.py`, and two
+BEHAVIORAL (not merely static) confirmations: an ETF-form mapping
+cannot be constructed with `is_proxy=False`, and a `PROVIDER_
+CONTINUOUS_FUTURES` bar cannot be constructed without `roll_provenance`.
+
+**Adversarial and concurrency coverage**
+(`test_collectors_cross_asset_pit_concurrency_adversarial.py`).
+Concurrent identical backfills (4 threads racing the SAME operation)
+tolerate `MarketDataLockError` from the ledger's deliberately FAIL-FAST
+lock (mirrors `ml.concurrency.experiment_lock`'s own documented
+contract -- never block-waits) but must NEVER produce duplicate or
+corrupt bars from whichever threads win; concurrent cache readers get
+byte-identical bytes. Forged-component-manifest and combined-manifest-
+component-swap detection: a forged manifest's SELF-CLAIMED id stays
+unchanged (`dataclasses.replace` does not recompute a content-addressed
+id), but independently RECOMPUTING the id from the manifest's own
+recorded fields no longer matches -- exactly how verification catches a
+forgery. `RetryExhaustedError` (and its full exception chain) never
+contains the real `api_key`, confirmed with a realistic secret literal.
+Registry identity is confirmed independent of `PYTHONHASHSEED` via two
+child-process subprocess runs under different explicit seed values.
+
+**New shared `DatasetKind`/`SourceKind`/`RecordKind` values** (narrow,
+additive, mirroring Phase 4B's own `MACRO_OBSERVATIONS`/`FRED_API`
+precedent exactly): `DatasetKind.CROSS_ASSET_MARKET_BARS` (same
+scoping-only pattern, `instrument_id` repurposed to mean
+`f"{canonical_driver_id}__{instrument_form}"` since one provider may map
+a driver through more than one instrument form, each needing its own
+provenance/quarantine scope), `SourceKind.MARKET_DATA_PROVIDER_API`
+(deliberately provider-NEUTRAL, unlike Phase 4A's `FRED_API` which names
+one specific source), `RecordKind.MARKET_DRIVER_BAR`. ~16 new exceptions
+in `core/exceptions.py` (`MarketDriverRegistryError`, `ProviderCapabilityError`,
+`InstrumentFormError`, `SymbolMappingError`, `AdjustmentPolicyError`,
+`SessionPolicyError`, `FuturesContractError`, `ContinuationPolicyError`,
+`MarketAvailabilityPolicyError`/`MarketAvailabilityUnresolvedError`,
+`MarketRecordError`, `MarketProviderResponseError`, `MarketBackfillSpecError`,
+`MarketCombinedManifestError`, `MarketUpdatePlanError`, `GapPolicyError`)
+-- `CollectorOrchestrationStateError`/`CollectorOrchestrationConflictError`/
+`CollectorReconciliationError`/`CollectorVerificationError` (Phase 4A)
+are REUSED directly for this phase's own stage machine/reconciliation/
+verification, matching Phase 4B's precedent.
+
+**Example config**
+(`examples/xauusd_cross_asset_config.example.json`). Mirrors Phase 4B's
+own `xauusd_macro_fred_config.example.json` shape: the full 10-concept
+curated registry (honestly marking `treasury_volatility` disabled), the
+9 Alpha Vantage ETF provider mappings, a bounded backfill spec, session/
+availability/adjustment policy blocks, and a `credentials` block that
+references only the `ALPHA_VANTAGE_API_KEY` environment-variable NAME --
+never a literal value. A dedicated test
+(`test_cross_asset_example_config.py`) constructs REAL registry/mapping/
+backfill objects directly from the file and confirms zero secret-shaped
+literals anywhere in it.
+
 ## Known limitations (honestly disclosed)
 
 Phase 1:
@@ -1484,6 +2053,50 @@ Phase 4B:
   one operation, exactly as Phase 4A's own collector does.
 - No CLI surface: library only, matching Phases 1-4A.
 
+Phase 4C:
+- Only ONE provider (Alpha Vantage, `TIME_SERIES_DAILY` only) is
+  genuinely wired to a live universe this phase; every mapped concept is
+  an ETF-form PROXY, never a literal spot/futures instrument -- honestly
+  disclosed via `is_proxy=True`/`proxy_quality` on every mapping, never
+  silently upgraded.
+- `treasury_volatility` ships UNSUPPORTED AND FAIL-CLOSED: no ETF with a
+  defensible tracking relationship to Treasury-market implied volatility
+  was identified through the shipped provider; the concept exists in the
+  registry (`enabled=False`) for a future phase to fill.
+- No real provider this phase maps a futures instrument form -- the
+  futures-contract/continuous-series/roll-provenance code paths are
+  fully implemented and exercised end-to-end, but only through the
+  mandatory fixture universe's synthetic `FakeMarketCollector`, never
+  against a live provider.
+- Gap-policy missing-bar detection uses a Mon-Fri business-day heuristic
+  with NO public-holiday calendar awareness (`calendar_assurance=
+  "limited"`, always) -- the same disclosed gap Phase 3's
+  `REQUIRE_EXPECTED_MARKET_CALENDAR` and Phase 4B's `NEXT_BUSINESS_DAY_
+  CONSERVATIVE` already carry for OTC/provider-specific sessions.
+- `TimezoneSessionPolicy`/adjustment/availability policies are per-
+  DRIVER-SPEC fields, not per-mapping -- a driver with multiple mappings
+  from different providers currently shares one session/adjustment/
+  availability policy set across all of them.
+- `contract_metadata_id_by_mapping`/`roll_provenance_by_mapping` (when
+  supplied to orchestration) apply the SAME futures identity to every
+  bar produced for a mapping in ONE call -- adequate for this phase's
+  fixture coverage of the code paths, not a general per-row roll
+  resolver a real multi-roll futures provider would eventually need.
+- No cross-asset-to-XAUUSD-feature join exists yet (matching Phase 4B's
+  own "modeled but not wired into feature generation" limitation) --
+  the PIT consumer contract is documented and enforced by the safety
+  scan, not yet exercised by an actual feature-generation join.
+- `MarketBackfillSpec.start_time`/`end_time` are NOT enforced as a
+  server-side date-range filter against Alpha Vantage's own response
+  (the provider has none to request -- `outputsize=full` always returns
+  the provider's entire available history); `max_records_per_mapping`
+  is the actual, caller-controlled bound on how much of that response is
+  accepted downstream.
+- No pagination support, matching Phase 4A/4B: a caller needing more
+  than one page from a future paginating provider issues more than one
+  operation.
+- No CLI surface: library only, matching Phases 1-4B.
+
 ## Future phases (not started)
 
 Session-reset VWAP; Wilder-smoothed ATR/RSI variants; macro-derived
@@ -1500,7 +2113,14 @@ and `/fred/series`; a real BLS/Treasury release-calendar implementation
 for `AvailabilityPolicyKind.RELEASE_CALENDAR_REFERENCE`; public-holiday
 awareness for `NEXT_BUSINESS_DAY_CONSERVATIVE`; enabling and
 fixture-verifying the extended macro-series universe beyond the 4 core
-drivers; further external collectors (Yahoo Finance, MT5, broker/news
-APIs -- Phase 4A/4B delivered FRED only), live streaming, and CLI
-expansion (explicitly out of scope through Phase 4B, reserved for a
-future milestone).
+drivers; a real, live-verified futures provider (individual-contract or
+provider-continuous) to exercise `futures.py`/`ContinuationPolicy`
+outside the fixture universe; a viable `treasury_volatility` provider
+mapping; per-mapping (rather than per-driver-spec) session/adjustment/
+availability policies; a cross-asset-to-XAUUSD-feature join with
+point-in-time enforcement wired into generation; a real EIA integration
+(route structure was live-verified, but no data was fetched without
+registering a real account); further external collectors (Yahoo
+Finance, MT5, broker/news APIs -- Phase 4A/4B/4C delivered FRED and
+Alpha Vantage only), live streaming, and CLI expansion (explicitly out
+of scope through Phase 4C, reserved for a future milestone).

@@ -68,6 +68,16 @@ class SourceKind(Enum):
     separate function, never called by the adapter) touches the
     network."""
 
+    MARKET_DATA_PROVIDER_API = "market_data_provider_api"
+    """Milestone 10, Phase 4C: source rows produced from an ALREADY-
+    DOWNLOADED, ALREADY-CACHED response from ANY concrete
+    `HistoricalMarketCollector` provider adapter (`collectors.
+    cross_asset.providers.*`) -- deliberately PROVIDER-NEUTRAL (unlike
+    `FRED_API`, which names one specific source), since Phase 4C's own
+    collector CONTRACT is provider-neutral by design; the specific
+    provider is recorded on the source manifest's own `source_label`/
+    `source_name`, never encoded into a per-provider `SourceKind`."""
+
 
 class RecordKind(Enum):
     CANDLE = "candle"
@@ -80,6 +90,17 @@ class RecordKind(Enum):
     four `MarketDataEvent` kinds above (a macro observation has no OHLC/
     bid-ask/price-size shape, and maps to `macro.MacroEvent`, a
     completely separate Phase 1 model, never `events.MarketDataEvent`)."""
+
+    MARKET_DRIVER_BAR = "market_driver_bar"
+    """Milestone 10, Phase 4C: one raw OHLCV bar for a curated cross-asset
+    market driver, from any provider-neutral `HistoricalMarketCollector`
+    adapter -- deliberately NOT `CANDLE` above (that kind maps to
+    `candles.Candle`, Phase 1's sequence-based `MarketEventStore` record;
+    a market driver bar maps to `collectors.cross_asset.market_record.
+    MarketDriverBar`, a materially richer, purely content-addressed
+    record carrying instrument-form/proxy/adjustment/futures-contract/
+    continuation/availability semantics `Candle` was never shaped to
+    hold -- see that module's own docstring)."""
 
 
 def compute_content_digest(data: bytes) -> str:

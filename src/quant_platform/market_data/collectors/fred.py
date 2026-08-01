@@ -26,43 +26,27 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import urlencode
 
-from quant_platform.core.exceptions import (
-    CollectorError,
-    CollectorRequestManifestError,
-    MalformedFredResponseError,
-    RateLimitUnavailableError,
-    RetryExhaustedError,
-)
+from quant_platform.core.exceptions import CollectorRequestManifestError, MalformedFredResponseError
 from quant_platform.market_data.adapters import RawSourceRecord
 from quant_platform.market_data.collectors.cache import RawResponseCache
+from quant_platform.market_data.collectors.execute_request import (
+    CollectorRequestExecution,
+    execute_collector_request,
+)
 from quant_platform.market_data.collectors.fred_schemas import (
     FredObservation,
     parse_fred_csv_response,
     parse_fred_json_response,
 )
-from quant_platform.market_data.collectors.protocols import HistoricalHttpTransport, TransportRequest
-from quant_platform.market_data.collectors.rate_limit import RateLimitPolicy, TokenBucketState, try_acquire
+from quant_platform.market_data.collectors.protocols import HistoricalHttpTransport
+from quant_platform.market_data.collectors.rate_limit import RateLimitPolicy, TokenBucketState
 from quant_platform.market_data.collectors.request_manifest import (
     CollectorRequestManifest,
     CredentialMode,
     create_request_manifest,
 )
-from quant_platform.market_data.collectors.response_manifest import (
-    CollectorResponseManifest,
-    CompletionStatus,
-    create_response_manifest,
-)
-from quant_platform.market_data.collectors.retry import (
-    RetryAttemptRecord,
-    RetryFailureKind,
-    RetryOutcome,
-    RetryPolicy,
-    classify_failure,
-    parse_retry_after,
-    plan_next_wait_seconds,
-)
+from quant_platform.market_data.collectors.retry import RetryPolicy
 from quant_platform.market_data.source_manifests import RecordKind, SourceKind
 
 __all__ = [
@@ -88,9 +72,6 @@ FRED_ALLOWED_HOSTS = frozenset({FRED_ENDPOINT_HOST})
 FRED_EXAMPLE_SERIES = ("DFII10", "DGS10", "CPIAUCSL", "DFF")
 """Configured EXAMPLES only -- `build_fred_request_manifest` accepts any
 `series_id`; this is never enforced as an allowlist."""
-
-_RETRYABLE_TRANSPORT_EXCEPTIONS = ("TransportTimeoutError",)
-
 
 _VALID_SORT_ORDERS = frozenset({"asc", "desc"})
 _VALID_FREQUENCY_CODES = frozenset({
@@ -172,26 +153,11 @@ def build_fred_request_manifest(
     )
 
 
-def _build_transport_request(
-    manifest: CollectorRequestManifest, *, api_key: str | None, connect_timeout: float, read_timeout: float, max_response_bytes: int,
-    request_time: datetime,
-) -> TransportRequest:
-    query = dict(manifest.canonical_query_params)
-    if api_key is not None:
-        query["api_key"] = api_key
-    url = f"https://{manifest.endpoint_host}{manifest.endpoint_path}?{urlencode(query)}"
-    return TransportRequest(
-        url=url, headers=dict(manifest.canonical_headers), connect_timeout=connect_timeout, read_timeout=read_timeout,
-        max_response_bytes=max_response_bytes, allow_redirects=False, max_redirects=0, allowed_hosts=FRED_ALLOWED_HOSTS,
-        request_time=request_time,
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class FredRequestExecution:
-    response_manifest: CollectorResponseManifest
-    raw_bytes: bytes
-    attempts: tuple[RetryAttemptRecord, ...]
+FredRequestExecution = CollectorRequestExecution
+"""Milestone 10, Phase 4C: `execute_request.CollectorRequestExecution`
+under its original Phase 4A name -- preserved for backward compatibility
+(nothing outside this module actually names the type, but it remains
+part of this module's own public `__all__`)."""
 
 
 def execute_fred_request(
@@ -208,90 +174,17 @@ def execute_fred_request(
     operation_time: datetime,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> tuple[FredRequestExecution, TokenBucketState]:
-    """The attempt loop: transport + retry + rate-limit coordinated
-    together. `operation_time` is the ONLY time value used to drive rate
-    limiting/`Retry-After` math -- this function never reads the wall
-    clock itself; `sleep_fn` is the only place real waiting happens, and
-    it is fully injectable."""
-    attempts: list[RetryAttemptRecord] = []
-    state = rate_limit_state
-
-    for attempt_number in range(1, retry_policy.max_attempts + 1):
-        acquired, state = try_acquire(state, rate_limit_policy, now=operation_time)
-        if not acquired:
-            raise RateLimitUnavailableError(
-                f"no rate-limit token available for request_manifest_id {request_manifest.request_manifest_id!r} at attempt {attempt_number}"
-            )
-
-        transport_request = _build_transport_request(
-            request_manifest, api_key=api_key, connect_timeout=connect_timeout, read_timeout=read_timeout,
-            max_response_bytes=max_response_bytes, request_time=operation_time,
-        )
-
-        try:
-            response = transport.get(transport_request)
-        except CollectorError as exc:
-            failure_kind = RetryFailureKind.READ_TIMEOUT if type(exc).__name__ in _RETRYABLE_TRANSPORT_EXCEPTIONS else RetryFailureKind.MALFORMED_RESPONSE
-            outcome = classify_failure(kind=failure_kind, status_code=None, policy=retry_policy)
-            if outcome is RetryOutcome.STOP or attempt_number == retry_policy.max_attempts:
-                attempts.append(RetryAttemptRecord(
-                    attempt_number=attempt_number, outcome="exhausted" if outcome is RetryOutcome.RETRY else "non_retryable_failure",
-                    status_code=None, failure_kind=failure_kind.value, wait_seconds_before_next=None, detail=type(exc).__name__,
-                ))
-                # Deliberately NEVER interpolate `{exc}` (the raw exception text) here: a
-                # `TransportRequest.url` MAY legitimately carry a real `api_key` query
-                # parameter for the in-flight call (see protocols.py), and a transport
-                # implementation's own exception message may echo that URL back (e.g. in
-                # a timeout message) -- only the exception's CLASS NAME is safe to surface,
-                # exactly mirroring `RetryAttemptRecord.detail` immediately above.
-                raise RetryExhaustedError(
-                    f"request_manifest_id {request_manifest.request_manifest_id!r} exhausted retries: {type(exc).__name__}"
-                ) from exc
-            wait = plan_next_wait_seconds(retry_policy, attempt_number=attempt_number, retry_after_seconds=None)
-            attempts.append(RetryAttemptRecord(
-                attempt_number=attempt_number, outcome="retryable_failure", status_code=None, failure_kind=failure_kind.value,
-                wait_seconds_before_next=wait, detail=type(exc).__name__,
-            ))
-            sleep_fn(wait)
-            continue
-
-        if response.status_code == 200:
-            attempts.append(RetryAttemptRecord(attempt_number=attempt_number, outcome="success", status_code=200, failure_kind=None, wait_seconds_before_next=None))
-            response_manifest = create_response_manifest(
-                request_manifest_id=request_manifest.request_manifest_id, http_status=response.status_code, raw_headers=response.headers,
-                raw_bytes=response.body, content_type=response.headers.get("Content-Type") or response.headers.get("content-type"),
-                encoding="utf-8", completion_status=CompletionStatus.COMPLETE, received_time=operation_time, transport_attempt_count=attempt_number,
-            )
-            return FredRequestExecution(response_manifest=response_manifest, raw_bytes=response.body, attempts=tuple(attempts)), state
-
-        outcome = classify_failure(kind=RetryFailureKind.HTTP_STATUS, status_code=response.status_code, policy=retry_policy)
-        retry_after_header = response.headers.get("Retry-After") or response.headers.get("retry-after")
-        retry_after_seconds = parse_retry_after(retry_after_header, now=operation_time) if retry_after_header else None
-
-        if outcome is RetryOutcome.STOP:
-            attempts.append(RetryAttemptRecord(
-                attempt_number=attempt_number, outcome="non_retryable_failure", status_code=response.status_code, failure_kind="http_status",
-                wait_seconds_before_next=None,
-            ))
-            raise RetryExhaustedError(
-                f"request_manifest_id {request_manifest.request_manifest_id!r} received non-retryable status {response.status_code}"
-            )
-        if attempt_number == retry_policy.max_attempts:
-            attempts.append(RetryAttemptRecord(
-                attempt_number=attempt_number, outcome="exhausted", status_code=response.status_code, failure_kind="http_status",
-                wait_seconds_before_next=None,
-            ))
-            raise RetryExhaustedError(
-                f"request_manifest_id {request_manifest.request_manifest_id!r} exhausted {retry_policy.max_attempts} attempts, last status {response.status_code}"
-            )
-        wait = plan_next_wait_seconds(retry_policy, attempt_number=attempt_number, retry_after_seconds=retry_after_seconds)
-        attempts.append(RetryAttemptRecord(
-            attempt_number=attempt_number, outcome="retryable_failure", status_code=response.status_code, failure_kind="http_status",
-            wait_seconds_before_next=wait,
-        ))
-        sleep_fn(wait)
-
-    raise RetryExhaustedError(f"request_manifest_id {request_manifest.request_manifest_id!r} exhausted all attempts")
+    """Milestone 10, Phase 4C: a THIN ALIAS of `execute_request.
+    execute_collector_request` (bound to `FRED_ALLOWED_HOSTS`) -- zero
+    duplication. The attempt loop itself was always fully provider-
+    neutral (see that module's own docstring for the extraction
+    rationale); this wrapper exists only so every existing caller of
+    `fred.execute_fred_request` keeps working unchanged."""
+    return execute_collector_request(
+        transport=transport, request_manifest=request_manifest, api_key=api_key, retry_policy=retry_policy, rate_limit_policy=rate_limit_policy,
+        rate_limit_state=rate_limit_state, connect_timeout=connect_timeout, read_timeout=read_timeout, max_response_bytes=max_response_bytes,
+        operation_time=operation_time, allowed_hosts=FRED_ALLOWED_HOSTS, sleep_fn=sleep_fn,
+    )
 
 
 # --------------------------------------------------------------------------

@@ -94,6 +94,19 @@ class DatasetKind(Enum):
     same field, since a macro series id (e.g. `"DGS10"`) is exactly as
     path-safe as an instrument id already must be."""
 
+    CROSS_ASSET_MARKET_BARS = "cross_asset_market_bars"
+    """Milestone 10, Phase 4C: the same scoping-only pattern
+    `MACRO_OBSERVATIONS` established, for `collectors.cross_asset`'s own
+    `MarketDriverBar` records -- these ALSO live in their own new store
+    (`cross_asset.market_record.MarketDriverBarStore`), never
+    `MarketEventStore`/`DatasetManifest`/`PartitionStore` versioning,
+    reusing `ProvenanceStore`/`QuarantineStore` purely for scoping.
+    `instrument_id` is repurposed to mean `f"{canonical_driver_id}__
+    {instrument_form}"` -- a single provider may map a canonical driver
+    through more than one instrument form (e.g. both an ETF proxy and a
+    futures contract), and each must never share a provenance/quarantine
+    scope with the other."""
+
 
 class PartitionGranularity(Enum):
     DAILY = "daily"
@@ -138,7 +151,7 @@ class DatasetKey:
 
     def __post_init__(self) -> None:
         require_non_empty(self.instrument_id, field_name="DatasetKey.instrument_id")
-        if self.dataset_kind in (DatasetKind.RAW_MARKET_EVENTS, DatasetKind.MACRO_OBSERVATIONS):
+        if self.dataset_kind in (DatasetKind.RAW_MARKET_EVENTS, DatasetKind.MACRO_OBSERVATIONS, DatasetKind.CROSS_ASSET_MARKET_BARS):
             if not self.provider:
                 raise DatasetManifestError(f"DatasetKey.provider is required for {self.dataset_kind.value}")
             if self.feature_name is not None or self.feature_version is not None:
@@ -177,6 +190,9 @@ class DatasetKey:
         if self.dataset_kind is DatasetKind.MACRO_OBSERVATIONS:
             assert self.provider is not None
             return ("macro_observations", self.provider, self.instrument_id)
+        if self.dataset_kind is DatasetKind.CROSS_ASSET_MARKET_BARS:
+            assert self.provider is not None
+            return ("cross_asset_market_bars", self.provider, self.instrument_id)
         assert self.feature_name is not None and self.feature_version is not None
         return ("derived_features", self.feature_name, f"v{self.feature_version}", self.instrument_id)
 

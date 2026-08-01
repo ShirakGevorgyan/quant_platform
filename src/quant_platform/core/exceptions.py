@@ -1746,3 +1746,143 @@ class UpdatePlanError(CollectorError):
     invalid inputs (e.g. a caller-supplied planning time that is not
     tz-aware, or an existing manifest that does not belong to the
     curated registry/universe being planned against)."""
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 4C: provider-neutral cross-asset historical market
+# collectors and curated XAUUSD market-driver universe.
+# `CollectorOrchestrationStateError`/`CollectorOrchestrationConflictError`/
+# `CollectorReconciliationError`/`CollectorVerificationError` (Phase 4A,
+# above) are REUSED directly for this phase's own multi-driver stage
+# machine, reconciliation, and verification -- exactly as Phase 4B already
+# did for its own curated FRED universe; they are already generic enough
+# that a phase-specific subclass would add no distinguishing information.
+# --------------------------------------------------------------------------
+class MarketDriverRegistryError(CollectorError):
+    """Raised when a curated cross-asset market-driver registry or an
+    individual `CuratedMarketDriverSpec` is structurally invalid: a
+    duplicate canonical driver id or name, a provider mapping without an
+    instrument form, a proxy mapping without an explicit proxy target, a
+    futures mapping without contract/continuation semantics, an equity/
+    ETF mapping without an adjustment policy, an enabled driver with no
+    supported mapping, or a result-affecting field excluded from
+    identity."""
+
+
+class ProviderCapabilityError(CollectorError):
+    """Raised when a request would exceed a `MarketCollectorCapabilities`
+    declaration a `HistoricalMarketCollector` provider adapter actually
+    made: an interval/granularity/adjustment/instrument-form the provider
+    does not support, a request exceeding the declared maximum
+    interval/rows-per-page, or a runtime-credential requirement not
+    satisfied. The orchestrator fails closed here rather than silently
+    downgrading the request."""
+
+
+class InstrumentFormError(CollectorError):
+    """Raised when an instrument-form/proxy classification is structurally
+    invalid: an unsupported `InstrumentForm`, a proxy mapping missing its
+    required `proxy_for`/`proxy_quality` classification, or code that
+    would label a proxy instrument (an ETF, a continuous futures series)
+    as the underlying spot/cash instrument it merely approximates."""
+
+
+class SymbolMappingError(CollectorError):
+    """Raised when a `ProviderSymbolMapping` is structurally invalid, or a
+    mapping-set would let one provider symbol resolve to two DIFFERENT
+    active canonical instruments within the same mapping version -- an
+    ambiguous mapping is rejected at construction, never resolved by
+    silent precedence."""
+
+
+class AdjustmentPolicyError(CollectorError):
+    """Raised when a price-`AdjustmentPolicy` is structurally invalid for
+    its declared `AdjustmentPolicyKind`, or a normalization step would mix
+    raw and adjusted price semantics within one series (e.g. an
+    adjusted-close value substituted into an otherwise-raw OHLC bar)."""
+
+
+class SessionPolicyError(CollectorError):
+    """Raised when a `TimezoneSessionPolicy` is structurally invalid: an
+    unresolvable timezone, an invalid session-open/close/break
+    combination, or a policy that cannot honestly represent the provider's
+    own documented session semantics."""
+
+
+class FuturesContractError(CollectorError):
+    """Raised when `FuturesContractMetadata` is structurally invalid or
+    missing a result-critical field (root symbol, exchange, expiry,
+    contract month/year, multiplier, quote unit, currency, tick size) --
+    a provider that cannot supply this metadata must be classified as
+    provider-generated continuous data instead of asserting individual
+    contract knowledge it does not actually have."""
+
+
+class ContinuationPolicyError(CollectorError):
+    """Raised when a `ContinuationPolicy` is structurally invalid, or a
+    continuous-series value is produced without the roll provenance
+    (active/prior/next contract, roll timestamp, adjustment amount or
+    ratio) its declared policy kind requires -- continuation is NEVER
+    silently stitched without this evidence."""
+
+
+class MarketAvailabilityPolicyError(CollectorError):
+    """Raised when a market-bar `BarAvailabilityPolicy` is structurally
+    invalid (e.g. a negative delay, an unsupported policy kind, or a
+    missing field its own kind requires) -- the market-bar analogue of
+    Phase 4B's `AvailabilityPolicyError`."""
+
+
+class MarketAvailabilityUnresolvedError(MarketAvailabilityPolicyError):
+    """Raised when a bar's `availability_time` cannot be resolved under
+    its declared `BarAvailabilityPolicy` -- the record must be quarantined
+    or rejected, NEVER silently treated as available at candle open (which
+    would be a point-in-time leak) -- the market-bar analogue of Phase
+    4B's `AvailabilityUnresolvedError`."""
+
+
+class MarketProviderResponseError(CollectorError):
+    """Raised when an ENTIRE provider response cannot be parsed as the
+    provider's own documented schema shape at all -- a structural parse
+    failure (unexpected top-level JSON shape, a provider error/rate-
+    limit envelope in place of the expected data envelope), distinct
+    from `MarketRecordError` (a single malformed ROW within an
+    otherwise well-formed response)."""
+
+
+class MarketRecordError(CollectorError):
+    """Raised when a raw or normalized market record is structurally
+    invalid: an OHLC relationship violation, a non-finite/non-positive
+    price where economically required, negative volume, a timestamp not
+    aligned with its declared interval, or an overlapping duplicate
+    coordinate carrying a conflicting payload."""
+
+
+class MarketBackfillSpecError(CollectorError):
+    """Raised when a `CuratedMarketBackfillSpec` is structurally invalid:
+    an empty or duplicate driver selection, an unsupported provider
+    mapping, an invalid interval, an unbounded request, an implicit
+    current-date default, an unsupported adjustment/futures policy, or
+    mixing semantically incompatible series into one component dataset."""
+
+
+class MarketCombinedManifestError(CollectorError):
+    """Raised when a combined cross-asset market-driver universe manifest
+    is structurally invalid, or its own identity cannot be reproduced
+    from its recorded component dataset references."""
+
+
+class MarketUpdatePlanError(CollectorError):
+    """Raised when cross-asset incremental update-plan construction
+    receives invalid inputs (a non-tz-aware planning time, or an existing
+    manifest that does not belong to the curated registry/universe being
+    planned against) -- the market-driver analogue of Phase 4B's
+    `UpdatePlanError`."""
+
+
+class GapPolicyError(CollectorError):
+    """Raised when a `GapPolicy` is structurally invalid, or a required
+    driver's missing-bar rate exceeds its configured tolerance under a
+    policy that must prevent a COMPLETE universe status as a result --
+    an ordinary, expected gap finding is reported via `GapReport`
+    instead and never raises this."""

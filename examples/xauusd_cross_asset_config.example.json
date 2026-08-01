@@ -1,0 +1,154 @@
+{
+  "curated_registry": {
+    "registry_version": 1,
+    "core_drivers": [
+      {
+        "canonical_driver_id": "us_dollar_strength",
+        "canonical_name": "US Dollar Strength",
+        "tier": "CORE_XAUUSD_MARKET_DRIVER",
+        "is_required": true,
+        "preferred_instrument_form": "cash_index",
+        "enabled": true
+      },
+      {
+        "canonical_driver_id": "wti_crude",
+        "canonical_name": "WTI Crude Oil",
+        "tier": "CORE_XAUUSD_MARKET_DRIVER",
+        "is_required": true,
+        "preferred_instrument_form": "spot",
+        "enabled": true
+      },
+      {
+        "canonical_driver_id": "brent_crude",
+        "canonical_name": "Brent Crude Oil",
+        "tier": "CORE_XAUUSD_MARKET_DRIVER",
+        "is_required": true,
+        "preferred_instrument_form": "spot",
+        "enabled": true
+      },
+      {
+        "canonical_driver_id": "silver",
+        "canonical_name": "Silver",
+        "tier": "CORE_XAUUSD_MARKET_DRIVER",
+        "is_required": true,
+        "preferred_instrument_form": "spot",
+        "enabled": true
+      },
+      {
+        "canonical_driver_id": "gold_reference",
+        "canonical_name": "Gold (XAUUSD Reference Market)",
+        "tier": "CORE_XAUUSD_MARKET_DRIVER",
+        "is_required": true,
+        "preferred_instrument_form": "spot",
+        "enabled": true
+      }
+    ],
+    "optional_drivers": [
+      {
+        "canonical_driver_id": "us_equity_market_stress",
+        "canonical_name": "US Equity Market Stress",
+        "tier": "REGIME_CONTEXT",
+        "is_required": false,
+        "preferred_instrument_form": "cash_index",
+        "enabled": true
+      },
+      {
+        "canonical_driver_id": "treasury_volatility",
+        "canonical_name": "Treasury Market Volatility",
+        "tier": "REGIME_CONTEXT",
+        "is_required": false,
+        "preferred_instrument_form": "cash_index",
+        "enabled": false,
+        "_comment": "UNSUPPORTED AND FAIL-CLOSED this phase -- no ETF with a defensible tracking relationship to Treasury-market implied volatility was identified through the shipped provider. Documented so the concept exists for a future phase; no mapping is fabricated to fill the gap."
+      },
+      {
+        "canonical_driver_id": "broad_commodity_index",
+        "canonical_name": "Broad Commodity Index",
+        "tier": "SECONDARY_MARKET_DRIVER",
+        "is_required": false,
+        "preferred_instrument_form": "synthetic_index",
+        "enabled": true
+      },
+      {
+        "canonical_driver_id": "copper_industrial_growth",
+        "canonical_name": "Copper (Industrial Growth Proxy)",
+        "tier": "SECONDARY_MARKET_DRIVER",
+        "is_required": false,
+        "preferred_instrument_form": "spot",
+        "enabled": true
+      },
+      {
+        "canonical_driver_id": "gold_miner_equity",
+        "canonical_name": "Gold Miner Equity Basket",
+        "tier": "SECONDARY_MARKET_DRIVER",
+        "is_required": false,
+        "preferred_instrument_form": "etf",
+        "enabled": true
+      }
+    ]
+  },
+  "provider_mappings": {
+    "provider": "alpha_vantage",
+    "mapping_version": 1,
+    "instrument_form": "etf",
+    "currency": "USD",
+    "exchange_or_venue": "NYSEARCA",
+    "adjustment_policy_kind": "raw_unadjusted",
+    "entries": [
+      { "canonical_driver_id": "us_dollar_strength", "provider_symbol": "UUP", "proxy_quality": "MODERATE" },
+      { "canonical_driver_id": "wti_crude", "provider_symbol": "USO", "proxy_quality": "MODERATE" },
+      { "canonical_driver_id": "brent_crude", "provider_symbol": "BNO", "proxy_quality": "MODERATE" },
+      { "canonical_driver_id": "silver", "provider_symbol": "SLV", "proxy_quality": "HIGH" },
+      { "canonical_driver_id": "gold_reference", "provider_symbol": "GLD", "proxy_quality": "HIGH" },
+      { "canonical_driver_id": "us_equity_market_stress", "provider_symbol": "VIXY", "proxy_quality": "LOW" },
+      { "canonical_driver_id": "broad_commodity_index", "provider_symbol": "DBC", "proxy_quality": "MODERATE" },
+      { "canonical_driver_id": "copper_industrial_growth", "provider_symbol": "CPER", "proxy_quality": "MODERATE" },
+      { "canonical_driver_id": "gold_miner_equity", "provider_symbol": "GDX", "proxy_quality": "MODERATE" }
+    ],
+    "_comment": "Every entry is honestly classified is_proxy=true (see instrument_form.py's own ETF-is-always-a-proxy structural rule). This provider supplies ETF proxies only -- never the literal spot/futures instrument."
+  },
+  "backfill": {
+    "selected_driver_ids": [
+      "us_dollar_strength", "wti_crude", "brent_crude", "silver", "gold_reference",
+      "us_equity_market_stress", "broad_commodity_index", "copper_industrial_growth", "gold_miner_equity"
+    ],
+    "requested_granularity": "1d",
+    "start_time": "2015-01-01T00:00:00Z",
+    "end_time": "2024-12-31T00:00:00Z",
+    "cache_policy": "PREFER_CACHE",
+    "fail_fast": false,
+    "max_driver_count": 16,
+    "max_records_per_mapping": 20000,
+    "max_total_raw_bytes": 50000000,
+    "target_dataset_namespace": "xauusd_cross_asset_research"
+  },
+  "session_policy": {
+    "timezone_key": "America/New_York",
+    "is_24_hour_session": false,
+    "session_open_time": "09:30:00",
+    "session_close_time": "16:00:00",
+    "timestamp_convention": "open_labeled",
+    "provider_session_note": "Alpha Vantage TIME_SERIES_DAILY daily bar date treated as the NYSE session date for these US-listed ETFs.",
+    "applies_to": [
+      "us_dollar_strength", "wti_crude", "brent_crude", "silver", "gold_reference",
+      "us_equity_market_stress", "broad_commodity_index", "copper_industrial_growth", "gold_miner_equity"
+    ]
+  },
+  "availability_policy": {
+    "kind": "close_plus_conservative_delay",
+    "timezone_key": "America/New_York",
+    "delay_minutes": 1440,
+    "_comment": "Alpha Vantage documents no exact intraday publication SLA for daily bars; this conservatively assumes next-day availability rather than claiming real-time availability it cannot back."
+  },
+  "adjustment_policy": {
+    "kind": "raw_unadjusted"
+  },
+  "credentials": {
+    "api_key_source": "environment_variable",
+    "api_key_env_var": "ALPHA_VANTAGE_API_KEY",
+    "_comment": "No literal API key is ever written here. The runtime key is resolved ONLY at call time via quant_platform.market_data.collectors.cross_asset.acceptance.resolve_alpha_vantage_api_key_from_environment(), which reads ALPHA_VANTAGE_API_KEY from the process environment (or an explicit mapping a caller supplies) and never persists, logs, or echoes it. Ordinary fixture-backed tests and backfills never require this key at all."
+  },
+  "storage": {
+    "storage_root": "./data"
+  }
+}
