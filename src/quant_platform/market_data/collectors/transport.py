@@ -54,18 +54,30 @@ _ALLOWED_SCHEME = "https"
 def _validate_url_static(url: str, *, allowed_hosts: frozenset[str]) -> SplitResult:
     parts = urlsplit(url)
     if parts.scheme.lower() != _ALLOWED_SCHEME:
-        raise DisallowedUrlError(f"URL scheme must be {_ALLOWED_SCHEME!r}, got {parts.scheme!r} in {url!r}")
+        raise DisallowedUrlError(f"URL scheme must be {_ALLOWED_SCHEME!r}, got {parts.scheme!r} in {_redact_url_for_error(url)!r}")
     if "@" in (parts.netloc or ""):
-        raise DisallowedUrlError(f"URL must not carry userinfo: {url!r}")
+        raise DisallowedUrlError(f"URL must not carry userinfo: {_redact_url_for_error(url)!r}")
     host = parts.hostname
     if not host:
-        raise DisallowedUrlError(f"URL has no host: {url!r}")
+        raise DisallowedUrlError(f"URL has no host: {_redact_url_for_error(url)!r}")
     if _looks_like_ip_literal(host):
-        raise DisallowedUrlError(f"IP-literal hosts are never allowed: {host!r} in {url!r}")
+        raise DisallowedUrlError(f"IP-literal hosts are never allowed: {host!r} in {_redact_url_for_error(url)!r}")
     allowed_lower = {h.lower() for h in allowed_hosts}
     if host.lower() not in allowed_lower:
         raise DisallowedUrlError(f"host {host!r} is not on the allowlist {sorted(allowed_hosts)!r}")
     return parts
+
+
+def _redact_url_for_error(url: str) -> str:
+    """Strips the query string before a URL is ever embedded in an
+    exception MESSAGE -- `TransportRequest.url` may legitimately carry a
+    real `api_key=...` query parameter for the in-flight call (see
+    `protocols.py`), and an exception's text is exactly the kind of
+    thing that ends up in a log line, a wrapping exception's own
+    message, or a test failure output. The scheme/host/path alone are
+    enough to identify WHICH request failed without risking the secret."""
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
 def _looks_like_ip_literal(host: str) -> bool:
@@ -153,15 +165,15 @@ class StdlibHttpsTransport:
                 conn.request("GET", path, headers=dict(request.headers))
                 response = conn.getresponse()
             except TimeoutError as exc:
-                raise TransportTimeoutError(f"read timeout for {url!r}: {exc}") from exc
+                raise TransportTimeoutError(f"read timeout for {_redact_url_for_error(url)!r}: {exc}") from exc
             except (http.client.HTTPException, OSError) as exc:
-                raise TransportTimeoutError(f"transport failure for {url!r}: {exc}") from exc
+                raise TransportTimeoutError(f"transport failure for {_redact_url_for_error(url)!r}: {exc}") from exc
 
             content_encoding = response.getheader("Content-Encoding", "identity")
             if content_encoding.lower() not in ("identity", ""):
                 response.close()
                 raise ResponseTooLargeError(
-                    f"refusing compressed response (Content-Encoding={content_encoding!r}) for {url!r} -- decompression is "
+                    f"refusing compressed response (Content-Encoding={content_encoding!r}) for {_redact_url_for_error(url)!r} -- decompression is "
                     "not supported and decompressed size cannot be bounded"
                 )
 
@@ -180,16 +192,16 @@ class StdlibHttpsTransport:
         self, status_code: int, headers: dict[str, str], request: TransportRequest, *, redirect_count: int, current_url: str,
     ) -> TransportResponse:
         if not request.allow_redirects:
-            raise RedirectViolationError(f"received redirect status {status_code} for {current_url!r} but allow_redirects=False")
+            raise RedirectViolationError(f"received redirect status {status_code} for {_redact_url_for_error(current_url)!r} but allow_redirects=False")
         if redirect_count >= request.max_redirects:
-            raise RedirectViolationError(f"redirect count exceeded max_redirects={request.max_redirects} at {current_url!r}")
+            raise RedirectViolationError(f"redirect count exceeded max_redirects={request.max_redirects} at {_redact_url_for_error(current_url)!r}")
         location = headers.get("Location") or headers.get("location")
         if not location:
-            raise RedirectViolationError(f"redirect status {status_code} for {current_url!r} carried no Location header")
+            raise RedirectViolationError(f"redirect status {status_code} for {_redact_url_for_error(current_url)!r} carried no Location header")
         target = urljoin(current_url, location)
         target_scheme = urlsplit(target).scheme.lower()
         if target_scheme != _ALLOWED_SCHEME:
-            raise RedirectViolationError(f"redirect from {current_url!r} to {target!r} would downgrade scheme to {target_scheme!r}")
+            raise RedirectViolationError(f"redirect from {_redact_url_for_error(current_url)!r} to {_redact_url_for_error(target)!r} would downgrade scheme to {target_scheme!r}")
         return self._get(target, request, redirect_count=redirect_count + 1)
 
 
@@ -201,12 +213,12 @@ def _read_bounded(response: http.client.HTTPResponse, *, max_bytes: int, url: st
         try:
             chunk = response.read(chunk_size)
         except TimeoutError as exc:
-            raise TransportTimeoutError(f"read timeout while streaming body for {url!r}: {exc}") from exc
+            raise TransportTimeoutError(f"read timeout while streaming body for {_redact_url_for_error(url)!r}: {exc}") from exc
         if not chunk:
             break
         total += len(chunk)
         if total > max_bytes:
-            raise ResponseTooLargeError(f"response for {url!r} exceeded max_response_bytes={max_bytes} while streaming")
+            raise ResponseTooLargeError(f"response for {_redact_url_for_error(url)!r} exceeded max_response_bytes={max_bytes} while streaming")
         chunks.append(chunk)
     return b"".join(chunks)
 
@@ -220,4 +232,4 @@ class ForbiddenTransport:
     network" can inject this instead of a real transport."""
 
     def get(self, request: TransportRequest) -> TransportResponse:
-        raise AssertionError(f"ForbiddenTransport.get() was called for {request.url!r} -- network access is not permitted here")
+        raise AssertionError(f"ForbiddenTransport.get() was called for {_redact_url_for_error(request.url)!r} -- network access is not permitted here")

@@ -30,6 +30,7 @@ from urllib.parse import urlencode
 
 from quant_platform.core.exceptions import (
     CollectorError,
+    CollectorRequestManifestError,
     MalformedFredResponseError,
     RateLimitUnavailableError,
     RetryExhaustedError,
@@ -91,16 +92,77 @@ FRED_EXAMPLE_SERIES = ("DFII10", "DGS10", "CPIAUCSL", "DFF")
 _RETRYABLE_TRANSPORT_EXCEPTIONS = ("TransportTimeoutError",)
 
 
+_VALID_SORT_ORDERS = frozenset({"asc", "desc"})
+_VALID_FREQUENCY_CODES = frozenset({
+    "d", "w", "bw", "m", "q", "sa", "a", "wef", "weth", "wew", "wetu", "wem", "wesu", "wesa", "bwew", "bwem",
+})
+_VALID_AGGREGATION_METHODS = frozenset({"avg", "sum", "eop"})
+_VALID_OUTPUT_TYPES = frozenset({1, 2, 3, 4})
+
+
 def build_fred_request_manifest(
     *, series_id: str, observation_start: datetime | None, observation_end: datetime | None, response_format: str,
     timeout_policy_id: str, retry_policy_id: str, rate_limit_policy_id: str, credential_mode: CredentialMode, request_time: datetime,
-    collector_version: str = FRED_COLLECTOR_VERSION,
+    collector_version: str = FRED_COLLECTOR_VERSION, realtime_start: datetime | None = None, realtime_end: datetime | None = None,
+    limit: int | None = None, offset: int | None = None, sort_order: str = "asc", units: str = "lin",
+    frequency: str | None = None, aggregation_method: str | None = None, output_type: int | None = None,
+    vintage_dates: tuple[datetime, ...] | None = None,
 ) -> CollectorRequestManifest:
-    query_params: dict[str, str] = {"series_id": series_id, "file_type": response_format}
+    """Milestone 10, Phase 4B extends this with the remaining OFFICIAL
+    `/fred/series/observations` parameters the spec requires be modeled
+    explicitly rather than left to an undocumented FRED default:
+    `realtime_start`/`realtime_end` (ALFRED vintage window),
+    `limit`/`offset` (pagination), `sort_order` (ALWAYS included,
+    default `"asc"` -- never left to FRED's own undocumented default),
+    `units` (ALWAYS included, default `"lin"` -- a transformation code,
+    never omitted), `frequency`/`aggregation_method` (aggregation is
+    rejected if supplied without a frequency -- meaningless combination
+    per FRED's own API contract), `output_type`, `vintage_dates`. All
+    are OPTIONAL kwargs with values that reproduce the exact prior
+    query shape when omitted, EXCEPT `sort_order`/`units`, which are
+    now always present -- a deliberate, disclosed identity-affecting
+    change (see the Phase 4B delivery report): omitting a
+    result-affecting parameter and relying on FRED's own undocumented
+    default is exactly what this phase's spec forbids."""
+    if sort_order not in _VALID_SORT_ORDERS:
+        raise CollectorRequestManifestError(f"sort_order must be one of {sorted(_VALID_SORT_ORDERS)!r}, got {sort_order!r}")
+    if limit is not None and not (1 <= limit <= 100_000):
+        raise CollectorRequestManifestError(f"limit must be in [1, 100000], got {limit}")
+    if offset is not None and offset < 0:
+        raise CollectorRequestManifestError(f"offset must be >= 0, got {offset}")
+    if frequency is not None and frequency not in _VALID_FREQUENCY_CODES:
+        raise CollectorRequestManifestError(f"frequency {frequency!r} is not a recognized FRED frequency code")
+    if aggregation_method is not None and frequency is None:
+        raise CollectorRequestManifestError("aggregation_method requires frequency to also be set -- meaningless otherwise per FRED's own API contract")
+    if aggregation_method is not None and aggregation_method not in _VALID_AGGREGATION_METHODS:
+        raise CollectorRequestManifestError(f"aggregation_method {aggregation_method!r} is not one of {sorted(_VALID_AGGREGATION_METHODS)!r}")
+    if output_type is not None and output_type not in _VALID_OUTPUT_TYPES:
+        raise CollectorRequestManifestError(f"output_type must be one of {sorted(_VALID_OUTPUT_TYPES)!r}, got {output_type}")
+    if vintage_dates is not None and not vintage_dates:
+        raise CollectorRequestManifestError("vintage_dates must be non-empty when supplied, or omitted entirely (None)")
+
+    query_params: dict[str, str] = {"series_id": series_id, "file_type": response_format, "sort_order": sort_order, "units": units}
     if observation_start is not None:
         query_params["observation_start"] = observation_start.strftime("%Y-%m-%d")
     if observation_end is not None:
         query_params["observation_end"] = observation_end.strftime("%Y-%m-%d")
+    if realtime_start is not None:
+        query_params["realtime_start"] = realtime_start.strftime("%Y-%m-%d")
+    if realtime_end is not None:
+        query_params["realtime_end"] = realtime_end.strftime("%Y-%m-%d")
+    if limit is not None:
+        query_params["limit"] = str(limit)
+    if offset is not None:
+        query_params["offset"] = str(offset)
+    if frequency is not None:
+        query_params["frequency"] = frequency
+    if aggregation_method is not None:
+        query_params["aggregation_method"] = aggregation_method
+    if output_type is not None:
+        query_params["output_type"] = str(output_type)
+    if vintage_dates is not None:
+        query_params["vintage_dates"] = ",".join(d.strftime("%Y-%m-%d") for d in vintage_dates)
+
     return create_request_manifest(
         collector_name=FRED_COLLECTOR_NAME, collector_version=collector_version, endpoint_host=FRED_ENDPOINT_HOST,
         endpoint_path=FRED_ENDPOINT_PATH, canonical_query_params=query_params, canonical_headers={}, requested_series_or_dataset=series_id,
@@ -176,7 +238,15 @@ def execute_fred_request(
                     attempt_number=attempt_number, outcome="exhausted" if outcome is RetryOutcome.RETRY else "non_retryable_failure",
                     status_code=None, failure_kind=failure_kind.value, wait_seconds_before_next=None, detail=type(exc).__name__,
                 ))
-                raise RetryExhaustedError(f"request_manifest_id {request_manifest.request_manifest_id!r} exhausted retries: {exc}") from exc
+                # Deliberately NEVER interpolate `{exc}` (the raw exception text) here: a
+                # `TransportRequest.url` MAY legitimately carry a real `api_key` query
+                # parameter for the in-flight call (see protocols.py), and a transport
+                # implementation's own exception message may echo that URL back (e.g. in
+                # a timeout message) -- only the exception's CLASS NAME is safe to surface,
+                # exactly mirroring `RetryAttemptRecord.detail` immediately above.
+                raise RetryExhaustedError(
+                    f"request_manifest_id {request_manifest.request_manifest_id!r} exhausted retries: {type(exc).__name__}"
+                ) from exc
             wait = plan_next_wait_seconds(retry_policy, attempt_number=attempt_number, retry_after_seconds=None)
             attempts.append(RetryAttemptRecord(
                 attempt_number=attempt_number, outcome="retryable_failure", status_code=None, failure_kind=failure_kind.value,

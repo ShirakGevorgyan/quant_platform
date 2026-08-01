@@ -1,6 +1,6 @@
 # Deterministic Market Data Platform and Feature Store (Milestone 10) -- Architecture
 
-## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) + Phase 4A (secure external historical collector infrastructure and FRED integration) delivered
+## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) + Phase 4A (secure external historical collector infrastructure and FRED integration) + Phase 4B (curated FRED macro universe and verified historical backfill workflow for XAUUSD research) delivered
 
 ## Primary goal
 
@@ -1048,6 +1048,307 @@ localhost rejected); and a scan for an accidentally-committed long
 opaque literal following `api_key=`, applied to BOTH the `collectors/`
 source and this test suite's own `test_collectors_*.py` fixtures.
 
+## Curated FRED macro universe and verified historical backfill workflow (Phase 4B)
+
+Phase 4B answers "how does XAUUSD research get a CURATED, versioned,
+point-in-time-safe macro-driver universe on top of Phase 4A's generic
+FRED collector infrastructure, without weakening any guarantee Phases
+1-4A already established." It adds `market_data.collectors.curated`, a
+new subpackage that REUSES Phase 4A's transport/retry/rate-limit/cache/
+request-and-response-manifest machinery unchanged, and REUSES Phase 3's
+`ProvenanceStore`/`QuarantineStore` (already record-kind-agnostic) via
+the same `DatasetKind.MACRO_OBSERVATIONS` scoping Phase 4A established
+-- while introducing its own new record types, stores, and a THIRD
+independent stage-machine implementation where the shape of the problem
+(many series per operation, not one) is genuinely different from either
+existing one.
+
+**Curated series registry** (`registry.py`). `CuratedFredSeriesSpec` is
+an immutable value object (series_id, canonical_series_name,
+registry_version, tier, economic_category, expected native
+frequency/units/seasonal-adjustment, target_macro_instrument_id,
+normalization_kind, unit_conversion, missing_value_policy, revision/
+availability policy id references, default_observation_start, request
+overrides, enabled, notes); `notes` is the ONE field excluded from
+identity (documentation only, never computation-affecting).
+`CuratedFredRegistry` is a KEYED SET, not an ordered list:
+`create_curated_registry` always SORTS specs by `series_id` before
+computing `registry_id`, so identity AND iteration order are BOTH
+independent of declaration order (`create_curated_registry(specs=(a,
+b))` and `(b, a)` produce the identical `registry_id`). Rejects
+duplicate series ids, duplicate canonical names, an enabled series with
+no target instrument id, and an unsupported frequency/unit/normalization
+combination. `default_core_series_specs` returns exactly the 4 MANDATORY
+series (`DFII10`->`us_10y_real_yield`, `DGS10`->`us_10y_nominal_yield`,
+`CPIAUCSL`->`us_cpi_all_urban`, `DFF`->`effective_federal_funds_rate`),
+all `SeriesTier.CORE_XAUUSD_DRIVER`, all `enabled=True`.
+`default_extended_series_specs` returns the 14 reviewed extended
+candidates (`T10YIE`, `T5YIE`, `DGS2`, `DGS5`, `DGS30`, `DTWEXBGS`,
+`UNRATE`, `PAYEMS`, `PCEPI`, `PCEPILFE`, `INDPRO`, `VIXCLS`, `WALCL`,
+`M2SL`) -- ALL constructed `enabled=False` by deliberate design: only
+the 4 core series are individually fixture-verified this phase; adding
+one to a live universe requires an explicit opt-in flip, disclosed as a
+scope decision, not an oversight.
+
+**Official metadata contract** (`fred_series_metadata.py`,
+`metadata.py`). `FRED_SERIES_ENDPOINT_PATH = "/fred/series"` (metadata)
+is a SEPARATE endpoint from Phase 4A's `/fred/series/observations`;
+`execute_fred_series_metadata_request` is a THIN ALIAS for `fred.
+execute_fred_request` (zero duplication -- `_build_transport_request`
+already builds URLs generically from `manifest.endpoint_host/
+endpoint_path/canonical_query_params`, so the same attempt loop serves
+both endpoints). `parse_fred_series_metadata_response` is PARSE-ONLY
+(mirrors `fred_schemas.py`'s own layering) and never compares the
+returned `series_id` against a "requested" one -- that drift decision
+belongs entirely to `metadata.verify_series_metadata`, which NEVER
+trusts a manually-written curated label over the official response.
+DRIFT POLICY, exactly as specified: unexpected series id, incompatible
+frequency, incompatible units, or a changed seasonal-adjustment code
+(only where the spec declared an expectation) each FAIL CLOSED; a
+changed title is informational only (no curated expectation exists to
+compare it against); a changed supported observation range is REPORTED,
+and the requested backfill interval is permitted to proceed only if it
+still falls within the metadata's own currently-reported range
+(`last_updated` is captured for provenance only, never compared).
+
+**Revision policy** (`revision_policy.py`). Four kinds --
+`LATEST_AVAILABLE` (no override; NOT automatically point-in-time-safe on
+its own), `FIRST_RELEASE_ONLY` (FRED `output_type=4`), `AS_OF_REALTIME_
+DATE` (requires an explicit `as_of_realtime_date`; resolves `realtime_
+start=realtime_end=` that date), `VINTAGE_SERIES` (FRED `output_type=2`,
+retaining distinct revisions) -- with `resolve_fred_request_overrides`
+as the SINGLE place FRED-specific parameter names (`output_type`,
+`realtime_start`, `realtime_end`) are ever produced from a named
+`RevisionPolicyKind`; every other module reasons purely in terms of the
+4 kinds, never raw FRED parameter names. `create_revision_policy`
+rejects `as_of_realtime_date` supplied on any kind other than `AS_OF_
+REALTIME_DATE` (an invalid combination, caught at construction, not at
+request time).
+
+**Point-in-time availability** (`availability.py`) -- THE SINGLE MOST
+IMPORTANT DESIGN DECISION IN THIS PHASE, extending Phase 4A's own
+`realtime_start`-not-`date` discipline with an explicit, versioned,
+identity-relevant POLICY rather than a single hardcoded rule. Four
+distinct times are never conflated: `observation_date` (the economic
+period FRED reports, e.g. `"2024-01-01"` for January CPI), `realtime_
+start`/`realtime_end` (FRED/ALFRED's own real-time validity window),
+`availability_time` (the earliest time this platform permits
+POINT-IN-TIME use of the value -- what every downstream PIT join must
+actually filter on), `ingestion_time` (purely operational). Six
+`AvailabilityPolicyKind`s: `OBSERVATION_DATE_END_OF_DAY` (daily market
+rates -- available end of the observation day itself, in an explicit
+timezone), `NEXT_BUSINESS_DAY_CONSERVATIVE` (simple Mon-Fri arithmetic,
+NO public-holiday awareness -- a disclosed limitation, not silently
+assumed away), `EXPLICIT_RELEASE_TIMESTAMP` (a caller-supplied exact
+datetime; forbids also supplying time-of-day fields, since they would be
+redundant/conflicting), `RELEASE_CALENDAR_REFERENCE` (deliberately
+UNIMPLEMENTED this phase -- `resolve_availability_time` raises
+`AvailabilityPolicyError`, an honest "not yet supported" rather than a
+silent fallback), `REALTIME_START_DATE_CONSERVATIVE` (monthly releases
+like CPI -- availability is the series' own `realtime_start`, at an
+explicit time of day; REQUIRES a `realtime_start_text`, fails closed
+-- `AvailabilityUnresolvedError` -- if one is not available),
+`MANUAL_CURATED_RELEASE_RULE` (the only kind permitting an explicit
+`delay_days` override). `resolve_availability_time` is STRUCTURALLY
+fail-closed: no code path returns "immediately available" as a silent
+default -- every branch either resolves a concrete, timezone-aware
+datetime or raises. FRED reports only DATES, never exact publication
+times; this phase does not fabricate false timestamp precision -- an
+`availability_hour`/`availability_minute` is an explicit, configurable,
+DISCLOSED-AS-APPROXIMATE convention (not a claim of a real published
+release time), and the policy object itself (including its timezone and
+hour/minute) is fully identity-relevant, so a policy CHANGE is a
+detectable, auditable event, never silently reinterpreted in place.
+
+**Curated macro observation** (`macro_observation.py`).
+`CuratedMacroObservation` is a materially richer record than Phase 1's
+`MacroEvent` -- native AND normalized unit, native frequency, the full
+vintage/realtime lineage, the resolved `availability_time` AND the
+policy id that produced it, and direct request/response/source manifest
+references -- so it lives in its OWN new store rather than being forced
+into `macro.MacroEventStore`. IDENTITY DISTINGUISHES ECONOMICALLY
+DISTINCT REVISIONS BY CONSTRUCTION: `observation_id` is content-addressed
+over EVERY field, including `realtime_start`/`value`/`availability_
+policy_id` -- two vintages of the same `observation_date` with a
+different value, or the same value resolved under a different policy,
+always produce DIFFERENT ids; nothing ever collapses them. Deliberately
+NO `provenance_id` field (would be circular -- a `ProvenanceRecord` is
+built FROM this observation's own id); Phase 3's `ProvenanceStore` is
+reused unchanged for that binding. `CuratedObservationStore` is PURELY
+content-addressed append-only (no sequence numbers needed, unlike
+`MacroEventStore`) -- "append" is naturally idempotent by simple
+id-membership check under its own per-series lock. `append_many_and_
+read_all` performs an append-then-read as ONE atomic, lock-held
+operation (rather than a separate locked `append()` loop followed by a
+separate UNLOCKED `read_observations()` call) -- closing a real race
+window a concurrent caller could otherwise hit between a write
+completing and a later read observing it; discovered and hardened
+during this phase's own concurrency testing (see "Known limitations"
+for the fuller story of that investigation).
+
+**Missing-value policy.** FRED's `"."` NEVER becomes zero, matching
+Phase 4A's own discipline. Per-series `MissingValuePolicy`:
+`QUARANTINE` (default -- the safest, most conservative choice),
+`STORE_AS_MISSING_FACT` (durably records `is_missing=True`, `value=
+None`), `SKIP_AND_REPORT` (excluded WITHOUT quarantining, but always
+counted -- never silently dropped). No forward-fill anywhere in this
+package.
+
+**Curated backfill spec** (`backfill.py`). Immutable, content-addressed
+multi-series plan: `curated_registry_id`, `selected_series_ids`
+(ALWAYS sorted by `create_curated_backfill_spec` -- the SAME mechanism
+satisfies both "identity independent of declaration order" and
+orchestration's own "stable series processing order" requirement),
+observation window, optional realtime window, `revision_policy_id`,
+output type, page size, `CachePolicy` (`PREFER_CACHE`/`FORCE_FRESH`),
+optional registry-wide availability/normalization overrides,
+`target_dataset_namespace`, `fail_fast`, and three explicit BOUNDS
+(`max_series_count`, `max_observations_per_series`,
+`max_total_raw_bytes`) -- an unbounded request is structurally
+unconstructable. `create_curated_backfill_spec` validates every
+selected series against the supplied registry BEFORE a spec can exist
+at all: unknown or disabled series is rejected at construction, not at
+run time.
+
+**Multi-series orchestration** (`orchestration.py`, ~600 lines, the
+largest module in this phase). `CuratedOperationStage`/
+`CuratedOperationStore` are a THIRD, independent, small stage-machine
+implementation (after Phase 3's `OperationStore` and Phase 4A's
+`CollectorOperationStore`), duplicating the SAME proven idempotent/
+conflict/monotonic-progression `advance()` algorithm a third time --
+scoped to `target_dataset_namespace` (not `operation_id` + `DatasetKey`)
+because ONE operation here spans MANY series at once, a materially
+different shape than either existing single-series-scoped machine
+commits to. The 12-stage machine: `REGISTRY_VERIFIED -> PLAN_CREATED ->
+SERIES_METADATA_VERIFIED -> REQUESTS_COMMITTED -> RESPONSES_COMMITTED ->
+OBSERVATIONS_PARSED -> AVAILABILITY_RESOLVED -> SERIES_DATASETS_
+COMMITTED -> COMBINED_MANIFEST_COMMITTED -> RECONCILED -> VERIFIED ->
+COMPLETED`.
+
+Per series, in the SORTED (deterministic) order `CuratedBackfillSpec.
+selected_series_ids` already guarantees: fetch-or-replay metadata,
+verify it against the curated spec (fail-closed drift aborts that
+series), fetch-or-replay observations, re-hash-verify the raw bytes,
+parse strictly, resolve availability/normalize/quarantine each row via
+`_normalize_curated_row` (a PURE row processor, reused UNCHANGED by
+`verification.py` for independent rederivation), run the SAME pre-flight
+provenance-conflict check Phase 3/4A established, then commit the
+series' own component dataset. `backfill_spec.fail_fast=True` (the
+default) re-raises immediately the moment ANY series fails ANY stage --
+nothing is committed for ANY series, `COMPLETED` is never reached.
+`fail_fast=False` records each series' own `SeriesOutcome` independently
+and continues; the combined manifest's `completeness_status` becomes
+`PARTIAL` the moment even one series failed, `COMPLETE` only if every
+selected series succeeded; zero successes still raises (nothing to
+commit). Both `CachePolicy.PREFER_CACHE`/`FORCE_FRESH` and cache-vs-
+transport fetch mode are decided INDEPENDENTLY per series inside the
+loop, never once for the whole operation. The raw-response cache write
+is unconditional even under `dry_run=True` (identical rationale to
+Phase 4A); only the business-record stores (observation/component/
+combined-manifest/provenance/quarantine/operation-ledger) are `dry_run`
+-gated.
+
+**Dataset layout** (`datasets.py`). One immutable `ComponentDatasetManifest`
+PER SERIES plus one `CombinedUniverseManifest` binding the exact
+component versions that make up one curated-universe backfill --
+DIFFERENT native frequencies (`DGS10` daily, `CPIAUCSL` monthly) are
+NEVER forced into one physically regular time series; no implicit
+resampling, forward-fill, or alignment happens anywhere in this package.
+VERSIONING IS A STORE-LEVEL CONCEPT, not baked into either manifest's
+own content hash: `component_manifest_id`/`combined_manifest_id` are
+each content-addressed purely from observed facts (which observations
+are included, coverage, missing/revision counts, the exact component
+ids bound); "version N" is simply "the Nth distinct manifest ever
+durably recorded" (`len(history)`), read from the append-only store.
+Both stores' `append` is IDEMPOTENT no-op (returns the existing version
+number unchanged) when the incoming content id already matches the
+CURRENT one -- this idempotency IS the mechanism that satisfies "an
+exact no-op update must mint no new dataset version," not a separate
+special case anywhere else.
+
+**Incremental update planning** (`update_plan.py`). PURE and
+deterministic: NEVER reads the wall clock ("today"), never touches the
+network. Compares each selected series' CURRENT `ComponentDatasetManifest`
+coverage against a caller-supplied `desired_observation_end` and
+`RevisionPolicy`, producing one of `NO_UPDATE_NEEDED`, `APPEND_
+OBSERVATIONS` (from the day after the current coverage end, or the
+series' own `default_observation_start` if it has no history yet), or
+`REVISION_REFRESH` (the revision policy in effect CHANGED since the
+existing combined manifest was built -- already-covered dates may now
+resolve to different vintages, so a full refresh is required).
+`planning_time` is excluded from the plan's own identity (two plans
+computed minutes apart from identical inputs are the SAME plan); this
+module's job is only to REPORT the no-op case correctly -- the actual
+"no new version" guarantee lives in `datasets.py`'s own idempotent
+`append`, as above.
+
+**Reconciliation** (`reconciliation.py`) and **verification**
+(`verification.py`) mirror Phase 4A's own honesty split exactly.
+Reconciliation scans ALREADY-STORED evidence purely against itself (no
+original construction parameters needed): registry-vs-combined-manifest
+linkage, component manifest version linkage, coverage/observation-count
+recomputation from the observation store, conflicting-vintage detection
+(same `observation_date` + `realtime_start` recording two DIFFERENT
+values), and provenance completeness (both directions). Verification
+takes the ORIGINAL construction parameters plus a `CuratedIngestionReport`'s
+own `SeriesOutcome`s and REDERIVES everything fresh, independently, using
+the exact same pure functions orchestration used: registry self-check
+identity, per-series response-manifest re-hash, a STRICT reparse of the
+cached raw bytes, recomputed availability/normalized values via
+`_normalize_curated_row` (imported directly from `orchestration.py`),
+recomputed component/combined manifest self-check identities and
+recomputed `completeness_status` -- never trusting a cached parsed
+observation, a recorded count, or any final "is_verified" flag anywhere.
+
+**PIT consumer contract** (documented, not yet a joined feature --
+matching Phase 4A's own "modeled but not wired into feature generation"
+discipline): a future consumer joining curated macro data into market
+bars MUST filter on `availability_time`, never `observation_date` alone
+-- `test_collectors_curated_pit_concurrency_adversarial.py` proves this
+concretely (an earlier-`observation_date`-but-later-`availability_time`
+value stays invisible before its availability time) and
+`test_market_data_safety_scan.py`'s new `TestCuratedSpecificSafety`
+class makes any FUTURE reintroduction of the anti-pattern (comparing
+`observation_date` directly against a time value) structurally loud,
+not merely documented in prose.
+
+**Real-FRED acceptance workflow** (`acceptance.py`). `acceptance.py` is
+the ONE place anywhere in `collectors/` (curated included) that reads an
+environment variable (`FRED_API_KEY_ENV_VAR = "FRED_API_KEY"`) --
+explicitly the sanctioned exception to "no arbitrary environment reads
+in pure domain code." `resolve_fred_api_key_from_environment` never
+raises and never falls back to a placeholder; `run_real_fred_acceptance_
+workflow` REQUIRES an explicit, non-empty `api_key` argument (disabled
+by default), runs the full pipeline over a caller-BOUNDED interval with
+a small page size, then a SECOND `ForbiddenTransport`-backed pass over
+the SAME `operation_id` to prove offline replay makes zero network
+calls, comparing the two runs' semantic results. `RedactedAcceptanceReport`
+is structurally incapable of carrying a secret -- its own field set has
+no place to put one. The corresponding pytest test resolves the key via
+the same function and calls `pytest.skip(...)` with a precise reason
+when absent (the expected state for ordinary CI and this offline
+development environment); a missing credential is never treated as an
+application failure, and the ordinary full suite never requires a key or
+network access.
+
+**Mandatory fixture-based acceptance** (`test_collectors_curated_
+fixture_acceptance.py`). The ALWAYS-RUN, no-network counterpart:
+realistic, hand-built FRED fixtures covering all 4 core series across
+two native frequencies, one missing observation (a weekend "."), and one
+revision (`DGS10`, same `observation_date`, two vintages with different
+values and `realtime_start`s) -- exercising the complete pipeline
+(orchestration -> component/combined datasets -> reconciliation ->
+verification -> offline replay) fully deterministically. Also proves two
+properties beyond the ordinary happy path: running the identical
+semantic workflow from two INDEPENDENT temp repositories converges on
+byte-identical `combined_manifest_id`/component/observation ids (proving
+identity is purely content-addressed, never influenced by filesystem
+path), and running it in two child interpreters under DIFFERENT explicit
+`PYTHONHASHSEED` values produces the identical `combined_manifest_id`
+(proving identity never depends on Python's per-process-randomized
+`hash()`/dict-iteration order, only on `compute_content_id`'s canonical,
+sorted-key JSON + sha256).
+
 ## Known limitations (honestly disclosed)
 
 Phase 1:
@@ -1133,17 +1434,73 @@ Phase 4A:
   phase populates or consumes them.
 - No CLI surface: library only, matching Phases 1-3.
 
+Phase 4B:
+- `NEXT_BUSINESS_DAY_CONSERVATIVE` uses simple Mon-Fri weekday
+  arithmetic with NO public-holiday calendar awareness -- a disclosed
+  limitation carried over from the same honest gap Phase 3's
+  `REQUIRE_EXPECTED_MARKET_CALENDAR` gap policy already discloses for
+  OTC/provider-specific sessions.
+- `AvailabilityPolicyKind.RELEASE_CALENDAR_REFERENCE` is deliberately
+  UNIMPLEMENTED this phase -- `resolve_availability_time` raises
+  `AvailabilityPolicyError` rather than silently falling back to a
+  different policy kind; a future phase wiring an actual BLS/Treasury
+  release calendar can implement this branch without a schema change.
+- FRED reports only DATES for `realtime_start`, never exact intraday
+  publication times; every `AvailabilityPolicy`'s `availability_hour`/
+  `availability_minute` is a disclosed, configurable APPROXIMATION of
+  when a value becomes usable, not a claim of verified real release
+  timing -- the policy itself is fully identity-relevant, so this
+  approximation is auditable, never silently baked in.
+- Only the 4 mandatory core series are individually fixture-verified
+  this phase; the 14 extended-universe candidates are registered
+  (`default_extended_series_specs`) but all constructed `enabled=False`
+  -- enabling one for a live backfill requires an explicit opt-in flip
+  by a future caller, not a code change.
+- No curated-data-to-market-bar join exists yet (matching Phase 4A's own
+  "modeled but not wired into feature generation" limitation for
+  Phase 1 macro events) -- the PIT consumer contract is documented and
+  enforced by a dedicated safety-scan check, not yet exercised by an
+  actual feature-generation join.
+- Concurrency testing under AGGRESSIVE same-process thread contention
+  (multiple threads simultaneously retrying the identical operation in
+  a tight loop) occasionally surfaces `experiment_lock`'s own stale-
+  lock-reclaim heuristic (`ml.concurrency`, shared infrastructure
+  predating this phase) needing more attempts than a single bare call
+  provides before any one thread completes; every individual failure
+  observed under this stress remains a clean, recognized
+  `MarketDataLockError` (never corruption -- confirmed via extensive
+  repeated testing, see `test_collectors_curated_pit_concurrency_
+  adversarial.py::TestConcurrency`), and a bounded caller-level retry
+  with a small jittered backoff (the pattern a real caller would use)
+  reliably converges. A deeper fix to `experiment_lock`'s own contention
+  behavior under heavy same-process thread load is out of this phase's
+  scope (shared infrastructure used by every prior phase) and is noted
+  here as a candidate for dedicated follow-up work, not fixed as a
+  side effect of this phase's own deliverable.
+- No pagination support, matching Phase 4A: `page_size` bounds a single
+  request; `CuratedBackfillSpec.max_series_count`/`max_observations_
+  per_series`/`max_total_raw_bytes` bound a whole operation, but a
+  caller needing more than one FRED page per series issues more than
+  one operation, exactly as Phase 4A's own collector does.
+- No CLI surface: library only, matching Phases 1-4A.
+
 ## Future phases (not started)
 
 Session-reset VWAP; Wilder-smoothed ATR/RSI variants; macro-derived
-features with point-in-time enforcement wired into generation; tick-to-
-candle resampling; a real instrument registry; fixed-event-count and
-granularity-changing (daily-to-monthly) compaction; windowed/bounded
-store reads for large-scale partition rebuild; integration with
-`portfolio_risk`/`execution_gateway` as their own authoritative
-market-data source (this milestone explicitly forbade touching either
-package); FRED pagination and additional collector endpoints beyond
-`/fred/series/observations`; further external collectors (Yahoo
-Finance, MT5, broker/news APIs -- Phase 4A delivered FRED only), live
-streaming, and CLI expansion (explicitly out of scope through Phase 4A,
-reserved for a future milestone).
+features with point-in-time enforcement wired into generation
+(including an actual curated-macro-to-market-bar join using
+`availability_time`); tick-to-candle resampling; a real instrument
+registry; fixed-event-count and granularity-changing
+(daily-to-monthly) compaction; windowed/bounded store reads for
+large-scale partition rebuild; integration with `portfolio_risk`/
+`execution_gateway` as their own authoritative market-data source (this
+milestone explicitly forbade touching either package); FRED pagination
+and additional collector endpoints beyond `/fred/series/observations`
+and `/fred/series`; a real BLS/Treasury release-calendar implementation
+for `AvailabilityPolicyKind.RELEASE_CALENDAR_REFERENCE`; public-holiday
+awareness for `NEXT_BUSINESS_DAY_CONSERVATIVE`; enabling and
+fixture-verifying the extended macro-series universe beyond the 4 core
+drivers; further external collectors (Yahoo Finance, MT5, broker/news
+APIs -- Phase 4A/4B delivered FRED only), live streaming, and CLI
+expansion (explicitly out of scope through Phase 4B, reserved for a
+future milestone).

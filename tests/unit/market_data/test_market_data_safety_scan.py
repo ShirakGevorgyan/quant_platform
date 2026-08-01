@@ -530,3 +530,81 @@ class TestCollectorSpecificSafety:
             assert path.name == "retry.py", f"{path.name} calls float(...) outside retry.py's own duration parsing: {flagged}"
             for line in flagged:
                 assert "seconds" in line or "stripped" in line, f"unexpected float(...) call shape in retry.py: {line!r}"
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 4B: checks specific to `collectors/curated/` -- the
+# curated multi-series FRED universe layer. `_collector_source_files()`
+# already reaches this subpackage (it is a RECURSIVE `rglob` over all of
+# `collectors/`), so every check above already covers it; this section adds
+# ONE further, Phase-4B-specific structural check the earlier phases had no
+# occasion to need: a curated observation's `observation_date` (the
+# ECONOMIC PERIOD text FRED reports) must never be compared directly
+# against a wall-clock-shaped time value as if it were proof of
+# availability -- that is exactly the point-in-time leakage
+# `availability_time`/`availability.py` exists to prevent (see
+# `macro_observation.py`'s own module docstring: "never the availability
+# proof"). A future change that filtered "is this observation visible
+# yet" by checking `observation_date <= as_of` directly (skipping
+# `resolve_availability_time` entirely) would reintroduce look-ahead bias
+# silently; this check makes that reintroduction structurally loud.
+# --------------------------------------------------------------------------
+_CURATED_ROOT = _COLLECTORS_ROOT / "curated"
+_OBSERVATION_DATE_AS_AVAILABILITY = re.compile(
+    r"\bobservation_date\w*\s*(<=|>=|==|<|>)\s*(as_of|planning_time|operation_time|desired_observation_end)\b"
+    r"|\b(as_of|planning_time|operation_time|desired_observation_end)\s*(<=|>=|==|<|>)\s*observation_date\w*\b"
+)
+
+
+def _curated_source_files() -> list[Path]:
+    return sorted(_CURATED_ROOT.rglob("*.py"))
+
+
+class TestCuratedSpecificSafety:
+    def test_curated_subpackage_is_reached_by_the_scanner(self) -> None:
+        # Guards against a silent path-computation mistake that would make
+        # every check in this class vacuously true by scanning zero files.
+        files = _curated_source_files()
+        assert len(files) >= 10
+        assert any(p.name == "availability.py" for p in files)
+        assert all(p in _collector_source_files() for p in files)
+
+    def test_no_direct_observation_date_used_as_availability_proof(self) -> None:
+        """`observation_date` may be PASSED to `resolve_availability_time`
+        (a named keyword argument, `availability.py`'s own legitimate
+        entry point) but must never be COMPARED directly against a
+        wall-clock-shaped time value anywhere in `curated/` -- doing so
+        would bypass `AvailabilityPolicy` resolution entirely and treat
+        the economic period as if it were proof of release timing."""
+        for path in _curated_source_files():
+            text = path.read_text(encoding="utf-8")
+            match = _OBSERVATION_DATE_AS_AVAILABILITY.search(text)
+            assert match is None, f"{path.name} compares observation_date directly against a time value: {match.group(0) if match else ''!r}"
+
+    def test_observation_date_as_availability_check_is_non_vacuous(self) -> None:
+        bad_snippets = (
+            "if observation.observation_date <= as_of:\n",
+            "visible = observation_date_text >= planning_time\n",
+            "if desired_observation_end < observation_date:\n",
+        )
+        for snippet in bad_snippets:
+            assert _OBSERVATION_DATE_AS_AVAILABILITY.search(snippet), f"scanner failed to catch: {snippet!r}"
+
+    def test_legitimate_availability_time_comparison_is_not_flagged(self) -> None:
+        """The CORRECT pattern (comparing the RESOLVED `availability_time`,
+        never the raw `observation_date`, against `as_of`) must not be
+        flagged -- proves the check is precise, not merely banning the
+        word "observation_date" from ever appearing near a comparison."""
+        good_snippet = "visible = observation.availability_time <= as_of\n"
+        assert not _OBSERVATION_DATE_AS_AVAILABILITY.search(good_snippet)
+
+    def test_no_secret_in_any_curated_module(self) -> None:
+        """`acceptance.py` is the ONE sanctioned place in all of
+        `collectors/` (curated included) that reads `FRED_API_KEY` from
+        the environment -- confirmed here to be the ONLY curated module
+        naming that env var, and that no curated module hardcodes a
+        credential-shaped literal."""
+        offenders = [p.name for p in _curated_source_files() if p.name != "acceptance.py" and "FRED_API_KEY" in p.read_text(encoding="utf-8")]
+        assert offenders == [], f"unexpected FRED_API_KEY reference outside acceptance.py: {offenders}"
+        source = _collector_combined_source()
+        assert not _LONG_LITERAL_API_KEY.search(source)

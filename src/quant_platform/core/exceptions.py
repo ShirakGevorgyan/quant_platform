@@ -1676,3 +1676,73 @@ class CollectorVerificationError(CollectorError):
     report) when a FATAL cross-consistency check fails and the caller
     has asked for that to raise rather than merely be reported as an
     issue."""
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 4B: curated FRED macro universe.
+# --------------------------------------------------------------------------
+class CuratedRegistryError(CollectorError):
+    """Raised when a curated FRED series registry or an individual
+    `CuratedFredSeriesSpec` is structurally invalid: a duplicate FRED
+    series id or canonical name, an ambiguous target instrument
+    identity, an unsupported normalization/unit/frequency combination,
+    a missing release-availability policy, or an enabled series with no
+    target identity."""
+
+
+class SeriesMetadataError(CollectorError):
+    """Base class for FRED series-METADATA failures (the `/fred/series`
+    endpoint, distinct from `/fred/series/observations`) -- a structural
+    parse failure of the metadata response itself, as opposed to a
+    drift between that (valid) metadata and a curated spec's own
+    expectations (`MetadataDriftError`)."""
+
+
+class MetadataDriftError(SeriesMetadataError):
+    """Raised when officially-returned FRED series metadata disagrees
+    with a curated spec's own declared expectations in a way this
+    phase's drift policy classifies as FAIL CLOSED: a different series
+    id than requested, an incompatible frequency, incompatible units, or
+    a seasonal-adjustment change that is analytically meaningful. A
+    harmless title/notes-only change is a WARNING, never this."""
+
+
+class AvailabilityPolicyError(CollectorError):
+    """Raised when a `ReleaseAvailabilityPolicy` is structurally invalid
+    (e.g. a negative delay, an unsupported policy kind, or a missing
+    field its own kind requires)."""
+
+
+class AvailabilityUnresolvedError(AvailabilityPolicyError):
+    """Raised when an observation's `availability_time` cannot be
+    resolved under its declared `ReleaseAvailabilityPolicy` -- the
+    record must be quarantined or rejected, NEVER silently treated as
+    immediately available (which would be a point-in-time leak)."""
+
+
+class RevisionPolicyError(CollectorError):
+    """Raised when a requested/declared revision policy
+    (`LATEST_AVAILABLE`/`FIRST_RELEASE_ONLY`/`AS_OF_REALTIME_DATE`/
+    `VINTAGE_SERIES`) is invalid for the requesting context, or two
+    series combined into one curated universe declare incompatible
+    revision policies that this phase does not support combining."""
+
+
+class CuratedBackfillSpecError(CollectorError):
+    """Raised when a `CuratedBackfillSpec` is structurally invalid: an
+    empty or duplicate series selection, an unknown or disabled series,
+    an invalid interval, an unbounded request, or a wall-clock-dependent
+    default this phase forbids."""
+
+
+class CombinedManifestError(CollectorError):
+    """Raised when a combined curated-universe manifest is structurally
+    invalid, or its own identity cannot be reproduced from its recorded
+    component dataset references."""
+
+
+class UpdatePlanError(CollectorError):
+    """Raised when incremental update-plan construction receives
+    invalid inputs (e.g. a caller-supplied planning time that is not
+    tz-aware, or an existing manifest that does not belong to the
+    curated registry/universe being planned against)."""

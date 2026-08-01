@@ -1,0 +1,71 @@
+{
+  "curated_registry": {
+    "registry_version": 1,
+    "core_series": [
+      {
+        "series_id": "DFII10",
+        "canonical_series_name": "us_10y_real_yield",
+        "tier": "CORE_XAUUSD_DRIVER",
+        "economic_category": "real_rates"
+      },
+      {
+        "series_id": "DGS10",
+        "canonical_series_name": "us_10y_nominal_yield",
+        "tier": "CORE_XAUUSD_DRIVER",
+        "economic_category": "nominal_rates"
+      },
+      {
+        "series_id": "CPIAUCSL",
+        "canonical_series_name": "us_cpi_all_urban",
+        "tier": "CORE_XAUUSD_DRIVER",
+        "economic_category": "inflation"
+      },
+      {
+        "series_id": "DFF",
+        "canonical_series_name": "effective_federal_funds_rate",
+        "tier": "CORE_XAUUSD_DRIVER",
+        "economic_category": "policy_rate"
+      }
+    ],
+    "extended_series_enabled": []
+  },
+  "backfill": {
+    "selected_series_ids": ["CPIAUCSL", "DFF", "DFII10", "DGS10"],
+    "observation_start": "2015-01-01T00:00:00Z",
+    "observation_end": "2024-12-31T00:00:00Z",
+    "revision_policy": {
+      "kind": "LATEST_AVAILABLE"
+    },
+    "cache_policy": "PREFER_CACHE",
+    "fail_fast": true,
+    "page_size": 10000,
+    "max_series_count": 8,
+    "max_observations_per_series": 20000,
+    "max_total_raw_bytes": 50000000,
+    "target_dataset_namespace": "xauusd_macro_research"
+  },
+  "availability_policies": {
+    "daily_series": {
+      "kind": "OBSERVATION_DATE_END_OF_DAY",
+      "timezone_key": "America/New_York",
+      "availability_hour": 17,
+      "availability_minute": 0,
+      "applies_to": ["DFII10", "DGS10", "DFF"]
+    },
+    "monthly_series": {
+      "kind": "REALTIME_START_DATE_CONSERVATIVE",
+      "timezone_key": "America/New_York",
+      "availability_hour": 8,
+      "availability_minute": 30,
+      "applies_to": ["CPIAUCSL"]
+    }
+  },
+  "credentials": {
+    "api_key_source": "environment_variable",
+    "api_key_env_var": "FRED_API_KEY",
+    "_comment": "No literal API key is ever written here. The runtime key is resolved ONLY at call time via quant_platform.market_data.collectors.curated.acceptance.resolve_fred_api_key_from_environment(), which reads FRED_API_KEY from the process environment (or an explicit mapping a caller supplies) and never persists, logs, or echoes it. Ordinary fixture-backed tests and backfills never require this key at all."
+  },
+  "storage": {
+    "storage_root": "./data"
+  }
+}
