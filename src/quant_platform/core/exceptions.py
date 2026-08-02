@@ -1976,3 +1976,44 @@ class BridgeVerificationError(MarketDataBridgeError):
     consuming its report) when a FATAL cross-consistency check fails and
     the caller has asked for that to raise rather than merely be reported
     as an issue."""
+
+
+# --------------------------------------------------------------------------
+# Milestone 11, Phase 1: deterministic Dataset Qualification Engine.
+# `quant_platform.qualification` decides whether an ALREADY-BUILT research
+# dataset (`features.manifests.ResearchDatasetManifest`, produced by the
+# real, unmodified `features.dataset_builder.ResearchDatasetBuilder`) is
+# scientifically suitable for ML -- it never trains a model, never computes
+# feature importance, never performs feature selection, and never builds a
+# second `FeatureEngine`/`FeatureRegistry`/`ResearchDatasetBuilder`.
+# --------------------------------------------------------------------------
+class QualificationError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.qualification`.
+    This package reads an already-built research dataset's manifest and
+    durable artifacts ONLY -- it never recomputes a feature, never refits
+    a model, never opens a network connection, and never claims a
+    dataset is a good TRADING dataset (only that it is structurally,
+    temporally, and statistically sound enough to build a model from)."""
+
+
+class QualificationRequestError(QualificationError):
+    """Raised when a qualification request (the manifest/store/optional
+    `required_feature_names` bundle handed to `DatasetQualificationEngine.
+    qualify`) is structurally invalid -- e.g. a `research_store` that
+    cannot resolve the manifest's own `dataset_id`."""
+
+
+class QualificationVerificationError(QualificationError):
+    """Raised when `QualificationVerifier` cannot even ATTEMPT its checks
+    (e.g. the manifest's content directory is entirely unreadable for a
+    reason unrelated to corruption, such as a filesystem permission
+    error) -- as opposed to a genuine corruption/mismatch FINDING, which
+    is always reported as a blocking failure on the resulting report,
+    never raised."""
+
+
+class QualificationReconciliationError(QualificationError):
+    """Raised when `QualificationReconciliation` cannot complete
+    structurally (the report or its source manifest cannot be read at
+    all), as opposed to an ordinary structured `ReconciliationIssue`
+    finding, which is a normal, expected, non-raising outcome."""
