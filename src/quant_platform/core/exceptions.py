@@ -2060,3 +2060,106 @@ class FeatureDiscoveryReconciliationError(FeatureDiscoveryError):
     all, or the two reports being compared cover different feature
     sets), as opposed to an ordinary structured drift finding, which is
     a normal, expected, non-raising outcome."""
+
+
+# --------------------------------------------------------------------------
+# Milestone 11, Phase 3, Part A: deterministic Label Infrastructure.
+# `quant_platform.labels` establishes the versioned, content-addressed,
+# replayable, point-in-time-safe framework every future label family will
+# be generated through -- it never generates a real label VALUE for any
+# of the 6 named families (Next Return, Multi Horizon Return, Direction,
+# Triple Barrier, Forward Volatility, Future Extension Placeholder), never
+# trains a model, and never claims a label is predictive. A label produced
+# through this framework is immutable scientific evidence derived from
+# historical observations, never a prediction.
+# --------------------------------------------------------------------------
+class LabelError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.labels`. This
+    package is pure infrastructure: identity, versioning, manifest,
+    diagnostics, verification, replay, recovery, reconciliation, and
+    reporting for whatever label VALUES a caller-supplied, pluggable
+    generator function produces -- it never ships a generator for any
+    named label family itself (that is a later phase's responsibility)
+    and never computes a statistic that requires a prediction target."""
+
+
+class LabelRequestError(LabelError):
+    """Raised when a request into this package (a specification's own
+    constructor arguments, a builder/registry/reconciliation call) is
+    structurally invalid -- e.g. an empty `created_from_dataset`, or two
+    bundles requested for reconciliation that do not share a
+    `label_specification_id`."""
+
+
+class LabelIdentityError(LabelError):
+    """Raised when a `LabelSpecification`'s or `LabelBundle`'s own
+    self-consistency check fails: a freshly recomputed
+    `label_specification_id`/`parameter_hash`/identity `content_id`
+    does not match what the object itself claims -- always a tampering
+    or corruption signal, never a normal outcome silently tolerated at
+    construction/registration time."""
+
+
+class DuplicateLabelSpecificationError(LabelError):
+    """Raised when `LabelRegistry.register` is called with a
+    `label_specification_id` already present -- mirrors `features.
+    registry.FeatureRegistry`'s own append-only `DuplicateFeatureError`
+    exactly: a specification is never silently overwritten, and a
+    genuine parameter change always produces a new, distinct id instead."""
+
+
+class UnknownLabelSpecificationError(LabelError):
+    """Raised when `LabelRegistry.lookup`/`freeze`/`verify` is given a
+    `label_specification_id` that was never registered."""
+
+
+class LabelGenerationContractError(LabelError):
+    """Raised when a caller-supplied, pluggable label generator function
+    (`LabelDefinition.generate`) returns something that violates the
+    generic structural contract `LabelBuilder` enforces (not a
+    `pd.Series`, wrong length, non-numeric dtype) -- this package never
+    inspects whether the VALUES are scientifically correct for any named
+    family, only that the generic shape contract is honored."""
+
+
+class LabelMutableAliasError(LabelError):
+    """Raised when a generator's returned label `pd.Series` shares
+    underlying memory with a column of its own source `DataFrame`
+    (detected via `numpy.shares_memory`, never Python `is` identity,
+    which pandas column access does not reliably preserve) -- mutating
+    the source data later would silently corrupt an already-generated
+    label, violating this package's immutability guarantee."""
+
+
+class LabelVerificationError(LabelError):
+    """Raised when `LabelVerifier` cannot even ATTEMPT its checks (e.g.
+    the supplied generator raises while `LabelVerifier` re-derives a
+    fresh bundle for comparison) -- as opposed to a genuine mismatch
+    FINDING, which is always reported as a non-raising
+    `LabelVerificationResult.verified=False`, never raised."""
+
+
+class LabelReplayError(LabelError):
+    """Raised when `LabelReplay` cannot even ATTEMPT a replay (e.g. the
+    original bundle and the supplied source data disagree in row count
+    before generation is even invoked) -- as opposed to a genuine
+    replay-divergence finding, which is a normal, non-raising
+    `LabelReplayResult.replayed=False` outcome."""
+
+
+class LabelRecoveryError(LabelError):
+    """Raised when `LabelRecovery` cannot even ATTEMPT recovery (e.g. a
+    malformed `LabelSpecification` is supplied) -- as opposed to a
+    genuine "insufficient evidence to recover" outcome, which is a
+    normal, non-raising `LabelRecoveryResult.recoverable=False` result.
+    Recovery never guesses at a plausible label value; it only ever
+    replays from the original specification and source data, or
+    honestly reports that it cannot."""
+
+
+class LabelReconciliationError(LabelError):
+    """Raised when `LabelReconciliation` cannot complete structurally
+    (the two bundles being compared do not share a
+    `label_specification_id`, so there is nothing to reconcile), as
+    opposed to an ordinary structured drift finding, which is a normal,
+    expected, non-raising outcome."""
