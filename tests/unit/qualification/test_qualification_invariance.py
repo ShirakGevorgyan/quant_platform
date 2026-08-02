@@ -14,7 +14,6 @@ import textwrap
 
 import pandas as pd
 import pytest
-from conftest import build_request, trend_registry
 
 from quant_platform.core.types import Timeframe
 from quant_platform.features.dataset_builder import ResearchDatasetBuilder
@@ -58,13 +57,15 @@ class TestTruncationInvariance:
         prefix = train_df.iloc[:cutoff_index]
         assert prefix["open_time"].is_monotonic_increasing == train_df["open_time"].is_monotonic_increasing is True
 
-    def test_real_rebuild_with_a_shorter_date_range_reproduces_identical_prefix_rows(self, tmp_path, seeded_loader, synthetic_m1_df) -> None:
+    def test_real_rebuild_with_a_shorter_date_range_reproduces_identical_prefix_rows(
+        self, tmp_path, seeded_loader, synthetic_m1_df, trend_registry_factory, build_request_factory,
+    ) -> None:
         research_store = ResearchDatasetStore(tmp_path / "research_full")
         builder = ResearchDatasetBuilder(
-            historical_loader=seeded_loader, registry=trend_registry(), research_store=research_store,
+            historical_loader=seeded_loader, registry=trend_registry_factory(), research_store=research_store,
             manifest_store=ResearchManifestStore(tmp_path / "research_full"),
         )
-        full_manifest = builder.build(build_request())
+        full_manifest = builder.build(build_request_factory())
         full_splits = research_store.read_artifacts(full_manifest.dataset_id, full_manifest.content_id)
         assert full_splits is not None
         full_all = pd.concat(full_splits.values(), ignore_index=True).sort_values("open_time").reset_index(drop=True)
@@ -72,10 +73,10 @@ class TestTruncationInvariance:
         cutoff = synthetic_m1_df["open_time"].iloc[999]
         truncated_research_store = ResearchDatasetStore(tmp_path / "research_truncated")
         truncated_builder = ResearchDatasetBuilder(
-            historical_loader=seeded_loader, registry=trend_registry(), research_store=truncated_research_store,
+            historical_loader=seeded_loader, registry=trend_registry_factory(), research_store=truncated_research_store,
             manifest_store=ResearchManifestStore(tmp_path / "research_truncated"),
         )
-        truncated_manifest = truncated_builder.build(build_request(end=cutoff + Timeframe.M1.duration))
+        truncated_manifest = truncated_builder.build(build_request_factory(end=cutoff + Timeframe.M1.duration))
         truncated_splits = truncated_research_store.read_artifacts(truncated_manifest.dataset_id, truncated_manifest.content_id)
         assert truncated_splits is not None
         truncated_all = pd.concat(truncated_splits.values(), ignore_index=True).sort_values("open_time").reset_index(drop=True)
@@ -94,13 +95,15 @@ class TestReplayInvariance:
     entirely on the deterministic (source, recipe) pair, never on
     whatever happened to be sitting on disk from a previous build."""
 
-    def test_rebuilding_after_destroying_artifacts_reproduces_an_identical_report(self, tmp_path, seeded_loader) -> None:
+    def test_rebuilding_after_destroying_artifacts_reproduces_an_identical_report(
+        self, tmp_path, seeded_loader, trend_registry_factory, build_request_factory,
+    ) -> None:
         research_root = tmp_path / "research"
         research_store = ResearchDatasetStore(research_root)
         manifest_store = ResearchManifestStore(research_root)
-        builder = ResearchDatasetBuilder(historical_loader=seeded_loader, registry=trend_registry(), research_store=research_store, manifest_store=manifest_store)
+        builder = ResearchDatasetBuilder(historical_loader=seeded_loader, registry=trend_registry_factory(), research_store=research_store, manifest_store=manifest_store)
 
-        manifest_1 = builder.build(build_request())
+        manifest_1 = builder.build(build_request_factory())
         report_1 = DatasetQualificationEngine().qualify(manifest_1, research_store, required_feature_names=frozenset({"trend"}))
 
         content_dir = research_store.content_dir(manifest_1.dataset_id, manifest_1.content_id)
@@ -108,7 +111,7 @@ class TestReplayInvariance:
         shutil.rmtree(content_dir)
         assert not content_dir.exists()
 
-        manifest_2 = builder.build(build_request())
+        manifest_2 = builder.build(build_request_factory())
         report_2 = DatasetQualificationEngine().qualify(manifest_2, research_store, required_feature_names=frozenset({"trend"}))
 
         assert manifest_1.dataset_id == manifest_2.dataset_id

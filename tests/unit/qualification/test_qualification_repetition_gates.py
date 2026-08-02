@@ -6,8 +6,6 @@ repetition (after stripping the legitimately wall-clock-dependent
 
 from __future__ import annotations
 
-from conftest import build_request, trend_registry
-
 from quant_platform.features.dataset_builder import ResearchDatasetBuilder
 from quant_platform.features.manifests import ResearchDatasetStore, ResearchManifestStore
 from quant_platform.qualification.diagnostics import compute_diagnostics
@@ -36,12 +34,12 @@ class TestRepeatQualification:
 
 
 class TestRepeatReplay:
-    def test_ten_repeated_rebuilds_are_identical(self, tmp_path, seeded_loader) -> None:
+    def test_ten_repeated_rebuilds_are_identical(self, tmp_path, seeded_loader, trend_registry_factory, build_request_factory) -> None:
         research_store = ResearchDatasetStore(tmp_path / "research")
         manifest_store = ResearchManifestStore(tmp_path / "research")
-        builder = ResearchDatasetBuilder(historical_loader=seeded_loader, registry=trend_registry(), research_store=research_store, manifest_store=manifest_store)
+        builder = ResearchDatasetBuilder(historical_loader=seeded_loader, registry=trend_registry_factory(), research_store=research_store, manifest_store=manifest_store)
 
-        manifests = [builder.build(build_request()) for _ in range(_REPEAT_COUNT)]
+        manifests = [builder.build(build_request_factory()) for _ in range(_REPEAT_COUNT)]
         assert all(m.dataset_id == manifests[0].dataset_id for m in manifests)
         assert all(m.content_id == manifests[0].content_id for m in manifests)
         assert all(m.version == manifests[0].version for m in manifests)

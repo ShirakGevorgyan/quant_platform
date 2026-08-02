@@ -128,6 +128,33 @@ def research_store(tmp_path) -> ResearchDatasetStore:
 
 
 @pytest.fixture
+def build_request_factory():
+    """Exposes `build_request` as an injected fixture rather than
+    requiring `from conftest import build_request` -- a bare `import
+    conftest`/`from conftest import ...` is ambiguous once more than one
+    test directory's own (identically-named) `conftest.py` has been
+    imported into the SAME `pytest` session's `sys.modules` cache (e.g.
+    `tests/unit/feature_discovery/`'s own `conftest.py`); whichever
+    module won that slot first silently shadows the other, breaking
+    `from conftest import ...` in the loser's test files with a
+    confusing `ImportError` for a name that plainly exists. Pytest's own
+    fixture resolution has no such ambiguity (it is directory-scoped,
+    not `sys.modules`-keyed), so every helper this suite's test files
+    need is exposed as a fixture instead."""
+    return build_request
+
+
+@pytest.fixture
+def trend_registry_factory():
+    return trend_registry
+
+
+@pytest.fixture
+def two_feature_registry_factory():
+    return two_feature_registry
+
+
+@pytest.fixture
 def qualified_manifest(tmp_path, seeded_loader, research_store) -> ResearchDatasetManifest:
     """A REAL `ResearchDatasetManifest` produced by the real, unmodified
     `ResearchDatasetBuilder` -- the fixture every qualification test

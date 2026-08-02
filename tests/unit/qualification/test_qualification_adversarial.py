@@ -19,7 +19,6 @@ from dataclasses import replace
 
 import numpy as np
 import pandas as pd
-from conftest import build_request, trend_registry
 
 from quant_platform.features.dataset_builder import ResearchDatasetBuilder
 from quant_platform.features.manifests import ResearchDatasetStore, ResearchManifestStore
@@ -293,12 +292,12 @@ class TestManifestHashRecomputation:
 
 
 class TestFilesystemRelocation:
-    def test_qualification_is_identical_after_moving_the_entire_research_root(self, tmp_path, seeded_loader) -> None:
+    def test_qualification_is_identical_after_moving_the_entire_research_root(self, tmp_path, seeded_loader, trend_registry_factory, build_request_factory) -> None:
         original_root = tmp_path / "original"
         research_store = ResearchDatasetStore(original_root / "research")
         manifest_store = ResearchManifestStore(original_root / "research")
-        builder = ResearchDatasetBuilder(historical_loader=seeded_loader, registry=trend_registry(), research_store=research_store, manifest_store=manifest_store)
-        manifest = builder.build(build_request())
+        builder = ResearchDatasetBuilder(historical_loader=seeded_loader, registry=trend_registry_factory(), research_store=research_store, manifest_store=manifest_store)
+        manifest = builder.build(build_request_factory())
         report_before = DatasetQualificationEngine().qualify(manifest, research_store, required_feature_names=frozenset({"trend"}))
 
         relocated_root = tmp_path / "relocated"

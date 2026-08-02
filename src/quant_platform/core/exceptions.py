@@ -2017,3 +2017,46 @@ class QualificationReconciliationError(QualificationError):
     structurally (the report or its source manifest cannot be read at
     all), as opposed to an ordinary structured `ReconciliationIssue`
     finding, which is a normal, expected, non-raising outcome."""
+
+
+# --------------------------------------------------------------------------
+# Milestone 11, Phase 2, Part 1: deterministic Feature Discovery & Signal
+# Diagnostics. `quant_platform.feature_discovery` scientifically evaluates
+# every feature in an ALREADY-BUILT, ALREADY-QUALIFIED research dataset
+# (informativeness, stability, redundancy, drift, leakage safety) -- it
+# never trains a model, never computes SHAP/permutation importance, never
+# performs feature selection, and never builds a second
+# `FeatureEngine`/`FeatureRegistry`/`ResearchDatasetBuilder`/
+# `DatasetQualificationEngine`. Its output is scientific evidence about
+# feature QUALITY, never a claim about predictive alpha.
+# --------------------------------------------------------------------------
+class FeatureDiscoveryError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.feature_discovery`.
+    This package reads an already-built research dataset's manifest and
+    durable artifacts ONLY -- it never recomputes a feature, never fits
+    a predictive model, and never claims a feature IS or IS NOT
+    predictive (only that it is, or is not, scientifically well-behaved
+    enough to be worth a later milestone's consideration)."""
+
+
+class FeatureDiscoveryRequestError(FeatureDiscoveryError):
+    """Raised when a discovery request (the manifest/store/optional
+    feature-name subset handed to `FeatureDiscoveryEngine.discover`) is
+    structurally invalid -- e.g. a requested feature name absent from
+    `manifest.feature_names`."""
+
+
+class FeatureDiscoveryVerificationError(FeatureDiscoveryError):
+    """Raised when `FeatureDiscoveryVerifier` cannot even ATTEMPT its
+    checks (e.g. the manifest's content directory is entirely unreadable
+    for a reason unrelated to corruption) -- as opposed to a genuine
+    corruption/mismatch FINDING, which is always reported as a blocking
+    finding on the resulting report, never raised."""
+
+
+class FeatureDiscoveryReconciliationError(FeatureDiscoveryError):
+    """Raised when `FeatureDiscoveryReconciliation` cannot complete
+    structurally (the report or its source manifest cannot be read at
+    all, or the two reports being compared cover different feature
+    sets), as opposed to an ordinary structured drift finding, which is
+    a normal, expected, non-raising outcome."""
