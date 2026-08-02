@@ -563,6 +563,262 @@ variance, same conservative-floor philosophy as Milestone 2's benchmarks):
 - Manifest save + load + artifact read round trip (200,000-row dataset):
   34.3ms.
 
+## Milestone 10 Phase 4D: point-in-time multi-source alignment bridge
+
+`quant_platform.features.market_data_bridge` translates Milestone 10's
+durable, versioned, content-addressed `market_data` repositories (Phase
+2's raw candle store, Phase 4B's curated FRED macro layer, Phase 4C's
+cross-asset market-driver layer) into the exact input shapes THIS
+package already accepts, so a research dataset can be built from
+`market_data`-backed sources through the REAL, unmodified
+`FeatureEngine`/`FeatureRegistry`/`ResearchDatasetBuilder` above -- never
+a second feature-computation or dataset-building path. Everything in
+this section is additive to the architecture described above; nothing
+above this section changed in behavior (the two exceptions --
+`ResearchDatasetBuildRequest.market_data_lineage`/`ResearchDatasetManifest.
+market_data_lineage`, both new optional fields defaulting to `None` --
+are noted inline in their own sections).
+
+### Dependency direction and package layout
+
+`historical`/`market_data` -> `features.market_data_bridge` -> `features`
+(unmodified) -> research dataset artifacts. `market_data` never imports
+this bridge or any other part of `features` (verified structurally by
+`test_market_data_bridge_safety_scan.py::TestMarketDataNeverImportsFeatures`,
+which scans every file under `market_data/` for a `features` import).
+
+```
+features/market_data_bridge/
+    bindings.py             immutable BaseAssetDatasetBinding/MacroDatasetBinding/CrossAssetDatasetBinding
+    base_asset_adapter.py    resolves+verifies a base-asset binding -> HistoricalDatasetLoaderProtocol
+    macro_adapter.py         resolves+verifies a macro binding -> value/release_time DataFrame
+    cross_asset_adapter.py   resolves+verifies a cross-asset binding -> OHLCV DataFrame (availability-shifted)
+    coverage.py               source-coverage policy (FAIL_REQUIRED_SOURCE/ALLOW_OPTIONAL_MISSING_AND_REPORT/
+                               TRIM_TO_COMMON_SAFE_RANGE/QUARANTINE_INTERVAL)
+    staleness.py              per-source-type staleness reporting (reuses as_of_join_external/align_higher_timeframe)
+    lineage.py                assembles market_data_lineage + its content fingerprint
+    request.py                the orchestration entry point: build_research_dataset_from_market_data
+    rebuild_planner.py        pure incremental rebuild planner (no I/O)
+    reconciliation.py         non-raising structured-issue-reporting counterpart to the adapters' verify_* functions
+    verification.py           independent verification incl. the truncation-invariance proofs
+    reports.py                deterministic plain-text reports
+```
+
+Two narrow, additive changes were made OUTSIDE this new package, both
+backward compatible:
+- `historical/loader.py` gained `HistoricalDatasetLoaderProtocol`
+  (structural interface: `resolve_manifest`/`load_for_engine`) and
+  `HistoricalManifestLike` (structural interface:
+  `.dataset_id`/`.version`/`.content_checksum`, declared via `@property`
+  so a frozen dataclass can satisfy it). `ResearchDatasetBuilder.__init__`'s
+  `historical_loader` parameter is now typed against the Protocol instead
+  of the concrete `DatasetLoader` class -- a type-hint-only change; the
+  real `DatasetLoader` already satisfies it structurally, confirmed by
+  `test_market_data_bridge_backward_compatibility.py::
+  TestHistoricalDatasetLoaderProtocolBackwardCompatibility`.
+- `ResearchDatasetBuildRequest`/`ResearchDatasetManifest` each gained one
+  new field, `market_data_lineage: dict[str, object] | None = None`
+  (default `None`, so every pre-existing call site is unaffected).
+
+### Source bindings (`bindings.py`)
+
+`BaseAssetDatasetBinding`/`MacroDatasetBinding`/`CrossAssetDatasetBinding`
+are immutable, content-addressed (their own `binding_id` is a
+deterministic hash of every other field, computed by a `create_*`
+factory mirroring `market_data`'s own `create_*`-then-`compute_content_id`
+convention). Every identity-bearing string field is validated against a
+small set of forbidden mutable-alias tokens (`latest`/`current`/`newest`/
+`active`/`default`/...) -- `SourceBindingError` on construction, never a
+downstream surprise. `CrossAssetDatasetBinding` structurally rejects
+`instrument_form=ETF` paired with `proxy_policy.is_proxy=False` at
+construction time (reuses `market_data`'s own `ProxyPolicy` type
+directly rather than re-declaring proxy vocabulary).
+
+### The three source adapters: verify, then resolve
+
+Each adapter (`base_asset_adapter.py`/`macro_adapter.py`/
+`cross_asset_adapter.py`) exposes a `verify_*_binding` function (re-reads
+the live `market_data` store, requires the binding's pinned id to equal
+the store's CURRENT manifest, and requires a freshly recomputed digest
+to match that manifest's own recorded digest -- `SourceVerificationError`
+fail-closed on any mismatch) and a `resolve_*_dataframe`/`load_for_engine`
+function (the single, documented Decimal -> float64 boundary crossing,
+producing exactly the shape this package's existing feature families
+expect). Base-asset conflicting-candle and cross-asset conflicting-bar
+coordinates (two different records claiming the same timestamp) are
+detected and rejected, never silently resolved by picking one.
+
+**The cross-asset availability-shift adapter** is the one genuinely new
+alignment idea here (spec's own "if conventions differ, implement an
+explicit adapter and document the conversion"): `align_higher_timeframe`
+derives its reveal instant internally as `open_time + timeframe.duration`
+and has no parameter for an externally-supplied availability time, but a
+`MarketDriverBar` carries its OWN resolved `availability_time` (which can
+be materially later than a naive close-time guess, e.g. next-day
+availability for daily ETF proxy bars). `cross_asset_adapter.
+resolve_cross_asset_dataframe` therefore emits a SYNTHETIC `open_time`
+per row (`availability_time - timeframe.duration`) so that
+`align_higher_timeframe`'s own close-time-based reveal rule lands exactly
+on the bar's true availability instant, without touching that shared,
+already-tested primitive. Proven end-to-end by
+`test_market_data_bridge_cross_asset_adapter.py::
+TestResolveCrossAssetDataframe::test_bar_not_revealed_before_true_availability_time`.
+
+Base-asset data uses a different, simpler, equally explicit policy: a
+`market_data.candles.Candle` carries no `availability_time` field at all
+(unlike the richer Phase 4B/4C records), so the bridge's own honest
+policy is that a candle becomes visible exactly at its `close_time`
+(`open_time + timeframe.duration`) -- which is EXACTLY `FeatureEngine.
+compute`'s own availability-instant derivation for the base timeframe;
+the adapter changes nothing about how that's computed, it only supplies
+the values.
+
+**Macro revision-policy selection** (`macro_adapter.
+select_observations_for_policy`) is a pure selection over an already-
+verified, already-multi-vintage observation set -- it decides WHICH
+observations enter the join, never how the join itself works.
+`RevisionPolicyKind.VINTAGE_SERIES` passes every distinct vintage
+through unchanged (the general-purpose default: because each vintage
+carries its own accurate `availability_time`, `as_of_join_external`'s
+existing backward-looking as-of join over the full multi-vintage stream
+already reproduces true point-in-time-correct behavior with no new
+alignment logic). `FIRST_RELEASE_ONLY` keeps only the earliest-released
+vintage per `observation_date`. `LATEST_AVAILABLE`/`AS_OF_REALTIME_DATE`
+are REFUSED outright (`AlignmentPolicyError`) for research/training
+dataset construction -- both are explicitly non-point-in-time-safe by
+their own `market_data` docstrings (a single global "whatever is true
+right now" or "whatever was true on one fixed historical date" snapshot,
+never a per-row as-of view). A genuinely missing observation
+(`is_missing=True`) is included with `value=NaN` at its own real
+`availability_time` rather than dropped, so the series correctly shows
+as unavailable starting exactly when the official gap was published,
+never silently masked by the prior value's carry-forward.
+
+### Coverage, staleness, lineage, and manifest identity
+
+`coverage.py` implements the four named policy kinds (spec's own
+vocabulary): `FAIL_REQUIRED_SOURCE` (default-safe, raises
+`SourceCoverageError`), `ALLOW_OPTIONAL_MISSING_AND_REPORT`,
+`TRIM_TO_COMMON_SAFE_RANGE` (computes and reports the exact trimmed
+range and why -- never silent), and `QUARANTINE_INTERVAL` (a separate,
+post-hoc function, `evaluate_missing_runs`, over an already-computed
+missing indicator, identifying consecutive-missing runs beyond a
+configured tolerance -- reported, never auto-dropped). `staleness.py`
+reuses the existing `as_of_join_external`/`align_higher_timeframe`
+primitives directly (rather than reimplementing staleness) to produce a
+per-source `StalenessFinding`, applying a source-specific age threshold
+independent of which features a caller actually registered.
+
+`lineage.build_market_data_lineage` assembles a deterministic, stable-
+sorted JSON payload from every resolved binding plus the coverage
+decision; `lineage_content_id` gives it one content-addressed
+fingerprint. `request.build_research_dataset_from_market_data` (the
+orchestration entry point) threads BOTH into the `ResearchDatasetBuildRequest`
+it hands to the REAL `ResearchDatasetBuilder.build()` --
+`market_data_lineage` directly, and the fingerprint via
+`aux_input_content_hashes["market_data_lineage_content_id"]` (the SAME
+free-form extension point `historical_dataset_content_checksum` already
+used).
+
+**How this satisfies "changing a bound source version changes dataset
+identity" without touching `compute_dataset_id`.** `compute_dataset_id`
+(unmodified) stays a stable, source-content-independent "recipe id"
+exactly as originally designed. `ResearchDatasetManifest.
+market_data_lineage` is NOT excluded from `_identity_fields()`, so
+`ResearchManifestStore.save`'s own existing content-duplicate-vs-new-
+version comparison already picks up any lineage change. The precise
+mechanism (worth stating exactly, since it is easy to get subtly wrong
+-- see `test_market_data_bridge_identity_compatibility.py`'s own module
+docstring for the full worked explanation): `version` is
+`f"{sequence:06d}-{content_id_prefix}"`, where `content_id` hashes only
+the WRITTEN feature/label/split bytes (so two builds with different
+lineage but coincidentally identical output bytes can share the same
+`content_id_prefix`), but `sequence` always advances whenever
+`_identity_fields()` differs from the latest existing version in the
+SAME manifest history -- so the full version string still changes,
+provided the rebuild targets the same `ResearchManifestStore` root
+(the realistic "rebuild after a source revision" scenario).
+
+### Incremental rebuild planning, reconciliation, and verification
+
+`rebuild_planner.plan_rebuild` is a PURE function (no `market_data`/
+`features` I/O of its own) comparing an existing manifest's recorded
+lineage against newly proposed bindings, returning one of `NO_OP`/
+`APPEND_ONLY_SAFE_EXTENSION`/`PARTIAL_RECOMPUTATION_REQUIRED`/
+`FULL_REBUILD_REQUIRED` with reason codes. Distinguishing a safe append
+from a content revision requires more than a bare changed-id signal (a
+content hash carries no diff), so the planner accepts OPTIONAL
+`SourceChangeEvidence` (old/new covered-time-range and count, obtained
+by the caller separately) and only classifies `APPEND_ONLY_SAFE_EXTENSION`
+when BOTH the covered range's start is unchanged AND there is STRICT
+growth in at least one of covered-end-time/count -- identical
+range-and-count evidence alongside a changed component id (the
+signature of a same-range, same-count content-only revision) is never
+classified append-only, even though it satisfies a naive `>=`-based
+check (a real bug caught and fixed by this phase's own adversarial
+tests: see `test_market_data_bridge_adversarial.py::
+Test22IncrementalPlannerDoesNotMissAHistoricalRevisionImpact`).
+
+`reconciliation.py` is the non-raising, structured-issue-reporting
+counterpart to the adapters' own fail-closed `verify_*` functions, plus
+two standalone PIT re-checks (`reconcile_no_pre_availability_macro_
+leakage`/`reconcile_no_pre_close_cross_asset_leakage`) that independently
+re-derive the as-of/close-time join's own output and assert no selected
+value's timestamp exceeds the row's own availability instant.
+
+`verification.py` assembles the independent-verification checklist,
+classifying each check's actual independence HONESTLY
+(`INDEPENDENCE_CLASSIFICATION`): re-reading durable evidence via a
+genuinely separate code path (`independent_re_read`) vs. reproducing an
+already-published digest via the exact same hash formula
+(`same_formula_re_derivation` -- proves store/manifest consistency, not
+algorithmic independence of the hash itself) vs. reusing the SAME shared
+M3 alignment primitive the production path itself uses
+(`reused_shared_primitive` -- proves internal self-consistency, not
+independence from a bug in that shared primitive, which M3's own
+`test_alignment_boundaries.py` covers separately). The truncation-
+invariance proofs (`verify_truncation_invariance_macro`/`_cross_asset`)
+directly exercise spec's own "truncating all records after T must not
+change any aligned row at/before T" requirement by comparing alignment
+against the full source vs. a version truncated after a cutoff -- this
+caught a real bug during development (a `NaT != NaT` pandas comparison
+pitfall that misreported "no release yet in either join" as "differing";
+fixed, with a regression test).
+
+### Tests
+
+`tests/unit/features/test_market_data_bridge_*.py` (bindings, all three
+adapters, coverage, staleness, lineage, rebuild planner, reconciliation,
+verification, reports, the orchestration entry point, golden identity
+compatibility, backward compatibility, the mandatory 12-step
+fixture-based acceptance workflow, the 22-item adversarial suite, a
+safety scan, and performance sanity bounds) plus a shared fixture-helper
+module (`_market_data_bridge_test_helpers.py`, not itself collected).
+Every test builds real `market_data` repositories through the REAL
+ingestion/collector-store APIs and feeds the REAL `ResearchDatasetBuilder`
+-- never a mock or a test-only replacement.
+
+### Known limitations (Phase 4D)
+
+- No selective historical read for a superseded `market_data` manifest
+  version across any of the three source kinds (see `docs/
+  market_data_architecture.md`'s own Phase 4D section for the full
+  explanation and the base-asset-vs-macro/cross-asset asymmetry).
+- Cross-asset `roll_provenance`/`contract_metadata_id` (per-bar futures
+  detail) are not propagated into the aligned OHLCV frame -- unexercised
+  by this phase's ETF-only fixtures, a real gap for a future
+  futures/continuous-series cross-asset driver.
+- No genuine `market_data`-backed higher-timeframe derivation for the
+  SAME base instrument -- a caller resolves it via a second
+  `base_asset_adapter.resolve_base_asset_dataframe` call themselves.
+- `SourceChangeEvidence` (the rebuild planner's append-only-detection
+  input) must be supplied by the caller from a SEPARATE `market_data`
+  read; this phase does not auto-compute it from two binding sets alone
+  (a bare component/dataset id has no diff).
+- No CLI surface for the bridge itself (`feature_cli.py` unchanged) --
+  library-only, matching every `market_data` phase's own disclosed
+  limitation.
+
 ## Known limitations (honest, as measured)
 
 - **A custom feature can still misuse raw future data directly** (see

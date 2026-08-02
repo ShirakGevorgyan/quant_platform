@@ -1886,3 +1886,93 @@ class GapPolicyError(CollectorError):
     policy that must prevent a COMPLETE universe status as a result --
     an ordinary, expected gap finding is reported via `GapReport`
     instead and never raises this."""
+
+
+# --------------------------------------------------------------------------
+# Milestone 10, Phase 4D: point-in-time multi-source alignment bridge
+# between `quant_platform.market_data` and `quant_platform.features`.
+# `MarketDataBridgeError` is a `FeatureError` subclass (not a
+# `MarketDataError` one) because the bridge package itself lives under
+# `quant_platform.features.market_data_bridge` and only ever READS from
+# `market_data` -- the same "exceptions are grouped by the package that
+# raises them" convention every other block in this file already follows.
+# --------------------------------------------------------------------------
+class MarketDataBridgeError(FeatureError):
+    """Base class for every failure in
+    `quant_platform.features.market_data_bridge`. This package never
+    computes a feature value itself (all feature-family computation
+    still happens in the unmodified Milestone 3 `features` modules), never
+    writes to `quant_platform.market_data`, and never opens a network
+    connection -- it only reads already-durable `market_data` evidence and
+    reshapes/aligns it into the exact input shapes `features.engine.
+    FeatureEngine`/`features.dataset_builder.ResearchDatasetBuilder`
+    already accept."""
+
+
+class SourceBindingError(MarketDataBridgeError):
+    """Raised when a `bindings.BaseAssetDatasetBinding`/`MacroDatasetBinding`/
+    `CrossAssetDatasetBinding` is structurally invalid -- including an
+    attempt to pin a mutable alias (`"latest"`/`"current"`/`"newest"`/
+    `"active"`/a provider default) in a field that must be an exact,
+    immutable, content-addressed identity string."""
+
+
+class SourceVerificationError(MarketDataBridgeError):
+    """Raised when a pinned source binding cannot be independently
+    re-verified against the durable `market_data` evidence it claims to
+    reference: the referenced dataset/manifest/partition/component no
+    longer exists, a recomputed semantic digest does not match the pinned
+    one, or the underlying durable store has been appended to since the
+    binding was pinned (making the exact pinned version no longer
+    reconstructible from the store's current, append-only-grown state).
+    Always fails closed -- never silently substitutes the current/latest
+    state for the pinned one."""
+
+
+class AlignmentPolicyError(MarketDataBridgeError):
+    """Raised when a requested source-alignment, revision/vintage, or
+    availability policy is structurally invalid for the requesting
+    context -- most commonly, a macro revision policy that is explicitly
+    NOT point-in-time-safe (`RevisionPolicyKind.LATEST_AVAILABLE` or
+    `AS_OF_REALTIME_DATE`) bound to a training/research dataset request,
+    which this bridge always refuses rather than silently building a
+    leaky dataset."""
+
+
+class SourceCoverageError(MarketDataBridgeError):
+    """Raised when a bound source's available coverage cannot satisfy its
+    declared `coverage.SourceCoveragePolicy` under `FAIL_REQUIRED_SOURCE`
+    -- a required source with insufficient coverage, or a requested range
+    with no safe common overlap across every required source. An optional
+    source's shortfall, or a policy that permits trimming/quarantine, is
+    reported via `CoverageReport` instead and never raises this."""
+
+
+class MarketDataLineageError(MarketDataBridgeError):
+    """Raised when a `ResearchDatasetManifest.market_data_lineage` payload
+    is structurally invalid, references a lineage schema version this code
+    does not know how to read, or cannot be reproduced from its own
+    recorded bindings -- never silently reinterpreted as a different
+    schema version."""
+
+
+class RebuildPlanError(MarketDataBridgeError):
+    """Raised when `rebuild_planner`'s pure planner cannot safely
+    construct a rebuild plan from its inputs: an existing research
+    manifest whose recorded market-data lineage is missing or malformed,
+    or a proposed binding set that is not a well-formed successor to the
+    manifest's recorded one."""
+
+
+class BridgeReconciliationError(MarketDataBridgeError):
+    """Raised when bridge-side reconciliation cannot complete structurally
+    (a referenced binding/manifest/store cannot even be read), as opposed
+    to an ordinary structured `ReconciliationIssue` finding, which is a
+    normal, expected, non-raising outcome."""
+
+
+class BridgeVerificationError(MarketDataBridgeError):
+    """Raised by `verification.verify_market_data_bridge` (or a caller
+    consuming its report) when a FATAL cross-consistency check fails and
+    the caller has asked for that to raise rather than merely be reported
+    as an issue."""

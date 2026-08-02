@@ -1,6 +1,6 @@
 # Deterministic Market Data Platform and Feature Store (Milestone 10) -- Architecture
 
-## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) + Phase 4A (secure external historical collector infrastructure and FRED integration) + Phase 4B (curated FRED macro universe and verified historical backfill workflow for XAUUSD research) + Phase 4C (provider-neutral cross-asset historical market collectors and curated XAUUSD market-driver universe) delivered
+## Status: Phase 1 (immutable market events, calendar, macro, quality, normalization, deterministic feature generation and storage, replay, verification, reports) + Phase 2 (durable repository, dataset versioning, incremental ingestion, partitioning, checkpoints, recovery, reconciliation, compaction, export) + Phase 3 (historical ingestion orchestration and offline source adapters) + Phase 4A (secure external historical collector infrastructure and FRED integration) + Phase 4B (curated FRED macro universe and verified historical backfill workflow for XAUUSD research) + Phase 4C (provider-neutral cross-asset historical market collectors and curated XAUUSD market-driver universe) + Phase 4D (point-in-time multi-source alignment bridge into the existing Milestone 3 research-dataset pipeline -- see `docs/feature_engineering.md`'s own Phase 4D section for the full design; this document's Phase 4D section covers only the `market_data`-side read surface the bridge uses) delivered
 
 ## Primary goal
 
@@ -63,11 +63,28 @@ depend only on `identity.py`. `normalization.py` depends on
 `events.py`/`feature_store.py`. `reports.py` depends on `events.py`/
 `feature_store.py`/`verification.py`.
 
-This package does not modify, and is not imported by, `historical`,
+This package itself does not modify, and is not imported by, `historical`,
 `features`, `data`, `execution_gateway`, or `portfolio_risk` -- it is a
 genuinely new, self-contained domain that happens to reuse a few already-
 proven low-level building blocks from elsewhere in the repository (see
-"Reuse decisions" below). Nothing in those other packages changed.
+"Reuse decisions" below).
+
+**Phase 4D update**: a new package, `features.market_data_bridge` (living
+inside `features/`, documented in full in `docs/feature_engineering.md`'s
+own Phase 4D section), now imports `market_data` read-only to bridge this
+package's durable repositories into the Milestone 3 feature-engineering
+pipeline. The dependency direction stays strictly one-way --
+`market_data` still never imports `features`, and nothing in this
+package's own source changed to enable it (see `features/market_data_
+bridge/base_asset_adapter.py`/`macro_adapter.py`/`cross_asset_adapter.py`,
+which read `MarketEventStore`/`DatasetManifestStore`/`PartitionStore`
+(Phase 2) and the Phase 4B/4C curated stores exactly as any other reader
+would, through their existing public APIs only). `historical/loader.py`
+gained one narrow, additive Protocol (`HistoricalDatasetLoaderProtocol`/
+`HistoricalManifestLike`) and `features/dataset_builder.py`/`features/
+manifests.py` gained one narrow, additive field each
+(`ResearchDatasetBuildRequest.market_data_lineage`/`ResearchDatasetManifest.
+market_data_lineage`) -- both changes live in `features/`, not here.
 
 ## Reuse decisions
 
@@ -1918,6 +1935,62 @@ never a literal value. A dedicated test
 backfill objects directly from the file and confirms zero secret-shaped
 literals anywhere in it.
 
+## Point-in-time multi-source alignment bridge into the research-dataset pipeline (Phase 4D)
+
+Phase 4D's own package (`features.market_data_bridge`) lives entirely
+inside `features/`, not here -- see `docs/feature_engineering.md` for
+its full design (binding models, the three source adapters, coverage/
+staleness/lineage/rebuild-planning/reconciliation/verification, the 28-
+section delivery report at `docs/milestone10_phase4d_delivery_report.md`).
+This section documents only the READ SURFACE of `market_data` the
+bridge actually uses, and the one structural limitation of that surface
+worth understanding before relying on it.
+
+**What the bridge reads, and how:**
+- Base-asset candles: `events.MarketEventStore.read_events` (Phase 1) +
+  `manifests.DatasetManifestStore`/`partitions.PartitionStore` (Phase 2),
+  for `DatasetKind.RAW_MARKET_EVENTS`.
+- Curated macro observations: `collectors.curated.macro_observation.
+  CuratedObservationStore` + `collectors.curated.datasets.
+  ComponentDatasetManifestStore` (Phase 4B).
+- Cross-asset market-driver bars: `collectors.cross_asset.market_record.
+  MarketDriverBarStore` + `collectors.cross_asset.datasets.
+  ComponentMarketDatasetManifestStore` (Phase 4C).
+
+Every read goes through these stores' existing PUBLIC methods only --
+Phase 4D added no new `market_data` read method, no new store, and no
+change to any of the modules above.
+
+**The one structural limitation worth knowing: none of these stores
+support a SELECTIVE historical read "give me exactly what manifest
+version N described."** `MarketEventStore.read_events`/
+`CuratedObservationStore.read_observations`/`MarketDriverBarStore.
+read_bars` always return the full CURRENT append-only content for their
+partition/series/mapping; `partitions.PartitionStore` is explicitly
+documented as CURRENT-version-only storage (a later partition rebuild
+physically replaces the prior file at the same path). Practically, this
+means a Phase 4D binding can only be VERIFIED (never re-read byte-for-
+byte) once the underlying repository has advanced past the exact version
+it pinned -- `features.market_data_bridge.base_asset_adapter.
+verify_base_asset_binding`/`macro_adapter.verify_macro_binding`/
+`cross_asset_adapter.verify_cross_asset_binding` all fail closed
+(`SourceVerificationError`) in that case, rather than silently
+substituting the current state. Base-asset bindings get a strictly
+stronger guarantee than macro/cross-asset ones here: because Phase 2's
+`DatasetManifest.ordered_partition_ids` combined with `PartitionStore.
+read`'s CURRENT partition content lets a caller reconstruct the exact
+member-event-id set for the CURRENT manifest version deterministically,
+`verify_base_asset_binding` can verify via an exact member-set
+reconstruction; Phase 4B/4C's `ComponentDatasetManifest`/
+`ComponentMarketDatasetManifest` do not retain a member-id list at all
+(only a `semantic_digest` hash and summary counts), so their verification
+is limited to reproducing that digest from a live read and comparing --
+a real, meaningful check (it detects any divergence between the store
+and its manifest), but not a way to recover an OLDER, superseded
+manifest version's exact content once the store has grown past it. No
+`market_data` code changed to accommodate this; Phase 4D's bridge
+documents and works within the existing contract.
+
 ## Known limitations (honestly disclosed)
 
 Phase 1:
@@ -2097,30 +2170,62 @@ Phase 4C:
   operation.
 - No CLI surface: library only, matching Phases 1-4B.
 
+Phase 4D (bridge -- lives in `features/`, summarized here for
+completeness; full list in `docs/feature_engineering.md`'s own Phase 4D
+section and the delivery report):
+- No selective historical read for a superseded manifest version, for
+  every source kind, as described in the Phase 4D section above --
+  base-asset bindings can at least verify via exact member-set
+  reconstruction against the CURRENT manifest; macro/cross-asset
+  bindings can only verify via digest reproduction against the CURRENT
+  manifest. Neither can recover an OLDER version's content once the
+  store has grown past it.
+- Cross-asset `MarketDriverBar.roll_provenance`/`contract_metadata_id`
+  (per-bar futures/continuation detail) are not propagated by
+  `cross_asset_adapter.resolve_cross_asset_dataframe` into the aligned
+  OHLCV frame -- only binding-level `instrument_form`/`adjustment_
+  policy_id`/`continuation_policy_id` (a policy identifier, not the
+  per-bar roll detail) reach the research dataset's lineage. Unexercised
+  by this phase's own fixtures (ETF proxies only, matching Phase 4C's
+  own shipped provider coverage), but a real gap if a future phase wires
+  in a genuine futures/continuous-series cross-asset driver.
+- No genuine market_data-backed higher-timeframe derivation for the
+  SAME base instrument -- a caller wanting this resolves it via a second
+  `base_asset_adapter.resolve_base_asset_dataframe` call at the coarser
+  timeframe themselves (`request.
+  MarketDataResearchDatasetRequest.higher_timeframe_data` accepts the
+  result unchanged).
+
 ## Future phases (not started)
 
-Session-reset VWAP; Wilder-smoothed ATR/RSI variants; macro-derived
-features with point-in-time enforcement wired into generation
-(including an actual curated-macro-to-market-bar join using
-`availability_time`); tick-to-candle resampling; a real instrument
-registry; fixed-event-count and granularity-changing
-(daily-to-monthly) compaction; windowed/bounded store reads for
-large-scale partition rebuild; integration with `portfolio_risk`/
-`execution_gateway` as their own authoritative market-data source (this
-milestone explicitly forbade touching either package); FRED pagination
-and additional collector endpoints beyond `/fred/series/observations`
-and `/fred/series`; a real BLS/Treasury release-calendar implementation
-for `AvailabilityPolicyKind.RELEASE_CALENDAR_REFERENCE`; public-holiday
-awareness for `NEXT_BUSINESS_DAY_CONSERVATIVE`; enabling and
-fixture-verifying the extended macro-series universe beyond the 4 core
-drivers; a real, live-verified futures provider (individual-contract or
+Session-reset VWAP; Wilder-smoothed ATR/RSI variants; tick-to-candle
+resampling; a real instrument registry; fixed-event-count and
+granularity-changing (daily-to-monthly) compaction; windowed/bounded
+store reads for large-scale partition rebuild; integration with
+`portfolio_risk`/`execution_gateway` as their own authoritative
+market-data source (this milestone explicitly forbade touching either
+package); FRED pagination and additional collector endpoints beyond
+`/fred/series/observations` and `/fred/series`; a real BLS/Treasury
+release-calendar implementation for `AvailabilityPolicyKind.
+RELEASE_CALENDAR_REFERENCE`; public-holiday awareness for
+`NEXT_BUSINESS_DAY_CONSERVATIVE`; enabling and fixture-verifying the
+extended macro-series universe beyond the 4 core drivers; a real,
+live-verified futures provider (individual-contract or
 provider-continuous) to exercise `futures.py`/`ContinuationPolicy`
 outside the fixture universe; a viable `treasury_volatility` provider
 mapping; per-mapping (rather than per-driver-spec) session/adjustment/
-availability policies; a cross-asset-to-XAUUSD-feature join with
-point-in-time enforcement wired into generation; a real EIA integration
-(route structure was live-verified, but no data was fetched without
-registering a real account); further external collectors (Yahoo
-Finance, MT5, broker/news APIs -- Phase 4A/4B/4C delivered FRED and
-Alpha Vantage only), live streaming, and CLI expansion (explicitly out
-of scope through Phase 4C, reserved for a future milestone).
+availability policies; a real EIA integration (route structure was
+live-verified, but no data was fetched without registering a real
+account); further external collectors (Yahoo Finance, MT5, broker/news
+APIs -- Phase 4A/4B/4C delivered FRED and Alpha Vantage only), live
+streaming, and CLI expansion (explicitly out of scope through Phase 4C,
+reserved for a future milestone).
+
+**Resolved by Phase 4D** (previously listed here as future work): a
+curated-macro-to-market-bar join using `availability_time`, and a
+cross-asset-to-XAUUSD-feature join, both with point-in-time enforcement
+wired into ACTUAL feature generation -- delivered via
+`features.market_data_bridge`, reusing the existing Milestone 3
+`FeatureEngine`/`features.alignment` primitives unchanged rather than
+adding a second computation path. See this document's own Phase 4D
+section above and `docs/feature_engineering.md`.

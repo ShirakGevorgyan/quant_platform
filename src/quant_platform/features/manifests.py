@@ -119,6 +119,28 @@ class ResearchDatasetManifest:
     created_at: pd.Timestamp
     environment: dict[str, object] = field(default_factory=capture_environment_metadata)
     content_id: str = ""
+    market_data_lineage: dict[str, object] | None = None
+    """Additive, Milestone 10 Phase 4D field -- `None` for every manifest
+    built the original way (a real `historical.loader.DatasetLoader` with
+    no `market_data`-backed sources), and the structured payload
+    `features.market_data_bridge.lineage.build_market_data_lineage`
+    produces whenever the base asset, and/or any macro/cross-asset
+    source, was resolved through `features.market_data_bridge` instead.
+    `None` is never silently reinterpreted as "no market_data lineage
+    exists" vs. "this manifest predates the field" -- both cases are
+    externally indistinguishable by design (an old manifest genuinely has
+    no such lineage to report), consistent with spec's "old manifest
+    never silently interpreted as containing new lineage" requirement.
+    Because this field is NOT excluded from `_identity_fields()`, changing
+    which exact market_data source versions/policies were used changes
+    this payload's content, which changes whether `ResearchManifestStore.
+    save` treats a rebuild as content-identical (no-op) or mints a new
+    version -- the mechanism spec Section 4/17 requires ("changing a
+    bound source version changes the resulting research dataset
+    identity"), achieved without touching `compute_dataset_id`'s own
+    hash inputs (which stay a stable, source-content-independent "recipe
+    id" exactly as originally designed -- see this module's own opening
+    docstring)."""
 
     def to_json_dict(self) -> dict[str, object]:
         return {
@@ -146,6 +168,7 @@ class ResearchDatasetManifest:
             "created_at": self.created_at.isoformat(),
             "environment": self.environment,
             "content_id": self.content_id,
+            "market_data_lineage": self.market_data_lineage,
         }
 
     @classmethod
@@ -175,6 +198,7 @@ class ResearchDatasetManifest:
             created_at=pd.Timestamp(str(raw["created_at"])),
             environment=_as_dict(raw.get("environment") or {}),
             content_id=str(raw.get("content_id", "")),
+            market_data_lineage=(None if raw.get("market_data_lineage") is None else _as_dict(raw["market_data_lineage"])),
         )
 
     def _identity_fields(self) -> dict[str, object]:

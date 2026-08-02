@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -195,4 +195,58 @@ class DatasetLoader:
         return projected[list(OHLCV_COLUMNS)]
 
 
-__all__ = ["DatasetLoader", "LoadRequest", "RequiredQuality"]
+@runtime_checkable
+class HistoricalManifestLike(Protocol):
+    """Structural subset of `historical.manifest.DatasetManifest` that
+    `features.dataset_builder.ResearchDatasetBuilder.build` actually reads
+    off a resolved manifest -- exactly `.dataset_id`, `.version`, and
+    `.content_checksum` (see that module's `build()` body). A caller
+    substituting a non-`historical`-backed base-asset source (Milestone 10
+    Phase 4D's `features.market_data_bridge.base_asset_adapter`) only
+    needs to satisfy this narrow shape, never construct a full real
+    `DatasetManifest`. Declared via `@property` (read-only) rather than
+    plain attributes -- `ResearchDatasetBuilder.build()` only ever READS
+    these three fields, and a read-only Protocol lets an immutable
+    (`frozen=True`) dataclass implementation (e.g. `market_data_bridge.
+    base_asset_adapter.ResolvedHistoricalManifest`) satisfy it; a
+    plain-attribute Protocol declaration requires a SETTABLE attribute,
+    which mypy correctly refuses to match against a frozen dataclass's
+    field."""
+
+    @property
+    def dataset_id(self) -> str: ...
+
+    @property
+    def version(self) -> str: ...
+
+    @property
+    def content_checksum(self) -> str: ...
+
+
+@runtime_checkable
+class HistoricalDatasetLoaderProtocol(Protocol):
+    """Structural interface `ResearchDatasetBuilder` actually depends on --
+    exactly the 2 methods its `build()` calls (`resolve_manifest`,
+    `load_for_engine`). The concrete `DatasetLoader` above already
+    satisfies this unchanged (added narrowly so `ResearchDatasetBuilder.
+    __init__`'s type hint can accept it -- a type-hint-only, zero-runtime-
+    behavior change); it exists so a non-`historical`-backed base-asset
+    source can be substituted at the SAME call site without a second
+    `ResearchDatasetBuilder` or any change to its leak-safety guarantees --
+    see `features.market_data_bridge.base_asset_adapter` (Milestone 10
+    Phase 4D)."""
+
+    def resolve_manifest(self, request: LoadRequest) -> HistoricalManifestLike: ...
+
+    def load_for_engine(
+        self, request: LoadRequest, *, volume_source: Literal["tick_volume", "real_volume"] = "tick_volume"
+    ) -> pd.DataFrame: ...
+
+
+__all__ = [
+    "DatasetLoader",
+    "HistoricalDatasetLoaderProtocol",
+    "HistoricalManifestLike",
+    "LoadRequest",
+    "RequiredQuality",
+]

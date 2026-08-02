@@ -75,7 +75,7 @@ from quant_platform.features.splitting import (
 )
 from quant_platform.features.validation import validate_research_dataset
 from quant_platform.historical.code_revision import capture_code_revision
-from quant_platform.historical.loader import DatasetLoader, LoadRequest
+from quant_platform.historical.loader import HistoricalDatasetLoaderProtocol, LoadRequest
 
 SplitStrategy = Literal["chronological", "expanding_walk_forward", "rolling_walk_forward"]
 
@@ -123,13 +123,24 @@ class ResearchDatasetBuildRequest:
     allow_critical_validation_issues: bool = False
     reproducibility_seed: int = 0
     aux_input_content_hashes: dict[str, str] = field(default_factory=dict)
+    market_data_lineage: dict[str, object] | None = None
+    """Additive, Milestone 10 Phase 4D field -- `None` (the default) for
+    every ordinary `historical.loader.DatasetLoader`-backed build.
+    `features.market_data_bridge.request.build_research_dataset_from_market_data`
+    is the only caller that sets this (to `features.market_data_bridge.
+    lineage.build_market_data_lineage`'s output), so that the resulting
+    `manifests.ResearchDatasetManifest.market_data_lineage` is populated
+    at manifest-construction time -- see that field's own docstring for
+    why populating it after `build()` already saved the manifest would be
+    unsafe (it would mint a spurious extra manifest version for the same
+    content)."""
 
 
 class ResearchDatasetBuilder:
     def __init__(
         self,
         *,
-        historical_loader: DatasetLoader,
+        historical_loader: HistoricalDatasetLoaderProtocol,
         registry: FeatureRegistry,
         research_store: ResearchDatasetStore,
         manifest_store: ResearchManifestStore,
@@ -273,6 +284,7 @@ class ResearchDatasetBuilder:
                 "info_count": len(validation_report.infos),
             },
             created_at=pd.Timestamp.now(tz="UTC"), content_id=content_id,
+            market_data_lineage=request.market_data_lineage,
         )
         version = self._manifest_store.save(manifest)
         return self._manifest_store.load(dataset_id, version)
