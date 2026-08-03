@@ -2163,3 +2163,18 @@ class LabelReconciliationError(LabelError):
     `label_specification_id`, so there is nothing to reconcile), as
     opposed to an ordinary structured drift finding, which is a normal,
     expected, non-raising outcome."""
+
+
+# --------------------------------------------------------------------------
+# Milestone 11, Phase 3, Part B: concrete label families (Next Return,
+# Multi Horizon Return, Direction, Triple Barrier, Forward Volatility)
+# built on top of Part A's infrastructure. Still never a model, never a
+# prediction, never a statistic requiring a prediction target.
+# --------------------------------------------------------------------------
+class LabelRecordConflictError(LabelError):
+    """Raised when `records.LabelRecordLedger.commit` is asked to commit
+    a `row_identity` that is already committed for a given
+    `label_specification_id` -- the ledger is append-only and never
+    overwrites; recovery re-derives only the NOT-yet-committed subset
+    (`LabelRecordLedger.recover`), it never silently replaces a
+    previously committed row's label."""

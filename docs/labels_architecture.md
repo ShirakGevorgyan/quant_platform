@@ -1,9 +1,9 @@
-# Label Infrastructure (Milestone 11, Phase 3, Part A)
+# Label Infrastructure (Milestone 11, Phase 3)
 
 This is the authoritative technical reference for `quant_platform.labels`
 -- the deterministic, versioned, content-addressed, replayable,
-auditable, point-in-time-safe framework every future label family will
-be generated through.
+auditable, point-in-time-safe framework every label family in this
+platform is generated through.
 
 **A label is not a model. A label is not a prediction. A label is
 immutable scientific evidence derived from historical observations.**
@@ -14,13 +14,25 @@ Rank IC, Mutual Information, SHAP, Permutation Importance, Boruta,
 Recursive Feature Elimination, or any correlation to a label). Those
 belong to a later phase, once a model exists to evaluate.
 
-**Part A ships infrastructure only.** It treats 6 named label families
-(Next Return, Multi Horizon Return, Direction, Triple Barrier, Forward
-Volatility, Future Extension Placeholder) as first-class identity/
-versioning/reporting citizens, but implements the generation LOGIC for
-none of them -- every generated label's values come from a
-caller-supplied, pluggable generator function; this phase ships zero
-concrete implementations of one. Those belong to Part 2.
+Delivered in two parts:
+
+- **Part A** -- infrastructure only. `LabelSpecification`, `LabelIdentity`,
+  `LabelRegistry`, `LabelBuilder`/`LabelBundle` (a generic harness around
+  a caller-supplied, pluggable generator), `LabelManifest`,
+  `LabelDiagnostics`, `LabelVerifier`, `LabelReplay`, `LabelRecovery`,
+  `LabelReconciliation`, and 7 reports. Treats 6 named label families
+  (Next Return, Multi Horizon Return, Direction, Triple Barrier, Forward
+  Volatility, Future Extension Placeholder) as first-class identity/
+  versioning/reporting citizens, but ships zero concrete generation
+  logic for any of them.
+- **Part B** (this report's newest addition) -- the first 5 concrete
+  label families' real generation logic, built entirely on top of Part
+  A's infrastructure via the SAME pluggable-generator contract Part A
+  established (`builder.LabelGeneratorFn`) -- never a parallel pipeline.
+  Adds per-row `LabelRecord`/`LabelRecordLedger` (append-only recovery),
+  and `CompositeLabelBundle` (deterministic multi-family groupings).
+  `Future Extension Placeholder` still ships no generation logic --
+  reserved, as its name says, for a future family.
 
 ## Relationship to `features.labels` (Milestone 3)
 
@@ -83,6 +95,16 @@ src/quant_platform/labels/
     replay.py                                   LabelReplay -- regenerate and prove byte-identical reproduction
     recovery.py                                   LabelRecovery -- replay-based recovery, fails closed
     reports.py                                      7 render_* functions: deterministic plain-text reports
+
+    pricing.py            (Part B) PriceBasis (4), compute_forward_return -- shared point-in-time-safe return math
+    volatility.py            (Part B) VolatilityEstimatorFn contract + 2 shipped, non-privileged estimators
+    next_return.py              (Part B) Next Return: generate_next_return_labels, build_next_return_specification
+    multi_horizon_return.py       (Part B) Multi Horizon Return: one independently-identified spec per horizon
+    direction.py                    (Part B) Direction: UP/DOWN/NEUTRAL, configurable neutral_threshold
+    triple_barrier.py                 (Part B) Triple Barrier: upper/lower/time barrier, volatility-scaled width
+    forward_volatility.py               (Part B) Forward Volatility: pluggable-estimator realized volatility
+    records.py                            (Part B) LabelRecord, LabelRecordLedger -- per-row identity + append-only recovery
+    composite.py                            (Part B) CompositeLabelBundle -- deterministic multi-family "Label Bundles"
 ```
 
 ## Dependency isolation
@@ -294,6 +316,165 @@ History Report. Every renderer performs no discovery/verification/
 reconciliation logic of its own -- it renders already-computed objects
 only.
 
+## Part B: the 5 concrete label families
+
+Every family below is implemented INDEPENDENTLY -- none reads another
+family's generated output, even where two families share a pure
+computational primitive (`pricing.compute_forward_return`). Every
+family ships a `generate_*` function matching Part A's
+`builder.LabelGeneratorFn` contract exactly (`(source_data,
+specification) -> pd.Series`) and a `build_*_specification` function
+that assembles a well-formed `LabelSpecification` via
+`models.build_label_specification` -- neither module invents a second
+identity scheme.
+
+### Shared primitives (`pricing.py`, `volatility.py`)
+
+`pricing.PriceBasis` (`CLOSE_TO_CLOSE`, `OPEN_TO_CLOSE`,
+`CLOSE_TO_OPEN`, `MID_TO_MID`) and `pricing.compute_forward_return`
+resolve the entry/exit price pair and compute `exit.shift(-horizon_bars)
+/ entry - 1.0` -- point-in-time safe by construction (row `t` reads
+EXACTLY row `t + horizon_bars`, never beyond it). Every family that
+needs a forward return (Next Return, Multi Horizon Return, Direction)
+calls this SAME function; reusing it is not "one family depending on
+another's output" -- no family ever reads another's generated VALUES,
+they simply share pure math.
+
+`volatility.VolatilityEstimatorFn` is a plain structural contract
+(`(source_data, window_bars) -> rolling volatility series`); no
+estimator is privileged. Two shipped, genuinely different
+implementations prove real pluggability: `realized_stddev_estimator`
+(trailing stddev of close-to-close returns) and
+`realized_parkinson_estimator` (the Parkinson 1980 high/low-range
+estimator) -- different inputs, different formulas, interchangeable
+through the same contract. `triple_barrier.py` and
+`forward_volatility.py` both accept an estimator BY NAME
+(`resolve_estimator_by_name`), so `LabelSpecification.parameters`
+stays JSON-safe while still recording exactly which estimator produced
+a given bundle.
+
+### 1. Next Return (`next_return.py`)
+
+`generate_next_return_labels` is `pricing.compute_forward_return`
+applied with an explicit, REQUIRED `price_basis` (no default -- a
+caller must always name Close->Close, Open->Close, Close->Open, or
+Mid->Mid) and `horizon_bars`.
+
+### 2. Multi Horizon Return (`multi_horizon_return.py`)
+
+The SAME return computation as Next Return, independently parameterized
+per horizon. `build_multi_horizon_return_specifications(horizons=...)`
+returns one `LabelSpecification` PER horizon -- "horizons belong to
+`LabelSpecification`" means each horizon is its own, independently
+identified specification, never one label smeared across many
+horizons. `MULTI_HORIZON_RETURN_MINIMUM_HORIZONS = (1, 5, 10, 20, 50,
+100)` names the minimum required set; the function accepts ANY
+`horizons` tuple ("no hardcoded assumptions").
+
+### 3. Direction (`direction.py`)
+
+UP (`1.0`)/DOWN (`-1.0`)/NEUTRAL (`0.0`), thresholded off the same
+forward-return primitive. `neutral_threshold` is a REQUIRED, explicit
+argument (no default) and always lands in `parameters`, so it
+participates in `parameter_hash` -> `label_specification_id` by
+construction -- any threshold change is automatically a new,
+independently identified specification.
+
+### 4. Triple Barrier (`triple_barrier.py`)
+
++1 if the upper barrier is touched before the lower one within
+`max_holding_bars`; -1 if the lower touches first (or both touch within
+the same forward bar -- OHLC alone cannot say which happened first
+within one bar, so this resolves the tie toward the stop-like outcome);
+the SIGN of the terminal return (the "time barrier") if neither is
+touched. Barrier width is `close * (1 +/- multiplier *
+trailing_volatility)` -- `profit_multiplier`/`loss_multiplier` scale a
+PAST-only trailing volatility estimate (via the same pluggable
+`volatility.VolatilityEstimatorFn` contract, applied directly/
+un-shifted so row `t`'s barrier depends only on rows `<= t`) named by
+`volatility_estimator_reference`. `NaN` where trailing volatility is
+unavailable (insufficient warmup) or the full holding horizon's data
+does not exist. Deliberately REIMPLEMENTED natively rather than
+importing `features.labels.build_triple_barrier_labels` -- see
+"Relationship to `features.labels`" above; the two systems never share
+code, only a similar shape.
+
+### 5. Forward Volatility (`forward_volatility.py`)
+
+The realized volatility of the NEXT `horizon_bars` bars: the chosen
+estimator's own trailing rolling statistic, shifted `-horizon_bars` so
+row `t`'s value covers exactly rows `[t+1, t+horizon_bars]` -- never
+reaching beyond the configured horizon, never including row `t` itself.
+No estimator is privileged; both shipped estimators are equally usable.
+
+## Label Records (`records.py`) -- per-row identity and Recovery
+
+The governing specification requires every GENERATED label carry
+`label_id`, `label_specification_id`, `dataset_id`, `row_identity`,
+`event_time`, `availability_time`, `generation_version`, `content_hash`
+-- `records.materialize_label_records(bundle, source_data, *,
+dataset_id, timeframe, horizon_bars)` produces one `LabelRecord` per row
+FROM an already-built `builder.LabelBundle`, never a second generation
+pass.
+
+- **`row_identity`** is the row's `event_time` rendered as an ISO-8601
+  UTC string -- content-based and portable, never a positional
+  DataFrame index (which says nothing about WHICH row it is once rows
+  are re-ordered, filtered, or reloaded). By construction `row_identity
+  == event_time` always; `LabelRecord.verify_self_consistency` checks
+  this, catching a "future timestamp" tamper that bumps one field
+  without the other.
+- **`event_time = open_time + timeframe.duration`** (the bar's CLOSE
+  time -- mirrors `features.interfaces.FeatureContext`'s identical
+  convention). **`availability_time = event_time + timeframe.duration *
+  horizon_bars`** -- the WORST-CASE instant this label is guaranteed
+  knowable; a label that resolves earlier (an early triple-barrier
+  touch) is still conservatively marked available only this late.
+  Neither field ever reads the wall clock -- both are pure functions of
+  `source_data["open_time"]`.
+- **`label_id = sha256(label_specification_id | row_identity)`**
+  identifies WHICH label slot this is, independent of its value.
+  **`content_hash = sha256(label_id | value)`** additionally covers the
+  value, so a value change alone (identity unchanged) is still
+  detectable.
+- `materialize_label_records` cross-checks its own `dataset_id`
+  argument against `bundle.specification.created_from_dataset`, raising
+  `LabelRequestError` on a mismatch -- a real "dataset corruption" guard
+  added specifically because nothing else in the call chain would have
+  caught a caller passing a record set at the wrong dataset.
+
+**`LabelRecordLedger`** is the append-only commit tracker "Recovery"
+requires: `commit(records)` refuses (raises
+`LabelRecordConflictError`, ALL-or-nothing -- a batch containing even
+one already-committed `row_identity` is refused in full, nothing
+partially applied) to overwrite an already-committed `row_identity` for
+a given specification; `recover(candidates)` returns only the subset
+NOT yet committed, so resuming an interrupted generation run re-derives
+candidates for the whole requested range but only acts on the genuinely
+missing ones -- "never regenerate partially committed labels." In-memory
+only, matching this package's own "no persistence store yet" scope (see
+Known Limitations) -- the APPEND-ONLY CONTRACT is what Recovery
+requires, not durable storage.
+
+## Label Bundles (`composite.py`)
+
+`CompositeLabelBundle` groups several independently-generated,
+independently-identified `builder.LabelBundle`s (Return + Direction,
+Return + Volatility, Direction + Triple Barrier, Return + Direction +
+Volatility, or any other combination) under one content-addressed
+`composite_id` (`sha256(dataset_id, sorted member content_ids)`).
+`build_composite_from_definitions` builds every member via Part A's own
+`LabelBuilder` (one call per definition) and groups the results --
+never a parallel generation path.
+
+`verify_composite`/`replay_composite`/`reconcile_composite` are thin
+aggregations over Part A's own single-bundle `LabelVerifier`/
+`LabelReplay`/`LabelReconciliation` -- one call per member, results
+collected, never a parallel reimplementation of any of the three.
+`reconcile_composite` additionally detects `member_set_drift` (members
+added/removed) and `bundle_drift` (`composite_id` changed) at the
+composite level, on top of each member's own drift kinds.
+
 ## A real defect found and fixed during testing
 
 `LabelBundle` (a frozen dataclass) originally carried its default,
@@ -314,11 +495,31 @@ inconsistent with the new `__eq__`. This is the only dataclass in this
 package carrying a `pd.Series`/`pd.DataFrame` field; every other type is
 JSON-primitive-only and needed no such treatment (confirmed by grep).
 
+## Real defects found and fixed during Part B's development
+
+**`materialize_label_records` did not cross-check its `dataset_id`
+argument against the bundle's own specification.** Discovered while
+designing the "dataset corruption" adversarial scenario: nothing in the
+call chain would have caught a caller passing a `LabelRecord` batch
+tagged with the WRONG dataset id (`created_from_dataset` on the
+specification and `dataset_id` on the materialized records could
+silently disagree). Fixed by raising `LabelRequestError` the moment
+`materialize_label_records` is called with a `dataset_id` that does not
+match `bundle.specification.created_from_dataset`
+(`test_labels_phase3b_adversarial.py::Test11DatasetCorruption`).
+
+**`LabelRecord.verify_self_consistency` did not check `row_identity`
+against `event_time`**, even though the two are ALWAYS identical by
+construction (`row_identity = event_time.isoformat()`). A hand-tampered
+record bumping one field without the other (a "future timestamp"
+attack) went undetected. Fixed by adding the cross-check
+(`test_labels_phase3b_adversarial.py::Test01FutureTimestamp`).
+
 ## Known limitations
 
-- **Ships no generation logic for any of the 6 named families** -- by
-  design; this is Part A's entire point. `LabelGeneratorFn` is the
-  pluggable hook Part 2 will fill in.
+- **`Future Extension Placeholder` still ships no generation logic** --
+  by design; the family exists purely as a registration/identity
+  placeholder for whichever family is added next.
 - **Two of the 7 point-in-time rules are disclosed as out-of-scope** --
   see "Point-in-time rule mapping" above. Re-verifying them requires
   real macro/cross-asset source data this package deliberately never
@@ -327,6 +528,14 @@ JSON-primitive-only and needed no such treatment (confirmed by grep).
   documented in its own function docstring (`diagnostics.
   _trailing_nan_tail_is_well_formed`), not silently presented as
   definitive.
+- **Triple Barrier's tie-break (both barriers touched within the same
+  forward bar) resolves toward the stop-like (-1) outcome** -- OHLC
+  data alone cannot say which barrier was touched first intrabar; this
+  is a documented, conservative convention, not a claim of intrabar
+  ordering knowledge this package does not have.
+- **`LabelRecordLedger` is in-memory only** -- matches this package's
+  own "no persistence store yet" scope; the append-only CONTRACT
+  ("Recovery") is implemented, durable storage is not.
 - **No CLI surface** -- library only, matching every prior milestone's
   own disclosed pattern before a CLI phase followed.
 - **Not yet wired into a persistence store** -- this package produces

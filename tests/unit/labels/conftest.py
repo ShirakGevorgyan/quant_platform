@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from quant_platform.core.types import Timeframe
 from quant_platform.labels.builder import LabelBuilder, LabelBundle, LabelDefinition
 from quant_platform.labels.manifest import LabelManifest, build_label_manifest
 from quant_platform.labels.models import LabelFamily, LabelSpecification, build_label_specification
@@ -22,11 +23,34 @@ TRAILING_UNRESOLVED = 3
 enough future data yet" near the end of a source frame -- the only
 legitimate NaN shape this infrastructure-only phase reasons about."""
 
+OHLCV_ROW_COUNT = 300
+"""Large enough that the 100-bar minimum required Multi Horizon Return
+horizon (and Triple Barrier's default test window) still has a
+meaningful number of resolvable rows."""
+
 
 def source_dataframe(*, row_count: int = SOURCE_ROW_COUNT) -> pd.DataFrame:
     open_time = pd.date_range("2024-01-01", periods=row_count, freq="1min", tz="UTC")
     close = 100.0 + np.arange(row_count, dtype="float64")
     return pd.DataFrame({"open_time": open_time, "close": close, "high": close + 0.5, "low": close - 0.5})
+
+
+def ohlcv_dataframe(*, row_count: int = OHLCV_ROW_COUNT, seed: int = 7) -> pd.DataFrame:
+    """A synthetic but genuinely varied (up AND down movements) OHLCV
+    frame with a real `open` column -- unlike `source_dataframe`'s
+    monotonic ramp, needed for Phase 3B's Open->Close/Close->Open price
+    bases and for Direction/Triple Barrier tests to see all three
+    outcomes (UP/DOWN/NEUTRAL; upper/lower/time barrier) rather than
+    only ever one."""
+    rng = np.random.default_rng(seed)
+    open_time = pd.date_range("2024-01-01", periods=row_count, freq="1min", tz="UTC")
+    returns = rng.normal(0, 0.003, size=row_count)
+    close = 100.0 * np.cumprod(1.0 + returns)
+    open_ = np.roll(close, 1)
+    open_[0] = 100.0
+    high = np.maximum(open_, close) * (1.0 + np.abs(rng.normal(0, 0.001, size=row_count)))
+    low = np.minimum(open_, close) * (1.0 - np.abs(rng.normal(0, 0.001, size=row_count)))
+    return pd.DataFrame({"open_time": open_time, "open": open_, "high": high, "low": low, "close": close})
 
 
 def marker_generator(source_data: pd.DataFrame, specification: LabelSpecification) -> pd.Series:
@@ -79,8 +103,23 @@ def source_data() -> pd.DataFrame:
 
 
 @pytest.fixture
+def ohlcv_source_data() -> pd.DataFrame:
+    return ohlcv_dataframe()
+
+
+@pytest.fixture
 def source_content_id() -> str:
     return "test-source-content-id-0001"
+
+
+@pytest.fixture
+def dataset_id() -> str:
+    return "test-dataset-0001"
+
+
+@pytest.fixture
+def timeframe() -> Timeframe:
+    return Timeframe.M1
 
 
 @pytest.fixture
