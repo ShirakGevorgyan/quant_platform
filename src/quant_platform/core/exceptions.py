@@ -2178,3 +2178,54 @@ class LabelRecordConflictError(LabelError):
     overwrites; recovery re-derives only the NOT-yet-committed subset
     (`LabelRecordLedger.recover`), it never silently replaces a
     previously committed row's label."""
+
+
+# --------------------------------------------------------------------------
+# Milestone 11, Phase 3, Part C: `quant_platform.label_validation` --
+# whether GENERATED labels (Milestone 11 Phase 3 Parts A/B) are
+# scientifically suitable for ML research. The output is label QUALITY,
+# never a label value, never a model, never a feature-importance/
+# predictive-power statistic. A separate, independent package from
+# `labels/`, `qualification/`, and `feature_discovery/` -- never merged
+# into any of them.
+# --------------------------------------------------------------------------
+class LabelValidationError(QuantPlatformError):
+    """Base class for every failure in `quant_platform.label_validation`.
+    This package reads an already-generated `labels.builder.LabelBundle`
+    and its `labels.manifest.LabelManifest` ONLY -- it never generates a
+    label itself, never trains a model, never computes feature
+    importance, and never estimates predictive power. It only ever
+    answers: is this label's own statistical shape (distribution,
+    balance, degeneracy, drift, stability, coverage) sound enough to
+    attempt ML research with."""
+
+
+class LabelValidationRequestError(LabelValidationError):
+    """Raised when a request into this package (a qualification call's
+    own arguments, a reconciliation call's bundle pair) is structurally
+    invalid -- e.g. two bundles for reconciliation that do not share a
+    `label_specification_id`, or a regime assignment whose index does
+    not align with the bundle being evaluated."""
+
+
+class LabelValidationVerificationError(LabelValidationError):
+    """Raised when `LabelValidationVerifier` cannot even ATTEMPT its
+    checks (e.g. re-qualification itself raises) -- as opposed to a
+    genuine mismatch FINDING, which is always reported as a non-raising
+    `verified=False`, never raised."""
+
+
+class LabelValidationReplayError(LabelValidationError):
+    """Raised when the point-in-time replay proof
+    (`replay.replay_and_requalify`) cannot even be ATTEMPTED (e.g. the
+    supplied generator/source data cannot reproduce the original bundle
+    at all) -- as opposed to a genuine "qualification differs after
+    replay" finding, which is a normal, non-raising outcome."""
+
+
+class LabelValidationReconciliationError(LabelValidationError):
+    """Raised when `LabelValidationReconciliation` cannot complete
+    structurally (the two qualification reports being compared cover
+    different `label_specification_id` values, so there is nothing to
+    reconcile), as opposed to an ordinary structured drift finding,
+    which is a normal, expected, non-raising outcome."""
